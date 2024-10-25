@@ -49,6 +49,7 @@ extern "C" {
 #include "scheduling_helper.hpp"
 #include "time_util.h"
 #include "pixelpilot_config.h"
+#include "gpio.h"
 
 
 #define READ_BUF_SIZE (1024*1024) // SZ_1M https://github.com/rockchip-linux/mpp/blob/ed377c99a733e2cdbcc457a6aa3f0fcd438a9dff/osal/inc/mpp_common.h#L179
@@ -377,8 +378,8 @@ bool feed_packet_to_decoder(MppPacket *packet,void* data_p,int data_len){
 
 uint64_t first_frame_ms=0;
 void read_gstreamerpipe_stream(MppPacket *packet, int gst_udp_port, const VideoCodec& codec){
-    // GstRtpReceiver receiver(gst_udp_port, codec);
-	GstDvrReceiver receiver("/root/demo.mp4", codec);
+    GstRtpReceiver receiver(gst_udp_port, codec);
+	// GstDvrReceiver receiver("/root/demo.mp4", codec);
 	long long bytes_received = 0; 
 	uint64_t period_start=0;
     auto cb=[&packet,&decoder_stalled_count, &bytes_received, &period_start](std::shared_ptr<std::vector<uint8_t>> frame){
@@ -401,9 +402,15 @@ void read_gstreamerpipe_stream(MppPacket *packet, int gst_udp_port, const VideoC
 			dvr->frame(frame);
         }
     };
+
+    const std::string chipName = "gpiochip3"; // Change to your GPIO chip name
+    const unsigned int lineNum = 8;            // Change to your GPIO line number
+    GPIO gpio(chipName, lineNum);
+    gpio.listenForChanges();
+
     receiver.start_receiving(cb);
     while (!signal_flag){
-        sleep(10);
+        sleep(1);
     }
     receiver.stop_receiving();
     printf("Feeding eos\n");

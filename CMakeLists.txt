@@ -23,14 +23,24 @@ set(SOURCE_FILES
         src/gstrtpreceiver.cpp
         src/gstrtpreceiver.h
         src/gstdvrreceiver.cpp
-        src/gstdvrreceiver.h)
+        src/gstdvrreceiver.h
+        src/gpio.cpp
+        src/gpio.h)
 
 include_directories("/usr/include/libdrm" "/usr/include/cairo")
+
+# Find the gpiod library
+find_library(GPIOD_LIB gpiod REQUIRED)
+
+# Include directories for gpiod
+include_directories(/usr/include)
 
 configure_file("${PROJECT_NAME}_config.h.in" "${PROJECT_NAME}_config.h")
 
 add_executable(${PROJECT_NAME} ${SOURCE_FILES})
-target_link_libraries(${PROJECT_NAME} rockchip_mpp pthread drm m cairo)
+
+# Link libraries
+target_link_libraries(${PROJECT_NAME} rockchip_mpp pthread drm m cairo ${GPIOD_LIB})
 
 # Embed gstreamer
 find_package(PkgConfig REQUIRED)
