@@ -21,7 +21,9 @@ set(SOURCE_FILES
         src/main.h
         src/scheduling_helper.hpp
         src/gstrtpreceiver.cpp
-        src/gstrtpreceiver.h)
+        src/gstrtpreceiver.h
+        src/gstdvrreceiver.cpp
+        src/gstdvrreceiver.h)
 
 include_directories("/usr/include/libdrm" "/usr/include/cairo")
 

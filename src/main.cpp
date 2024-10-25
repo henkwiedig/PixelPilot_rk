@@ -45,6 +45,7 @@ extern "C" {
 
 #include "dvr.h"
 #include "gstrtpreceiver.h"
+#include "gstdvrreceiver.h"
 #include "scheduling_helper.hpp"
 #include "time_util.h"
 #include "pixelpilot_config.h"
@@ -376,7 +377,8 @@ bool feed_packet_to_decoder(MppPacket *packet,void* data_p,int data_len){
 
 uint64_t first_frame_ms=0;
 void read_gstreamerpipe_stream(MppPacket *packet, int gst_udp_port, const VideoCodec& codec){
-    GstRtpReceiver receiver(gst_udp_port, codec);
+    // GstRtpReceiver receiver(gst_udp_port, codec);
+	GstDvrReceiver receiver("/root/demo.mp4", codec);
 	long long bytes_received = 0; 
 	uint64_t period_start=0;
     auto cb=[&packet,&decoder_stalled_count, &bytes_received, &period_start](std::shared_ptr<std::vector<uint8_t>> frame){
