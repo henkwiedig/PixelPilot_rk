@@ -17,6 +17,8 @@ set(SOURCE_FILES
         src/rtp.c
         src/mavlink.h
         src/mavlink.c
+        src/msp.h
+        src/msp.c
         src/main.cpp
         src/main.h
         src/scheduling_helper.hpp

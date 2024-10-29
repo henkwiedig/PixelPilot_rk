@@ -42,6 +42,7 @@ extern "C" {
 
 #include "mavlink/common/mavlink.h"
 #include "mavlink.h"
+#include "msp.h"
 }
 
 #include "dvr.h"
@@ -344,6 +345,7 @@ void sig_handler(int signum)
 	spdlog::info("Received signal {}", signum);
 	signal_flag++;
 	mavlink_thread_signal++;
+	msp_thread_signal++;
 	osd_thread_signal++;
 	if (dvr != NULL) {
 		dvr->shutdown();
@@ -480,6 +482,8 @@ void printHelp() {
     "\n"
     "    --mavlink-dvr-on-arm   - Start recording when armed\n"
     "\n"
+	"    --msp-port <port>      - UDP port for msp telemetry            (Default: 14551)\n"
+    "\n"	
     "    --codec <codec>        - Video codec, should be the same as on VTX  (Default: h265 <h264|h265>)\n"
     "\n"
     "    --log-level <level>    - Log verbosity level, debug|info|warn|error (Default: info)\n"
@@ -520,6 +524,7 @@ int main(int argc, char **argv)
 	int i, j;
 	int enable_osd = 0;
 	int mavlink_thread = 0;
+	int msp_thread = 0;
 	int dvr_autostart = 0;
 	int print_modelist = 0;
 	char* dvr_template = NULL;
@@ -527,6 +532,7 @@ int main(int argc, char **argv)
 	int mp4_fragmentation_mode = 0;
 	uint16_t listen_port = 5600;
 	uint16_t mavlink_port = 14550;
+	uint16_t msp_port = 14551;
 	uint16_t mode_width = 0;
 	uint16_t mode_height = 0;
 	uint32_t mode_vrefresh = 0;
@@ -603,6 +609,11 @@ int main(int argc, char **argv)
 		continue;
 	}
 
+	__OnArgument("--msp-port") {
+		msp_port = atoi(__ArgValue);
+		continue;
+	}	
+
 	__OnArgument("--mavlink-dvr-on-arm") {
 		mavlink_dvr_on_arm = true;
 		continue;
@@ -619,6 +630,7 @@ int main(int argc, char **argv)
 		osd_vars.enable_wfbng = 1;
 		osd_vars.enable_telemetry = 1;
 		mavlink_thread = 1;
+		msp_thread = 1;
 		continue;
 	}
 
@@ -747,7 +759,7 @@ int main(int argc, char **argv)
 	ret = pthread_cond_init(&video_cond, NULL);
 	assert(!ret);
 
-	pthread_t tid_frame, tid_display, tid_osd, tid_mavlink, tid_dvr;
+	pthread_t tid_frame, tid_display, tid_osd, tid_mavlink, tid_msp, tid_dvr;
 	if (dvr_template != NULL) {
 		dvr_thread_params args;
 		args.filename_template = dvr_template;
@@ -769,6 +781,10 @@ int main(int argc, char **argv)
 	if (enable_osd) {
 		if (mavlink_thread) {
 			ret = pthread_create(&tid_mavlink, NULL, __MAVLINK_THREAD__, &signal_flag);
+			assert(!ret);
+		}
+		if (msp_thread) {
+			ret = pthread_create(&tid_msp, NULL, __MSP_THREAD__, &signal_flag);
 			assert(!ret);
 		}
 		osd_thread_params *args = (osd_thread_params *)malloc(sizeof *args);
@@ -809,6 +825,10 @@ int main(int argc, char **argv)
 		ret = pthread_join(tid_osd, NULL);
 		assert(!ret);
 	}
+	if (msp_thread) {
+		ret = pthread_join(tid_msp, NULL);
+		assert(!ret);
+	}	
 	if (dvr_template != NULL ){
 		ret = pthread_join(tid_dvr, NULL);
 		assert(!ret);
