@@ -4,6 +4,7 @@
 #include "drm.h"
 #include <cairo.h>
 #include <pthread.h>
+#include <ctype.h>  // for isprint
 #include "mavlink.h"
 #include "icons/icons.h"
 
@@ -13,6 +14,12 @@
 #define PATH_MAX	4096
 
 struct osd_vars osd_vars;
+
+#define ROWS 18       // Number of rows in the OSD
+#define COLUMNS 50    // Number of columns in the OSD
+extern char osd[ROWS][COLUMNS];
+extern time_t last_keepalive_time;  // Last time a keepalive was received
+
 
 extern uint32_t frames_received;
 uint32_t stats_rx_bytes = 0;
@@ -32,6 +39,49 @@ cairo_surface_t* net_icon;
 cairo_surface_t* sdcard_icon;
 
 pthread_mutex_t osd_mutex;
+
+
+void render_osd(cairo_t *cr, int x_start, int y_start) {
+    char msg[2] = {0};  // Single character buffer
+    for (int i = 0; i < ROWS; i++) {
+        for (int j = 0; j < COLUMNS; j++) {
+            char ch = osd[i][j];
+            if (!isprint((unsigned char)ch)) {
+                ch = 'X';  // Replace non-printable characters with 'X'
+            }
+            msg[0] = ch;
+
+            // Calculate the position for each character based on row and column
+            int x = x_start + j * 18;
+            int y = y_start + i * 54;
+
+            // Move to the calculated position and show the character
+            cairo_move_to(cr, x, y);
+            cairo_show_text(cr, msg);
+        }
+    }
+}
+
+void initialize_osd() {
+    // Initialize OSD array with blank spaces
+    for (int i = 0; i < ROWS; i++) {
+        for (int j = 0; j < COLUMNS; j++) {
+            osd[i][j] = ' ';
+        }
+    }
+}
+
+void render_disconnected_message() {
+    // Clear the OSD and display "DISCONNECTED" message in the center
+    initialize_osd();
+    const char *msg = "MSP DISCONNECTED";
+    int row = ROWS / 2;
+    int col_start = (COLUMNS - 12) / 2;  // Center the message horizontally
+
+    for (int i = 0; i < 12; i++) {
+        osd[row][col_start + i] = msg[i];
+    }
+}
 
 void modeset_paint_buffer(struct modeset_buf *buf) {
 	unsigned int j,k,off;
@@ -161,6 +211,11 @@ void modeset_paint_buffer(struct modeset_buf *buf) {
 			cairo_show_text (cr, msg);
 		}
 	}
+
+	render_osd(cr,0,0);
+    if (difftime(time(NULL), last_keepalive_time) > 2) {
+        render_disconnected_message();
+    }
 
 	if (!osd_vars.enable_telemetry){
 		return;

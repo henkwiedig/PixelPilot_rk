@@ -28,6 +28,9 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <ctype.h>  // for isprint
+#include <sys/select.h>
+#include <unistd.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -45,6 +48,34 @@ int msp_port = 14551;
 int msp_thread_signal = 0;
 msp_state_t *rx_msp_state;
 
+#define ROWS 18       // Number of rows in the OSD
+#define COLUMNS 50    // Number of columns in the OSD
+#define MAX_MSP_STRING_LENGTH 30 // ... NULL terminated string of up to 30 characters in length ...
+char osd[ROWS][COLUMNS];
+time_t last_keepalive_time = 0; // Last time a keepalive was received
+
+
+static void process_draw_string(uint8_t *payload) {
+    uint8_t row = payload[0];
+    uint8_t col = payload[1];
+    uint8_t attrs = payload[2]; // INAV and Betaflight use this to specify a higher page number. 
+
+    // Find the actual length of the payload string, stopping at null or MAX_DISPLAY_LENGTH
+    uint8_t actual_length = 0;
+    for (uint8_t idx = 0; idx < MAX_MSP_STRING_LENGTH && payload[3 + idx] != '\0'; idx++) {
+        actual_length++;
+    }
+
+    for(uint8_t idx = 0; idx < actual_length; idx++) { //MSP Disployport message is max 30
+        uint16_t character = payload[3 + idx];
+        if(attrs & 0x3) {
+            // shift over by the page number if they were specified
+            character |= ((attrs & 0x3) * 0x100);
+        }
+        osd[row-1][col + idx -1 ]=character;
+        //printf("%i %i\n",row,col);
+    }
+}
 
 int displayport_process_message(msp_msg_t *msg) {
     if (msg->direction != MSP_INBOUND) {
@@ -56,19 +87,33 @@ int displayport_process_message(msp_msg_t *msg) {
     msp_displayport_cmd_e sub_cmd = msg->payload[0];
     switch(sub_cmd) {
         case MSP_DISPLAYPORT_KEEPALIVE: // 0 -> Open/Keep-Alive DisplayPort
-            printf("MSP_DISPLAYPORT_KEEPALIVE\n");
+            last_keepalive_time = time(NULL);
             break;
         case MSP_DISPLAYPORT_CLOSE: // 1 -> Close DisplayPort
-            printf("MSP_DISPLAYPORT_CLOSE\n");
+            //printf("MSP_DISPLAYPORT_CLOSE\n");
             break;
         case MSP_DISPLAYPORT_CLEAR: // 2 -> Clear Screen
-            printf("MSP_DISPLAYPORT_CLEAR\n");
+            // Initialize the array with empty spaces or some default character
+            for (int i = 0; i < ROWS; i++) {
+                for (int j = 0; j < COLUMNS; j++) {
+                    osd[i][j] = ' ';  // Initialize with a blank space
+                }
+            }
             break;
         case MSP_DISPLAYPORT_DRAW_STRING: // 3 -> Draw String
-            printf("MSP_DISPLAYPORT_DRAW_STRING: %s\n",&msg->payload[1]);
+            process_draw_string(&msg->payload[1]);
             break;
         case MSP_DISPLAYPORT_DRAW_SCREEN: // 4 -> Draw Screen
-            printf("MSP_DISPLAYPORT_DRAW_SCREEN\n");
+            // Clear the console and move the cursor to the top-left corner
+            printf("\033[H");  // ANSI escape code to move cursor to "home" position
+            printf("\033[J");  // Clear the screen from cursor down
+            for (int i = 0; i < ROWS; i++) {
+                for (int j = 0; j < COLUMNS; j++) {
+                    char ch = osd[i][j];
+                    putchar(isprint((unsigned char)ch) ? ch : 'X');
+                }
+                putchar('\n');
+            }
             break;
         case MSP_DISPLAYPORT_SET_OPTIONS: // 5 -> Set Options (HDZero/iNav)
             printf("MSP_DISPLAYPORT_SET_OPTIONS\n");
@@ -101,9 +146,8 @@ static void rx_msp_callback(msp_msg_t *msp_message)
             printf("Received MSP_RC: %x\n", msp_message->payload);
 
          }
-         
         case MSP_DISPLAYPORT: {
-            printf("Received MSP_DISPLAYPORT: %x\n", msp_message->payload);
+            //printf("Received MSP_DISPLAYPORT: ");
             displayport_process_message(msp_message);
             break;
         }
@@ -229,8 +273,17 @@ void* __MSP_THREAD__(void* arg) {
   pthread_setname_np(pthread_self(), "__MSP");
   printf("Starting msp thread...\n");
 
-	rx_msp_state = calloc(1, sizeof(msp_state_t));
-	rx_msp_state->cb = &rx_msp_callback;  
+  rx_msp_state = calloc(1, sizeof(msp_state_t));
+  rx_msp_state->cb = &rx_msp_callback;  
+
+    // Initialize the array with empty spaces or some default character
+    for (int i = 0; i < ROWS; i++) {
+        for (int j = 0; j < COLUMNS; j++) {
+            osd[i][j] = ' ';  // Initialize with a blank space
+        }
+    }
+
+
   // Create socket
   int fd = socket(AF_INET, SOCK_DGRAM, 0);
   if (fd < 0) {
@@ -251,24 +304,39 @@ void* __MSP_THREAD__(void* arg) {
   }
 
    char buffer[2048];
-  while (!msp_thread_signal) {
-    memset(buffer, 0x00, sizeof(buffer));
-    int ret = recv(fd, buffer, sizeof(buffer), 0);
-    if (ret < 0) {
-      continue;
-    } else if (ret == 0) {
-      // peer has done an orderly shutdown
-      return 0;
+    while (!msp_thread_signal) {
+        fd_set read_fds;
+        struct timeval timeout;
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+
+        FD_ZERO(&read_fds);
+        FD_SET(fd, &read_fds);
+
+        int ready = select(fd + 1, &read_fds, NULL, NULL, &timeout);
+        if (ready < 0) {
+            perror("select error");
+            break;
+        } else if (ready == 0) {
+            // No data, continue loop after timeout
+            continue;
+        }
+
+        // Data available, proceed with recv
+        memset(buffer, 0x00, sizeof(buffer));
+        int ret = recv(fd, buffer, sizeof(buffer), 0);
+        if (ret < 0) {
+            perror("recv error");
+            break;
+        } else if (ret == 0) {
+            return 0;  // Peer has done an orderly shutdown
+        }
+
+        for (int i = 0; i < ret; i++) {
+            msp_process_data(rx_msp_state, buffer[i]);
+        }
     }
 
-    for(int i=0;i<ret;i++)
-      msp_process_data(rx_msp_state, buffer[i]);    
-
-    // parse msp
-    //printf("recv: %x\n",buffer);
-
-    usleep(1);
-  }
 	printf("MSP thread done.\n");
   return 0;
 }
