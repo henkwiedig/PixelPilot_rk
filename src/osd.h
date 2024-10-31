@@ -78,6 +78,22 @@ typedef struct {
 	int fd;
 } osd_thread_params;
 
+typedef struct display_info_s {
+    uint8_t char_width;
+    uint8_t char_height;
+    uint8_t font_width;
+    uint8_t font_height;
+    uint16_t num_chars;
+} display_info_t; 
+
+static const display_info_t hd_display_info = {
+    .char_width = 50,
+    .char_height = 18,
+    .font_width = 24,
+    .font_height = 36,
+    .num_chars = 512,
+};
+
 void *__OSD_THREAD__(void *param);
 
 #endif

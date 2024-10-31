@@ -42,6 +42,34 @@ pthread_mutex_t osd_mutex;
 
 
 void render_osd(cairo_t *cr, int x_start, int y_start) {
+
+    // Load the PNG image
+    cairo_surface_t *overlay_image = cairo_image_surface_create_from_png("font_btfl_hd.png");
+    int overlay_width = hd_display_info.char_width;  // Width of the sub-area you want to draw
+    int overlay_height = hd_display_info.char_height;  // Height of the sub-area you want to draw
+    int x_offset = 50;  // X coordinate to draw the image
+    int y_offset = 50;  // Y coordinate to draw the image
+    // Draw a sub-area of the overlay image
+    // You can specify the source coordinates (src_x, src_y) in the PNG and the destination coordinates
+    int src_x = 50;  // Starting X coordinate of the sub-area in the PNG
+    int src_y = 10;  // Starting Y coordinate of the sub-area in the PNG
+
+	//store current cairo state
+    cairo_save(cr);
+
+    cairo_set_source_surface(cr, overlay_image, x_offset, y_offset);
+    cairo_rectangle(cr, x_offset, y_offset, overlay_width, overlay_height);
+    cairo_clip(cr);  // Set the clipping region to the rectangle
+
+    // Draw the sub-area from the PNG
+    cairo_set_source_surface(cr, overlay_image, src_x, src_y);
+    cairo_paint(cr);
+
+    // Restore the clipping region
+    cairo_reset_clip(cr);
+
+    cairo_restore(cr);
+
     char msg[2] = {0};  // Single character buffer
     for (int i = 0; i < ROWS; i++) {
         for (int j = 0; j < COLUMNS; j++) {
@@ -60,6 +88,8 @@ void render_osd(cairo_t *cr, int x_start, int y_start) {
             cairo_show_text(cr, msg);
         }
     }
+
+
 }
 
 void initialize_osd() {
