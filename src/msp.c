@@ -69,8 +69,8 @@ static void process_draw_string(uint8_t *payload) {
 
     for(uint8_t idx = 0; idx < actual_length; idx++) { //MSP Disployport message is max 30
         uint16_t character = payload[3 + idx];
-        osd[row-1][col + idx -1 ]=character;
-        osd_page[row-1][col + idx -1 ]=payload[2] & 0x3;
+        osd[row][col + idx ]=character;
+        osd_page[row][col + idx]=payload[2] & 0x3;
         //printf("%i %i\n",row,col);
     }
 }
