@@ -37,59 +37,68 @@ cairo_surface_t *fps_icon;
 cairo_surface_t *lat_icon;
 cairo_surface_t* net_icon;
 cairo_surface_t* sdcard_icon;
+cairo_surface_t *font;
 
 pthread_mutex_t osd_mutex;
 
 
-void render_osd(cairo_t *cr, int x_start, int y_start) {
+void draw_character(cairo_t *cr, cairo_surface_t *font_image, char input_char, int char_width, int char_height, int dest_x, int dest_y) {
+    // Calculate the position of the character in the PNG font sheet
+    int src_x = 0;  // Since characters are vertically stacked, X is always 0
+    int src_y = input_char * char_height;  // Y offset based on the character's index
 
-    // Load the PNG image
-    cairo_surface_t *overlay_image = cairo_image_surface_create_from_png("font_btfl_hd.png");
-    int overlay_width = hd_display_info.char_width;  // Width of the sub-area you want to draw
-    int overlay_height = hd_display_info.char_height;  // Height of the sub-area you want to draw
-    int x_offset = 50;  // X coordinate to draw the image
-    int y_offset = 50;  // Y coordinate to draw the image
-    // Draw a sub-area of the overlay image
-    // You can specify the source coordinates (src_x, src_y) in the PNG and the destination coordinates
-    int src_x = 50;  // Starting X coordinate of the sub-area in the PNG
-    int src_y = 10;  // Starting Y coordinate of the sub-area in the PNG
-
-	//store current cairo state
+    // Save the current state of the context
     cairo_save(cr);
 
-    cairo_set_source_surface(cr, overlay_image, x_offset, y_offset);
-    cairo_rectangle(cr, x_offset, y_offset, overlay_width, overlay_height);
-    cairo_clip(cr);  // Set the clipping region to the rectangle
+    // Set the source surface to the font image at the calculated position
+    cairo_set_source_surface(cr, font_image, dest_x - src_x, dest_y - src_y);
+    
+    // Define the destination area to clip to the size of a single character
+    cairo_rectangle(cr, dest_x, dest_y, char_width, char_height);
+    cairo_clip(cr);  // Clip to the character's area
 
-    // Draw the sub-area from the PNG
-    cairo_set_source_surface(cr, overlay_image, src_x, src_y);
+    // Paint the character
     cairo_paint(cr);
 
-    // Restore the clipping region
-    cairo_reset_clip(cr);
-
+    // Restore the context to its previous state
     cairo_restore(cr);
+}
+
+
+
+void render_osd(cairo_t *cr) {
+
+	// Get the surface from the cairo context
+	cairo_surface_t *surface = cairo_get_target(cr);
+
+	// Read the width and height of the surface
+	int screen_width = cairo_image_surface_get_width(surface);
+	int screen_height = cairo_image_surface_get_height(surface);
+	int osd_columns = hd_display_info.char_width;
+	int osd_rows = hd_display_info.char_height;
+
+	// Define border spacing
+	int border_x = 20;  // Horizontal border space
+	int border_y = 20;  // Vertical border space
+
+	// Calculate the drawable area for OSD (excluding borders)
+	int drawable_width = screen_width - 2 * border_x;
+	int drawable_height = screen_height - 2 * border_y;
+
+	// Calculate scaling factors based on drawable area
+	float scale_x = (float)drawable_width / osd_columns;
+	float scale_y = (float)drawable_height / osd_rows;
+
 
     char msg[2] = {0};  // Single character buffer
     for (int i = 0; i < ROWS; i++) {
         for (int j = 0; j < COLUMNS; j++) {
             char ch = osd[i][j];
-            if (!isprint((unsigned char)ch)) {
-                ch = 'X';  // Replace non-printable characters with 'X'
-            }
-            msg[0] = ch;
-
-            // Calculate the position for each character based on row and column
-            int x = x_start + j * 18;
-            int y = y_start + i * 54;
-
-            // Move to the calculated position and show the character
-            cairo_move_to(cr, x, y);
-            cairo_show_text(cr, msg);
+			int x = border_x + j * scale_x;
+			int y = border_y + i * scale_y;
+           	draw_character(cr, font, ch, hd_display_info.font_width, hd_display_info.font_height, x, y);
         }
     }
-
-
 }
 
 void initialize_osd() {
@@ -108,7 +117,7 @@ void render_disconnected_message() {
     int row = ROWS / 2;
     int col_start = (COLUMNS - 12) / 2;  // Center the message horizontally
 
-    for (int i = 0; i < 12; i++) {
+    for (int i = 0; i < 16; i++) {
         osd[row][col_start + i] = msg[i];
     }
 }
@@ -242,7 +251,7 @@ void modeset_paint_buffer(struct modeset_buf *buf) {
 		}
 	}
 
-	render_osd(cr,0,0);
+	render_osd(cr);
     if (difftime(time(NULL), last_keepalive_time) > 2) {
         render_disconnected_message();
     }
@@ -394,6 +403,8 @@ void *__OSD_THREAD__(void *param) {
 	lat_icon = surface_from_embedded_png(latency_icon, latency_icon_length);
 	net_icon = surface_from_embedded_png(bandwidth_icon, bandwidth_icon_length);
 	sdcard_icon = surface_from_embedded_png(sdcard_white_icon, sdcard_white_icon_length);
+
+	font = cairo_image_surface_create_from_png("font_btfl_hd.png");
 
 	int ret = pthread_mutex_init(&osd_mutex, NULL);
 	assert(!ret);

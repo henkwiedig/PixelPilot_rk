@@ -105,15 +105,15 @@ int displayport_process_message(msp_msg_t *msg) {
             break;
         case MSP_DISPLAYPORT_DRAW_SCREEN: // 4 -> Draw Screen
             // Clear the console and move the cursor to the top-left corner
-            printf("\033[H");  // ANSI escape code to move cursor to "home" position
-            printf("\033[J");  // Clear the screen from cursor down
-            for (int i = 0; i < ROWS; i++) {
-                for (int j = 0; j < COLUMNS; j++) {
-                    char ch = osd[i][j];
-                    putchar(isprint((unsigned char)ch) ? ch : 'X');
-                }
-                putchar('\n');
-            }
+            // printf("\033[H");  // ANSI escape code to move cursor to "home" position
+            // printf("\033[J");  // Clear the screen from cursor down
+            // for (int i = 0; i < ROWS; i++) {
+            //     for (int j = 0; j < COLUMNS; j++) {
+            //         char ch = osd[i][j];
+            //         putchar(isprint((unsigned char)ch) ? ch : 'X');
+            //     }
+            //     putchar('\n');
+            // }
             break;
         case MSP_DISPLAYPORT_SET_OPTIONS: // 5 -> Set Options (HDZero/iNav)
             printf("MSP_DISPLAYPORT_SET_OPTIONS\n");
