@@ -18,6 +18,7 @@ struct osd_vars osd_vars;
 #define ROWS 18       // Number of rows in the OSD
 #define COLUMNS 50    // Number of columns in the OSD
 extern char osd[ROWS][COLUMNS];
+extern uint8_t osd_page[ROWS][COLUMNS];  // Stores page info for each character
 extern time_t last_keepalive_time;  // Last time a keepalive was received
 
 
@@ -42,9 +43,9 @@ cairo_surface_t *font;
 pthread_mutex_t osd_mutex;
 
 
-void draw_character(cairo_t *cr, cairo_surface_t *font_image, char input_char, int char_width, int char_height, int dest_x, int dest_y) {
+void draw_character(cairo_t *cr, cairo_surface_t *font_image, char input_char,uint8_t page, int char_width, int char_height, int dest_x, int dest_y) {
     // Calculate the position of the character in the PNG font sheet
-    int src_x = 0;  // Since characters are vertically stacked, X is always 0
+    int src_x = page * hd_display_info.font_width;  // Since characters are vertically stacked, X times the page
     int src_y = input_char * char_height;  // Y offset based on the character's index
 
     // Save the current state of the context
@@ -93,10 +94,9 @@ void render_osd(cairo_t *cr) {
     char msg[2] = {0};  // Single character buffer
     for (int i = 0; i < ROWS; i++) {
         for (int j = 0; j < COLUMNS; j++) {
-            char ch = osd[i][j];
 			int x = border_x + j * scale_x;
 			int y = border_y + i * scale_y;
-           	draw_character(cr, font, ch, hd_display_info.font_width, hd_display_info.font_height, x, y);
+           	draw_character(cr, font, osd[i][j],osd_page[i][j], hd_display_info.font_width, hd_display_info.font_height, x, y);
         }
     }
 }

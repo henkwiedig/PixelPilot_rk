@@ -52,6 +52,7 @@ msp_state_t *rx_msp_state;
 #define COLUMNS 50    // Number of columns in the OSD
 #define MAX_MSP_STRING_LENGTH 30 // ... NULL terminated string of up to 30 characters in length ...
 char osd[ROWS][COLUMNS];
+uint8_t osd_page[ROWS][COLUMNS];  // Stores page info for each character
 time_t last_keepalive_time = 0; // Last time a keepalive was received
 
 
@@ -68,11 +69,8 @@ static void process_draw_string(uint8_t *payload) {
 
     for(uint8_t idx = 0; idx < actual_length; idx++) { //MSP Disployport message is max 30
         uint16_t character = payload[3 + idx];
-        if(attrs & 0x3) {
-            // shift over by the page number if they were specified
-            character |= ((attrs & 0x3) * 0x100);
-        }
         osd[row-1][col + idx -1 ]=character;
+        osd_page[row-1][col + idx -1 ]=payload[2] & 0x3;
         //printf("%i %i\n",row,col);
     }
 }
