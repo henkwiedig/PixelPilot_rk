@@ -39,6 +39,11 @@ namespace pipeline {
         assert(false);
         return "";
     }
+    static std::string create_hlssink_tee(){
+        return "tee name=t t. ! hlssink2 send-keyframe-requests=false target-duration=5 playlist-length=3 location=/dev/shm/segment%05d.ts playlist-location=/dev/shm/live.m3u8 playlist-root=http://192.168.1.104:8080/live/ t. ! ";
+        assert(false);
+        return "";
+    }
     static std::string create_out_caps(const VideoCodec& codec){
         if(codec==VideoCodec::H264){
             std::stringstream ss;
@@ -116,6 +121,7 @@ std::string GstRtpReceiver::construct_gstreamer_pipeline()
     ss<<"udpsrc port="<<m_port<<" "<<pipeline::gst_create_rtp_caps(m_video_codec)<<" ! ";
     ss<<pipeline::create_rtp_depacketize_for_codec(m_video_codec);
     ss<<pipeline::create_parse_for_codec(m_video_codec);
+    ss<<pipeline::create_hlssink_tee();
     ss<<pipeline::create_out_caps(m_video_codec);
     ss<<" appsink drop=true name=out_appsink";
     return ss.str();
@@ -148,6 +154,7 @@ void GstRtpReceiver::start_receiving(NEW_FRAME_CALLBACK cb)
 
     const auto pipeline=construct_gstreamer_pipeline();
     GError *error = nullptr;
+    spdlog::info("here!!!!");
     m_gst_pipeline = gst_parse_launch(pipeline.c_str(), &error);
     spdlog::info("GSTREAMER PIPE=[{}]", pipeline);
     if (error) {
