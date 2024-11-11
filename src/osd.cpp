@@ -26,6 +26,10 @@ extern "C" {
 #include "spdlog/spdlog.h"
 #include <fmt/ranges.h>
 
+// Surface dimensions
+#define WIDTH 800
+#define HEIGHT 600
+
 #define WFB_LINK_LOST 1
 #define WFB_LINK_JAMMED 2
 
@@ -44,6 +48,7 @@ int hours = 0, minutes = 0, seconds = 0, milliseconds = 0;
 char custom_msg[80];
 u_int custom_msg_refresh_count = 0;
 
+cairo_surface_t *shm_surface;
 
 double getTimeInterval(struct timespec* timestamp, struct timespec* last_meansure_timestamp) {
   return (timestamp->tv_sec - last_meansure_timestamp->tv_sec) +
@@ -1447,6 +1452,9 @@ void modeset_paint_buffer(struct modeset_buf *buf, Osd *osd) {
 		minutes = 0;
 	}
 
+	cairo_set_source_surface(cr, shm_surface, 0, 0); // Position at (0, 0)
+    cairo_paint(cr); // Paint overlay_surface onto base_surface
+
 	cairo_fill(cr);
 	cairo_destroy(cr);
 }
@@ -1501,6 +1509,29 @@ void *__OSD_THREAD__(void *param) {
 	ret = modeset_perform_modeset(p->fd, p->out, p->out->osd_request, &p->out->osd_plane,
 								  buf->fb, buf->width, buf->height, osd_vars.plane_zpos);
 	assert(ret >= 0);
+
+    // Open the shared memory segment
+    int shm_fd = shm_open("/cairo_shm_surface", O_RDONLY, 0666);
+    if (shm_fd == -1) {
+        perror("Failed to open shared memory");
+        return nullptr;
+    }
+
+    // Map the shared memory to the process's address space
+    size_t shm_size = WIDTH * HEIGHT * 4; // 4 bytes per pixel (RGBA)
+	unsigned char *shm_data = (unsigned char*) mmap(0, shm_size, PROT_READ, MAP_SHARED, shm_fd, 0);
+    if (shm_data == MAP_FAILED) {
+        perror("Failed to map shared memory");
+        close(shm_fd);
+        return nullptr;
+    }
+
+    // Create a Cairo surface for the shared memory buffer
+	shm_surface = cairo_image_surface_create_for_data(
+        shm_data, CAIRO_FORMAT_ARGB32, WIDTH, HEIGHT, WIDTH * 4
+    );
+
+
 	while (!osd_thread_signal) {
 		std::unique_lock<std::mutex> lock(mtx);
 		std::vector<Fact> fact_buf;
