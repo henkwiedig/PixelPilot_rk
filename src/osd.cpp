@@ -952,57 +952,66 @@ public:
 
 class ExternalSurfaceWidget: public Widget {
 public:
-	ExternalSurfaceWidget(int pos_x, int pos_y): Widget(pos_x, pos_y) {
+	ExternalSurfaceWidget(int pos_x, int pos_y, std::string shm_name ): Widget(pos_x, pos_y), shm_name(shm_name)  {};
 
+	virtual void init_shm(cairo_t *cr) {
 		SPDLOG_INFO("creating shm region {}", shm_name);
 
+		cairo_surface_t *target = cairo_get_target(cr);
+		int width = cairo_image_surface_get_width(target);
+		int height = cairo_image_surface_get_height(target);		
 
 		// Create shared memory region
-		int shm_fd = shm_open(shm_name, O_CREAT | O_RDWR, 0666);
+		int shm_fd = shm_open(shm_name.c_str(), O_CREAT | O_RDWR, 0666);
 		if (shm_fd == -1) {
 			perror("Failed to create shared memory");
 		}
 
 		// Set the size of the shared memory
-		size_t shm_size = WIDTH * HEIGHT * 4; // 4 bytes per pixel (RGBA)
+		size_t shm_size = width * height * 4; // 4 bytes per pixel (RGBA)
 		if (ftruncate(shm_fd, shm_size) == -1) {
 			perror("Failed to set shared memory size");
-			shm_unlink(shm_name);
+			shm_unlink(shm_name.c_str());
 		}
 
 		// Map shared memory to process address space
 		unsigned char *shm_data = static_cast<unsigned char*>(mmap(0, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0));
 		if (shm_data == MAP_FAILED) {
 			perror("Failed to map shared memory");
-			shm_unlink(shm_name);
+			shm_unlink(shm_name.c_str());
 		}
 
 		// Create a Cairo surface for the shared memory buffer
 		shm_surface = cairo_image_surface_create_for_data(
-			shm_data, CAIRO_FORMAT_ARGB32, WIDTH, HEIGHT, WIDTH * 4
+			shm_data, CAIRO_FORMAT_ARGB32, width, height, width * 4
 		);
-	};
+	}
 
 	virtual void draw(cairo_t *cr) {
+
+		if (! shm_surface) 
+			init_shm(cr);
 		auto [x, y] = xy(cr);
-		cairo_set_source_surface(cr, shm_surface, 0, 0); // Position at (0, 0)
+		cairo_set_source_surface(cr, shm_surface, x, y); // Position at (0, 0)
     	cairo_paint(cr); // Paint shm_surface onto base_surface
 	}
 
 	~ExternalSurfaceWidget() {
 		SPDLOG_INFO("bye, bye, shm region {}", shm_name);
-		cairo_surface_destroy(shm_surface);
-		munmap(shm_data, shm_size);
-		shm_unlink(shm_name);		
+		if (shm_surface) {
+			cairo_surface_destroy(shm_surface);
+		}
+		if (shm_data) {
+			munmap(shm_data, shm_size);
+		}
+		shm_unlink(shm_name.c_str());
 	}
 
 protected:
-	cairo_surface_t *shm_surface;
-	unsigned char *shm_data;
+	cairo_surface_t *shm_surface = nullptr;
+	unsigned char *shm_data = nullptr;
 	size_t shm_size;
-	const char *shm_name = "/cairo_shm_surface";
-	int WIDTH = 1280;
-	int HEIGHT = 720;
+	std::string shm_name;
 };
 
 class Osd {
@@ -1049,7 +1058,7 @@ public:
 						  matchers);
 			}
 			else if (type == "ExternalSurfaceWidget") {
-				addWidget(new ExternalSurfaceWidget(x, y), matchers);
+				addWidget(new ExternalSurfaceWidget(x, y, name), matchers);
 			} else if (type == "TplTextWidget") {
 				auto tpl = widget_j.at("template").template get<std::string>();
 				addWidget(new TplTextWidget(x, y, tpl, (uint)matchers.size()), matchers);
