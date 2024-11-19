@@ -959,33 +959,47 @@ public:
 
 		cairo_surface_t *target = cairo_get_target(cr);
 		int width = cairo_image_surface_get_width(target);
-		int height = cairo_image_surface_get_height(target);		
+		int height = cairo_image_surface_get_height(target);
+
+		// Calculate total shared memory size
+		shm_size = sizeof(SharedMemoryRegion) + (width * height * 4); // Metadata + Image data
 
 		// Create shared memory region
 		int shm_fd = shm_open(shm_name.c_str(), O_CREAT | O_RDWR, 0666);
 		if (shm_fd == -1) {
 			perror("Failed to create shared memory");
+			return;
 		}
 
-		// Set the size of the shared memory
-		size_t shm_size = width * height * 4; // 4 bytes per pixel (RGBA)
 		if (ftruncate(shm_fd, shm_size) == -1) {
 			perror("Failed to set shared memory size");
 			shm_unlink(shm_name.c_str());
+			return;
 		}
 
 		// Map shared memory to process address space
-		unsigned char *shm_data = static_cast<unsigned char*>(mmap(0, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0));
-		if (shm_data == MAP_FAILED) {
+		auto *shm_region = static_cast<SharedMemoryRegion*>(
+			mmap(0, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0)
+		);
+		if (shm_region == MAP_FAILED) {
 			perror("Failed to map shared memory");
 			shm_unlink(shm_name.c_str());
+			return;
 		}
 
-		// Create a Cairo surface for the shared memory buffer
+		// Write metadata
+		shm_region->width = width;
+		shm_region->height = height;
+
+		// Create Cairo surface for the image data
 		shm_surface = cairo_image_surface_create_for_data(
-			shm_data, CAIRO_FORMAT_ARGB32, width, height, width * 4
+			shm_region->data, CAIRO_FORMAT_ARGB32, width, height, width * 4
 		);
+
+		// Store pointer for cleanup
+		shm_data = reinterpret_cast<unsigned char*>(shm_region);
 	}
+
 
 	virtual void draw(cairo_t *cr) {
 
