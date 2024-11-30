@@ -23,7 +23,8 @@ set(SOURCE_FILES
         src/main.h
         src/scheduling_helper.hpp
         src/gstrtpreceiver.cpp
-        src/gstrtpreceiver.h)
+        src/gstrtpreceiver.h
+        src/menu_system.cpp)
 file(GLOB ICONS src/icons/*.png)
 file(GLOB OSD_CONFIGS *_osd.json)
 
@@ -35,7 +36,7 @@ find_package(spdlog REQUIRED)
 find_package(nlohmann_json 3 REQUIRED)
 
 add_executable(${PROJECT_NAME} ${SOURCE_FILES})
-target_link_libraries(${PROJECT_NAME} rockchip_mpp pthread drm m cairo spdlog::spdlog nlohmann_json::nlohmann_json)
+target_link_libraries(${PROJECT_NAME} rockchip_mpp pthread drm m cairo spdlog::spdlog nlohmann_json::nlohmann_json yaml-cpp)
 
 # Embed gstreamer
 find_package(PkgConfig REQUIRED)

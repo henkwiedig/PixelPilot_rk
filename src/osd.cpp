@@ -25,6 +25,7 @@ extern "C" {
 #include <nlohmann/json.hpp>
 #include "spdlog/spdlog.h"
 #include <fmt/ranges.h>
+#include "menu_system.hpp"
 
 #define WFB_LINK_LOST 1
 #define WFB_LINK_JAMMED 2
@@ -1481,6 +1482,17 @@ cairo_surface_t * surface_from_embedded_png(const char * png, size_t length)
 		closure);
 }
 
+bool checkForInput(std::string& input) {
+    char buffer[256];
+    ssize_t bytesRead = read(STDIN_FILENO, buffer, sizeof(buffer) - 1);
+    if (bytesRead > 0) {
+        buffer[bytesRead] = '\0'; // Null-terminate the string
+        input = std::string(buffer);
+        return true;
+    }
+    return false; // No input available
+}
+
 void *__OSD_THREAD__(void *param) {
 	osd_thread_params *p = (osd_thread_params *)param;
 	Osd *osd = new Osd;
@@ -1501,6 +1513,13 @@ void *__OSD_THREAD__(void *param) {
 	ret = modeset_perform_modeset(p->fd, p->out, p->out->osd_request, &p->out->osd_plane,
 								  buf->fb, buf->width, buf->height, osd_vars.plane_zpos);
 	assert(ret >= 0);
+
+	SPDLOG_INFO("Loading menu\n");
+    Menu* currentMenu = loadMenuFromYaml("menu.yml");
+    std::string input;
+    int flags = fcntl(STDIN_FILENO, F_GETFL, 0); // Get current flags
+    fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK); // Set non-blocking mode
+
 	while (!osd_thread_signal) {
 		std::unique_lock<std::mutex> lock(mtx);
 		std::vector<Fact> fact_buf;
@@ -1530,7 +1549,13 @@ void *__OSD_THREAD__(void *param) {
 			SPDLOG_DEBUG("refresh OSD");
 			int buf_idx = p->out->osd_buf_switch ^ 1;
 			struct modeset_buf *buf = &p->out->osd_bufs[buf_idx];
-			modeset_paint_buffer(buf, osd);
+			//modeset_paint_buffer(buf, osd);
+			currentMenu->drawMenu(buf);
+			// Check if input is available
+			if (checkForInput(input)) {
+				SPDLOG_INFO("You typed: {}",input.c_str());
+				currentMenu->handleInput(input[0]);
+			}			
 
 			int ret = pthread_mutex_lock(&osd_mutex);
 			assert(!ret);	
