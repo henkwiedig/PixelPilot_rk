@@ -2,40 +2,146 @@
 #include "drm.h"
 #include "spdlog.h"
 
+#define NK_IMPLEMENTATION
+#define NK_INCLUDE_DEFAULT_ALLOCATOR
+#include "nuklear_console/vendor/Nuklear/nuklear.h"
+// Gamepad support https://github.com/robloach/nuklear_gamepad
+#define NK_GAMEPAD_IMPLEMENTATION
+#define NK_GAMEPAD_NONE
+#include "nuklear_console/vendor/nuklear_gamepad/nuklear_gamepad.h"
+#define NK_CONSOLE_IMPLEMENTATION
+#include "nuklear_console/nuklear_console.h"
 
-std::vector<std::shared_ptr<MenuOption>> loadMenuOptions(const YAML::Node& node) {
-    std::vector<std::shared_ptr<MenuOption>> options;
+#include <cstdlib> // for malloc and free
 
-    for (const auto& item : node) {
-        auto option = std::make_shared<MenuOption>(item["name"].as<std::string>());
-        SPDLOG_INFO("{}",option->name.c_str());
+void Menu::nk_cairo_render(cairo_t *cr, struct nk_context *ctx) const {
+    const struct nk_command *cmd;
 
-        if (item["submenu"]) {
-            option->submenu = loadMenuOptions(item["submenu"]);
+    // Iterate over all commands in the Nuklear command buffer
+    nk_foreach(cmd, ctx) {
+        switch (cmd->type) {
+            case NK_COMMAND_NOP:
+                break;
+            case NK_COMMAND_LINE: {
+                const struct nk_command_line *line = (const struct nk_command_line *)cmd;
+                cairo_set_source_rgb(cr,
+                                     line->color.r / 255.0,
+                                     line->color.g / 255.0,
+                                     line->color.b / 255.0);
+                cairo_set_line_width(cr, line->line_thickness);
+                cairo_move_to(cr, line->begin.x, line->begin.y);
+                cairo_line_to(cr, line->end.x, line->end.y);
+                cairo_stroke(cr);
+                break;
+            }
+            case NK_COMMAND_RECT: {
+                const struct nk_command_rect *rect = (const struct nk_command_rect *)cmd;
+                cairo_set_source_rgb(cr,
+                                     rect->color.r / 255.0,
+                                     rect->color.g / 255.0,
+                                     rect->color.b / 255.0);
+                cairo_set_line_width(cr, rect->line_thickness);
+                cairo_rectangle(cr, rect->x, rect->y, rect->w, rect->h);
+                cairo_stroke(cr);
+                break;
+            }
+            case NK_COMMAND_RECT_FILLED: {
+                const struct nk_command_rect_filled *rect = (const struct nk_command_rect_filled *)cmd;
+                cairo_set_source_rgb(cr,
+                                     rect->color.r / 255.0,
+                                     rect->color.g / 255.0,
+                                     rect->color.b / 255.0);
+                cairo_rectangle(cr, rect->x, rect->y, rect->w, rect->h);
+                cairo_fill(cr);
+                break;
+            }
+            case NK_COMMAND_TEXT: {
+                const struct nk_command_text *text = (const struct nk_command_text *)cmd;
+                cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+                cairo_set_font_size(cr, text->font->height);
+                cairo_set_source_rgb(cr,
+                                     text->foreground.r / 255.0,
+                                     text->foreground.g / 255.0,
+                                     text->foreground.b / 255.0);
+                cairo_move_to(cr, text->x, text->y + text->font->height);
+                cairo_show_text(cr, text->string);
+                break;
+            }
+            case NK_COMMAND_CIRCLE_FILLED: {
+                const struct nk_command_circle_filled *circle = (const struct nk_command_circle_filled *)cmd;
+                cairo_set_source_rgb(cr,
+                                     circle->color.r / 255.0,
+                                     circle->color.g / 255.0,
+                                     circle->color.b / 255.0);
+                cairo_arc(cr,
+                          circle->x + circle->w / 2.0,
+                          circle->y + circle->h / 2.0,
+                          circle->w / 2.0, 0, 2 * M_PI);
+                cairo_fill(cr);
+                break;
+            }
+            case NK_COMMAND_CIRCLE: {
+                const struct nk_command_circle *circle = (const struct nk_command_circle *)cmd;
+                cairo_set_source_rgb(cr,
+                                     circle->color.r / 255.0,
+                                     circle->color.g / 255.0,
+                                     circle->color.b / 255.0);
+                cairo_set_line_width(cr, circle->line_thickness);
+                cairo_arc(cr,
+                          circle->x + circle->w / 2.0,
+                          circle->y + circle->h / 2.0,
+                          circle->w / 2.0, 0, 2 * M_PI);
+                cairo_stroke(cr);
+                break;
+            }
+            case NK_COMMAND_IMAGE: {
+                const struct nk_command_image *image = (const struct nk_command_image *)cmd;
+                // Assuming Cairo supports loading the image into a cairo_surface_t
+                cairo_surface_t *img = (cairo_surface_t *)image->img.handle.ptr;
+                cairo_set_source_surface(cr, img, image->x, image->y);
+                cairo_rectangle(cr, image->x, image->y, image->w, image->h);
+                cairo_fill(cr);
+                break;
+            }
+            case NK_COMMAND_SCISSOR:
+            {
+                const struct nk_command_scissor *s = (const struct nk_command_scissor *)cmd;
+                cairo_reset_clip(cr);
+                if (s->x >= 0) {
+                    cairo_rectangle(cr, s->x - 1, s->y - 1, s->w + 2, s->h + 2);
+                    cairo_clip(cr);
+                }
+                break;
+            }
+            default:
+                SPDLOG_INFO("Unsupportet Nuklear command {}",cmd->type);
+                break;
         }
-
-        options.push_back(option);
     }
-
-    return options;
 }
 
-Menu* loadMenuFromYaml(const std::string& filepath) {
-    YAML::Node config = YAML::LoadFile(filepath);
-    auto options = loadMenuOptions(config["menu"]);
-    return new Menu(options);
+void Menu::initMenu() {
+
+    // Set up the console within the Nuklear context
+    console = nk_console_init(&ctx);
+
+    // Add some widgets
+    nk_console_button(console, "New Game");
+    nk_console* options = nk_console_button(console, "Options");
+    {
+        nk_console_button(options, "Some cool option!");
+        nk_console_button(options, "Option #2");
+        nk_console_button_onclick(options, "Back", nk_console_button_back);
+    }
+    nk_console_button(console, "Load Game");
+    nk_console_button(console, "Save Game");
+
 }
 
-void Menu::drawMenu(struct modeset_buf *buf) const {
+void Menu::drawMenu(struct modeset_buf *buf) {
 
 	cairo_t* cr;
 	cairo_surface_t *surface;
-
-    const int optionHeight = 40;
-    int yOffset = 50; // Start drawing from this Y-offset
-    int width, height;
-
-    int osd_x = buf->width - 300;
 	surface = cairo_image_surface_create_for_data(buf->map, CAIRO_FORMAT_ARGB32, buf->width, buf->height, buf->stride);
 	cr = cairo_create (surface);
 
@@ -44,50 +150,51 @@ void Menu::drawMenu(struct modeset_buf *buf) const {
 	cairo_set_operator(cr, CAIRO_OPERATOR_CLEAR);
 	cairo_paint(cr);
 	cairo_restore(cr);
-
     cairo_set_source_rgba(cr, 0, 0, 0, 0); // Transparent black (alpha = 0)
     cairo_paint(cr);
 
-    for (size_t i = 0; i < menuOptions.size(); ++i) {
-        if (i == currentIndex) {
-            cairo_set_source_rgb(cr, 0.2, 0.6, 1); // Highlight color
-            cairo_rectangle(cr, 20, yOffset, width - 40, optionHeight);
-            cairo_fill(cr);
+    nk_console_render_window(console, "nuklear_console", nk_rect(200, 200, 800, 600), NK_WINDOW_TITLE);
 
-            cairo_set_source_rgb(cr, 1, 1, 1); // Text color for highlighted option
-        } else {
-            cairo_set_source_rgb(cr, 0, 0, 0); // Text color
-        }
+    // Render Nuklear commands using Cairo
+    nk_cairo_render(cr, &ctx);
 
-        cairo_move_to(cr, 30, yOffset + optionHeight / 2 + 5);
-        cairo_set_font_size(cr, 20);
-        cairo_show_text(cr, menuOptions[i]->name.c_str());
-        yOffset += optionHeight + 10; // Space between options
-    }
+    // Cleanup
+    nk_clear(&ctx);
     cairo_destroy(cr);
+    cairo_surface_destroy(surface);
 }
 
-Menu* Menu::handleInput(char input) {
-    if (input == 'w' && currentIndex > 0) {
-        --currentIndex;
-    } else if (input == 's' && currentIndex < menuOptions.size() - 1) {
-        ++currentIndex;
-    } else if (input == 'd' && hasSubmenu()) {
-        return enterSubmenu();
-    } else if (input == 'a' && parent) {
-        return exitToParent();
+void Menu::handleInput(char input) {
+    nk_input_begin(&ctx);  // Start input processing
+    switch (input) {
+        case 'e':
+            nk_input_key(&ctx, NK_KEY_ENTER, true);
+            nk_input_key(&ctx, NK_KEY_ENTER, false);
+            break;
+        case 'w': 
+            nk_input_key(&ctx, NK_KEY_UP, true);
+            nk_input_key(&ctx, NK_KEY_UP, false);
+            break;  
+        case 's': 
+            nk_input_key(&ctx, NK_KEY_DOWN, true);
+            nk_input_key(&ctx, NK_KEY_DOWN, false);
+            break;  
+        case 'a': 
+            nk_input_key(&ctx, NK_KEY_LEFT, true);   
+            nk_input_key(&ctx, NK_KEY_LEFT, false);  
+            break;  
+        case 'd': 
+            nk_input_key(&ctx, NK_KEY_RIGHT, true);  
+            nk_input_key(&ctx, NK_KEY_RIGHT, false); 
+            break;  
+        case 't': 
+            nk_input_key(&ctx, NK_KEY_TAB, true);   
+            nk_input_key(&ctx, NK_KEY_TAB, false);  
+            break;  
+        default:
+            SPDLOG_INFO("Unhandled key: {}", std::string(1, input));  // Log unknown input
+            break;
     }
-    return this;
-}
 
-bool Menu::hasSubmenu() const {
-    return !menuOptions[currentIndex]->submenu.empty();
-}
-
-Menu* Menu::enterSubmenu() {
-    return new Menu(menuOptions[currentIndex]->submenu, this);
-}
-
-Menu* Menu::exitToParent() {
-    return parent;
+    nk_input_end(&ctx);  // End input processing
 }

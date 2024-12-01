@@ -5,7 +5,7 @@ project(pixelpilot VERSION 1.2.0)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-add_compile_options("-Wno-address-of-packed-member")
+add_compile_options("-Wno-address-of-packed-member" "-fpermissive")
 
 set(SOURCE_FILES 
         src/drm.h

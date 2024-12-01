@@ -1,0 +1,3 @@
+[submodule "src/nuklear_console"]
+	path = src/nuklear_console
+	url = https://github.com/RobLoach/nuklear_console.git

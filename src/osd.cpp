@@ -1514,8 +1514,9 @@ void *__OSD_THREAD__(void *param) {
 								  buf->fb, buf->width, buf->height, osd_vars.plane_zpos);
 	assert(ret >= 0);
 
-	SPDLOG_INFO("Loading menu\n");
-    Menu* currentMenu = loadMenuFromYaml("menu.yml");
+	bool menuActive = false;
+    Menu menu;
+	menu.initMenu();
     std::string input;
     int flags = fcntl(STDIN_FILENO, F_GETFL, 0); // Get current flags
     fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK); // Set non-blocking mode
@@ -1549,13 +1550,29 @@ void *__OSD_THREAD__(void *param) {
 			SPDLOG_DEBUG("refresh OSD");
 			int buf_idx = p->out->osd_buf_switch ^ 1;
 			struct modeset_buf *buf = &p->out->osd_bufs[buf_idx];
-			//modeset_paint_buffer(buf, osd);
-			currentMenu->drawMenu(buf);
+
 			// Check if input is available
 			if (checkForInput(input)) {
-				SPDLOG_INFO("You typed: {}",input.c_str());
-				currentMenu->handleInput(input[0]);
-			}			
+				SPDLOG_INFO("You typed: {}",input.c_str());				
+				switch (input[0]) {
+					case 'm':
+						menuActive = true;
+						break;
+					case 'x':
+						menuActive = false;
+						break;
+					default:
+						if (menuActive)
+							menu.handleInput(input[0]);
+					    break;
+				}
+			}
+
+			if (menuActive) {
+				menu.drawMenu(buf);
+			} else {
+				modeset_paint_buffer(buf, osd);
+			}
 
 			int ret = pthread_mutex_lock(&osd_mutex);
 			assert(!ret);	
