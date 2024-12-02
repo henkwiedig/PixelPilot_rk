@@ -1486,33 +1486,21 @@ cairo_surface_t * surface_from_embedded_png(const char * png, size_t length)
 		closure);
 }
 
-bool checkForInput(GPIOManager& gpio, std::string& input) {
-    char buffer[256];
-    ssize_t bytesRead = read(STDIN_FILENO, buffer, sizeof(buffer) - 1);
-    if (bytesRead > 0) {
-        buffer[bytesRead] = '\0'; // Null-terminate the string
-        input = std::string(buffer);
-        return true;
-    }
-
+char checkForInput(GPIOManager& gpio) {
+    char result = '\0';
     if (gpio.getValue("Up") == 0) {  // Active LOW
-        input = "w";
-        return true;
+        result =  'w';
     } else if (gpio.getValue("Down") == 0) {
-        input = "s";
-        return true;
+         result =  's';
     } else if (gpio.getValue("Left") == 0) {
-        input = "a";
-        return true;
+        result =  'a';
     } else if (gpio.getValue("Right") == 0) {
-        input = "d";
-        return true;
+        result =  'd';
     } else if (gpio.getValue("Ok") == 0) {
-        input = "e";
-        return true;
+        result =  'e';
     }
-	
-    return false; // No input available
+    SPDLOG_DEBUG("checkForInput result: {}", result); // Debug log
+    return result;
 }
 
 void *__OSD_THREAD__(void *param) {
@@ -1538,10 +1526,6 @@ void *__OSD_THREAD__(void *param) {
 
     Menu menu;
 	menu.initMenu();
-    std::string input;
-    int flags = fcntl(STDIN_FILENO, F_GETFL, 0); // Get current flags
-    fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK); // Set non-blocking mode
-
 	GPIOManager gpio;
     gpio.addLine("Up", "gpiochip4", 19);
     gpio.addLine("Down", "gpiochip4", 21);
@@ -1596,8 +1580,7 @@ void *__OSD_THREAD__(void *param) {
 				}
 				modeset_paint_buffer(buf, osd);
 			} else {
-				if (checkForInput(gpio, input))
-					menu.handleInput(input[0]);
+				menu.handleInput(checkForInput(gpio));
 				menu.drawMenu(buf);
 				menu.releaseKeys();
 				menu.drawMenu(buf);
