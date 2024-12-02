@@ -1527,11 +1527,11 @@ void *__OSD_THREAD__(void *param) {
     Menu menu;
 	menu.initMenu();
 	GPIOManager gpio;
-    gpio.addLine("Up", "gpiochip4", 19);
-    gpio.addLine("Down", "gpiochip4", 21);
-    gpio.addLine("Left", "gpiochip4", 18);
-    gpio.addLine("Right", "gpiochip3", 11);
-    gpio.addLine("Ok", "gpiochip3", 12);
+    gpio.addLine("Up", menu.gpioConfig.up.chip, menu.gpioConfig.up.line);
+    gpio.addLine("Down", menu.gpioConfig.down.chip, menu.gpioConfig.down.line);
+    gpio.addLine("Left", menu.gpioConfig.left.chip, menu.gpioConfig.left.line);
+    gpio.addLine("Right", menu.gpioConfig.right.chip, menu.gpioConfig.right.line);
+    gpio.addLine("Ok", menu.gpioConfig.ok.chip, menu.gpioConfig.ok.line);
 
 	while (!osd_thread_signal) {
 		std::unique_lock<std::mutex> lock(mtx);

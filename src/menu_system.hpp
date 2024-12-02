@@ -7,11 +7,16 @@
 #include "spdlog.h"
 #include "yaml-cpp/yaml.h"
 #include "nuklear_settings.h"
+#include "MenuConfig.hpp"
 
 class Menu {
 public:
     Menu(){
         SPDLOG_INFO("Menu opened ...");
+        YAML::Node config = YAML::LoadFile("menu.yml");
+        spdlog::debug("Loaded YAML file");
+        gpioConfig = config["gpio"].as<GPIOConfig>();
+
         default_font.userdata.ptr = NULL; // No additional font data
         default_font.height = 23.0f; // Font height
         default_font.width = font_width_calculator; // Text width calculation function
@@ -25,6 +30,7 @@ public:
     void handleInput(char input);
     void initMenu();
     void releaseKeys(void);
+    GPIOConfig gpioConfig;    
 private:
 
     // Wrapper functions for the custom allocator
@@ -59,6 +65,7 @@ private:
     float value = 0.6f;
     int i =  1;
     int j =  7;
+    int wlan_channel = 161;
     const int textedit_buffer_size = 256;
     char textedit_buffer[256] = "123456ABFCD";
     nk_bool radio_option = nk_false;

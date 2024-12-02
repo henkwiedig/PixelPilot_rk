@@ -1,17 +1,16 @@
-menu:
-  - name: "Main Menu"
-    options:
-      - name: "Option 1"
-      - name: "Option 2"
-        submenu:
-          - name: "Submenu 1"
-          - name: "Submenu 2"
-      - name: "Option 3"
-  - name: "Main Menu 2"
-    options:
-      - name: "Option 1"
-      - name: "Option 2"
-        submenu:
-          - name: "Submenu 1"
-          - name: "Submenu 2"
-      - name: "Option 3"
+gpio:
+  up:
+    chip: gpiochip4
+    line: 19
+  down:
+    chip: gpiochip4
+    line: 21
+  left:
+    chip: gpiochip4
+    line: 18
+  right:
+    chip: gpiochip3
+    line: 11
+  ok:
+    chip: gpiochip3
+    line: 12
