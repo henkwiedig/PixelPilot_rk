@@ -146,6 +146,11 @@ void exit_clicked(struct nk_console* button, void* user_data) {
     osd_vars.refresh_frequency_ms = 1000;
 }
 
+void wlan_channel_changed(struct nk_console* button, void* user_data) {
+    int* chan = static_cast<int*>(user_data);
+    SPDLOG_INFO("Changeing wlan channel to {}", *chan);
+}
+
 void Menu::initMenu() {
 
     // Set up the console within the Nuklear context
@@ -153,8 +158,9 @@ void Menu::initMenu() {
 
     nk_console_combobox(console, "Resolution", "1920x1080@60;1280x720@50;1600x1200@60", ';', &i)
         ->tooltip = "Select display resolution";
-    nk_console_combobox(console, "Channel", "36;40;44;48;52;56;60;64;100;104;108;112;116;120;124;128;132;136;140;144;149;153;157;161;165", ';', &i)
-        ->tooltip = "Select wfb channel";
+    nk_console* wlan_channel_options = nk_console_combobox(console, "Channel",  "36;40;44;48;52;56;60;64;100;104;108;112;116;120;124;128;132;136;140;144;149;153;157;161;165", ';', &wlan_channel);
+    wlan_channel_options->tooltip = "Select wfb channel";
+    nk_console_add_event_handler(wlan_channel_options, NK_CONSOLE_EVENT_CHANGED, &wlan_channel_changed,&wlan_channel,NULL);
     nk_console_checkbox(console, "Ad-Hoc network", &radio_option)
         ->tooltip = "Enable/Disable the Ad-Hoc network access point";
     nk_console_textedit(console, "WLAN Key", textedit_buffer, textedit_buffer_size)
@@ -244,9 +250,11 @@ void Menu::handleInput(char input) {
             break;  
         case 'd': 
             nk_input_key(&ctx, NK_KEY_RIGHT, true);
+            break;
+        case '\0': 
             break;  
         default:
-            SPDLOG_INFO("Unhandled key: {}", std::string(1, input));  // Log unknown input
+            SPDLOG_WARN("Unhandled key: {}", std::string(1, input));  // Log unknown input
             break;
     }
 

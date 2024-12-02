@@ -14,3 +14,55 @@ gpio:
   ok:
     chip: gpiochip3
     line: 12
+menu:
+  wfb_channels:
+    - channel: 36
+      frequency: 5180
+    - channel: 40
+      frequency: 5200
+    - channel: 44
+      frequency: 5220
+    - channel: 48
+      frequency: 5240
+    - channel: 52
+      frequency: 5260
+    - channel: 56
+      frequency: 5280
+    - channel: 60
+      frequency: 5300
+    - channel: 64
+      frequency: 5320
+    - channel: 100
+      frequency: 5500
+    - channel: 104
+      frequency: 5520
+    - channel: 108
+      frequency: 5540
+    - channel: 112
+      frequency: 5560
+    - channel: 116
+      frequency: 5580
+    - channel: 120
+      frequency: 5600
+    - channel: 124
+      frequency: 5620
+    - channel: 128
+      frequency: 5640
+    - channel: 132
+      frequency: 5660
+    - channel: 136
+      frequency: 5680
+    - channel: 140
+      frequency: 5700
+    - channel: 144
+      frequency: 5720
+    - channel: 149
+      frequency: 5745
+    - channel: 153
+      frequency: 5765
+    - channel: 157
+      frequency: 5785
+    - channel: 161
+      frequency: 5805
+    - channel: 165
+      frequency: 5825

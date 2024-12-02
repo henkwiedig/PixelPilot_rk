@@ -16,6 +16,7 @@ public:
         YAML::Node config = YAML::LoadFile("menu.yml");
         spdlog::debug("Loaded YAML file");
         gpioConfig = config["gpio"].as<GPIOConfig>();
+        wfbChannels = config["menu"]["wfb_channels"].as<std::vector<WLANChannel>>();
 
         default_font.userdata.ptr = NULL; // No additional font data
         default_font.height = 23.0f; // Font height
@@ -30,7 +31,7 @@ public:
     void handleInput(char input);
     void initMenu();
     void releaseKeys(void);
-    GPIOConfig gpioConfig;    
+    GPIOConfig gpioConfig;
 private:
 
     // Wrapper functions for the custom allocator
@@ -60,6 +61,8 @@ private:
     nk_console* console;
 
     // init gui state
+    std::vector<WLANChannel> wfbChannels;
+   
     enum {EASY, HARD};
     int op = EASY;
     float value = 0.6f;
