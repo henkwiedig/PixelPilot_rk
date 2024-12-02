@@ -1,6 +1,7 @@
 #include "menu_system.hpp"
 #include "drm.h"
 #include "spdlog.h"
+#include "osd.h"
 
 #define NK_IMPLEMENTATION
 #define NK_INCLUDE_STANDARD_IO
@@ -19,6 +20,9 @@
 #include "nuklear_console/nuklear_console.h"
 
 #include <cstdlib> // for malloc and free
+
+extern bool menuActive;
+extern struct osd_vars osd_vars;
 
 void Menu::nk_cairo_render(cairo_t *cr, struct nk_context *ctx) const {
     const struct nk_command *cmd;
@@ -147,6 +151,11 @@ void Menu::nk_cairo_render(cairo_t *cr, struct nk_context *ctx) const {
     }
 }
 
+void exit_clicked(struct nk_console* button, void* user_data) {
+    menuActive = false;
+    osd_vars.refresh_frequency_ms = 1000;
+}
+
 void Menu::initMenu() {
 
     // Set up the console within the Nuklear context
@@ -156,7 +165,11 @@ void Menu::initMenu() {
         ->tooltip = "Select display resolution";
     nk_console_combobox(console, "Channel", "36;40;44;48;52;56;60;64;100;104;108;112;116;120;124;128;132;136;140;144;149;153;157;161;165", ';', &i)
         ->tooltip = "Select wfb channel";
-    nk_console_textedit(console, "WLAN Key", textedit_buffer, textedit_buffer_size);
+    nk_console_textedit(console, "WLAN Key", textedit_buffer, textedit_buffer_size)
+       ->tooltip = "CHange WLAN Key";
+
+    nk_console_button_onclick(console, "Exit Menu", &exit_clicked);
+
 
 }
 

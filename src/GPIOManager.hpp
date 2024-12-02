@@ -3,33 +3,32 @@
 
 #include <gpiod.h>
 #include <string>
-#include <vector>
 #include <map>
-#include <stdexcept>
+#include <chrono>
 
-// A struct to manage GPIO lines across multiple chips
 class GPIOManager {
 public:
-    // Struct to store chip and line information
     struct Line {
-        gpiod_chip* chip;       // Pointer to the GPIO chip
-        gpiod_line* line;       // Pointer to the GPIO line
+        gpiod_chip* chip;
+        gpiod_line* line;
     };
 
-    // Destructor to clean up resources
-    ~GPIOManager() {
-        for (auto& [name, line] : lines) {
-            gpiod_chip_close(line.chip);
-        }
-    }
+    struct PressState {
+        bool isPressed = false;
+        std::chrono::steady_clock::time_point pressStart;
+    };
 
-    // Add a GPIO line to the manager
+    ~GPIOManager();
+
     void addLine(const std::string& name, const std::string& chip_name, int line_num);
-    // Get the value of a GPIO line
     int getValue(const std::string& name) const;
 
+    // Non-blocking press detection
+    std::string detectPressNonBlocking(const std::string& name, int longPressThresholdMs = 2000);
+
 private:
-    std::map<std::string, Line> lines; // Map of line names to Line structs
+    std::map<std::string, Line> lines;
+    std::map<std::string, PressState> states;
 };
 
 #endif // GPIOMANAGER_H

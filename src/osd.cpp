@@ -6,6 +6,7 @@ extern "C" {
 }
 #include "osd.h"
 #include "osd.hpp"
+#include "dvr.h"
 
 #include <pthread.h>
 #include <map>
@@ -46,6 +47,8 @@ int hours = 0, minutes = 0, seconds = 0, milliseconds = 0;
 char custom_msg[80];
 u_int custom_msg_refresh_count = 0;
 
+bool menuActive = false;
+extern Dvr *dvr;
 
 double getTimeInterval(struct timespec* timestamp, struct timespec* last_meansure_timestamp) {
   return (timestamp->tv_sec - last_meansure_timestamp->tv_sec) +
@@ -1533,7 +1536,6 @@ void *__OSD_THREAD__(void *param) {
 								  buf->fb, buf->width, buf->height, osd_vars.plane_zpos);
 	assert(ret >= 0);
 
-	bool menuActive = false;
     Menu menu;
 	menu.initMenu();
     std::string input;
@@ -1577,31 +1579,28 @@ void *__OSD_THREAD__(void *param) {
 			int buf_idx = p->out->osd_buf_switch ^ 1;
 			struct modeset_buf *buf = &p->out->osd_bufs[buf_idx];
 
-			// Check if input is available
-	        if (checkForInput(gpio, input)) {
-				SPDLOG_INFO("You typed: {}",input.c_str());				
-				switch (input[0]) {
-					case 'm':
+            if (! menuActive) {
+				std::string pressType = gpio.detectPressNonBlocking("Ok");
+				if (!pressType.empty()) {
+					if (pressType == "short") {
+						SPDLOG_INFO("Short ok press detected");
+						if (dvr) {
+							SPDLOG_INFO("Toggle recodring because of button press");
+							dvr->toggle_recording();
+						}					
+					} else if (pressType == "long") {
+						SPDLOG_INFO("Long press detected on 'Ok' button!");
 						menuActive = true;
 						osd_vars.refresh_frequency_ms = 100;
-						break;
-					case 'x':
-						menuActive = false;
-						osd_vars.refresh_frequency_ms = 1000;
-						break;
-					default:
-						if (menuActive)
-							menu.handleInput(input[0]);
-					    break;
+					}
 				}
-			}
-
-			if (menuActive) {
+				modeset_paint_buffer(buf, osd);
+			} else {
+				if (checkForInput(gpio, input))
+					menu.handleInput(input[0]);
 				menu.drawMenu(buf);
 				menu.releaseKeys();
 				menu.drawMenu(buf);
-			} else {
-				modeset_paint_buffer(buf, osd);
 			}
 
 			int ret = pthread_mutex_lock(&osd_mutex);
