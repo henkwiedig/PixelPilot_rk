@@ -6,19 +6,14 @@
 #include <string>
 #include "spdlog.h"
 #include "yaml-cpp/yaml.h"
-#define NK_INCLUDE_DEFAULT_ALLOCATOR
-#include "nuklear_console/vendor/Nuklear/nuklear.h"
-// Gamepad support https://github.com/robloach/nuklear_gamepad
-#define NK_GAMEPAD_NONE
-#include "nuklear_console/vendor/nuklear_gamepad/nuklear_gamepad.h"
-#include "nuklear_console/nuklear_console.h"
+#include "nuklear_settings.h"
 
 class Menu {
 public:
     Menu(){
         SPDLOG_INFO("Menu opened ...");
         default_font.userdata.ptr = NULL; // No additional font data
-        default_font.height = 13.0f; // Font height
+        default_font.height = 23.0f; // Font height
         default_font.width = font_width_calculator; // Text width calculation function
         nk_init(&ctx, &allocator, &default_font);
     };
@@ -58,7 +53,6 @@ private:
     struct nk_context ctx;
     nk_console* console;
 
-
     // init gui state
     enum {EASY, HARD};
     int op = EASY;
@@ -66,5 +60,6 @@ private:
     int i =  1;
     int j =  7;
     const int textedit_buffer_size = 256;
-    char textedit_buffer[256] = "123456ABFCD";    
+    char textedit_buffer[256] = "123456ABFCD";
+    nk_bool radio_option = nk_false;
 };
