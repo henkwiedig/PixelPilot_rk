@@ -1557,9 +1557,11 @@ void *__OSD_THREAD__(void *param) {
 				switch (input[0]) {
 					case 'm':
 						menuActive = true;
+						osd_vars.refresh_frequency_ms = 100;
 						break;
 					case 'x':
 						menuActive = false;
+						osd_vars.refresh_frequency_ms = 1000;
 						break;
 					default:
 						if (menuActive)
@@ -1569,6 +1571,8 @@ void *__OSD_THREAD__(void *param) {
 			}
 
 			if (menuActive) {
+				menu.drawMenu(buf);
+				menu.releaseKeys();
 				menu.drawMenu(buf);
 			} else {
 				modeset_paint_buffer(buf, osd);

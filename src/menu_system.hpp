@@ -6,7 +6,10 @@
 #include <string>
 #include "spdlog.h"
 #include "yaml-cpp/yaml.h"
+#define NK_INCLUDE_DEFAULT_ALLOCATOR
 #include "nuklear_console/vendor/Nuklear/nuklear.h"
+// Gamepad support https://github.com/robloach/nuklear_gamepad
+#define NK_GAMEPAD_NONE
 #include "nuklear_console/vendor/nuklear_gamepad/nuklear_gamepad.h"
 #include "nuklear_console/nuklear_console.h"
 
@@ -26,6 +29,7 @@ public:
     void drawMenu(struct modeset_buf *buf);
     void handleInput(char input);
     void initMenu();
+    void releaseKeys(void);
 private:
 
     // Wrapper functions for the custom allocator
@@ -59,5 +63,6 @@ private:
     enum {EASY, HARD};
     int op = EASY;
     float value = 0.6f;
-    int i =  20;
+    int i =  17;
+    int j =  7;
 };

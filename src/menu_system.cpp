@@ -3,7 +3,13 @@
 #include "spdlog.h"
 
 #define NK_IMPLEMENTATION
+#define NK_INCLUDE_STANDARD_IO
+// #define NK_INCLUDE_STANDARD_VARARGS
 #define NK_INCLUDE_DEFAULT_ALLOCATOR
+// #define NK_INCLUDE_VERTEX_BUFFER_OUTPUT
+// #define NK_INCLUDE_FONT_BAKING
+// #define NK_INCLUDE_DEFAULT_FONT
+// #define NK_INCLUDE_COMMAND_USERDATA
 #include "nuklear_console/vendor/Nuklear/nuklear.h"
 // Gamepad support https://github.com/robloach/nuklear_gamepad
 #define NK_GAMEPAD_IMPLEMENTATION
@@ -126,15 +132,18 @@ void Menu::initMenu() {
     console = nk_console_init(&ctx);
 
     // Add some widgets
-    nk_console_button(console, "New Game");
-    nk_console* options = nk_console_button(console, "Options");
-    {
-        nk_console_button(options, "Some cool option!");
-        nk_console_button(options, "Option #2");
-        nk_console_button_onclick(options, "Back", nk_console_button_back);
-    }
-    nk_console_button(console, "Load Game");
-    nk_console_button(console, "Save Game");
+    //nk_console_button(console, "New Game");
+    // nk_console* options = nk_console_button(console, "Options");
+    // {
+    //     nk_console_button(options, "Some cool option!");
+    //     nk_console_button(options, "Option #2");
+    //     nk_console_button_onclick(options, "Back", nk_console_button_back);
+    // }
+    // nk_console_button(console, "Load Game");
+    // nk_console_button(console, "Save Game");
+    // Sliders
+    nk_console_slider_int(console, "Slider Int", 0, &i, 20, 1);
+    nk_console_slider_int(console, "Slider Int2", 0, &j, 20, 1);
 
 }
 
@@ -169,32 +178,33 @@ void Menu::handleInput(char input) {
     switch (input) {
         case 'e':
             nk_input_key(&ctx, NK_KEY_ENTER, true);
-            nk_input_key(&ctx, NK_KEY_ENTER, false);
             break;
         case 'w': 
             nk_input_key(&ctx, NK_KEY_UP, true);
-            nk_input_key(&ctx, NK_KEY_UP, false);
             break;  
         case 's': 
             nk_input_key(&ctx, NK_KEY_DOWN, true);
-            nk_input_key(&ctx, NK_KEY_DOWN, false);
             break;  
         case 'a': 
-            nk_input_key(&ctx, NK_KEY_LEFT, true);   
-            nk_input_key(&ctx, NK_KEY_LEFT, false);  
+            nk_input_key(&ctx, NK_KEY_LEFT, true);
             break;  
         case 'd': 
-            nk_input_key(&ctx, NK_KEY_RIGHT, true);  
-            nk_input_key(&ctx, NK_KEY_RIGHT, false); 
-            break;  
-        case 't': 
-            nk_input_key(&ctx, NK_KEY_TAB, true);   
-            nk_input_key(&ctx, NK_KEY_TAB, false);  
+            nk_input_key(&ctx, NK_KEY_RIGHT, true);
             break;  
         default:
             SPDLOG_INFO("Unhandled key: {}", std::string(1, input));  // Log unknown input
             break;
     }
 
+    nk_input_end(&ctx);  // End input processing
+}
+
+void Menu::releaseKeys(void) {
+    nk_input_begin(&ctx);  // Start input processing
+    nk_input_key(&ctx, NK_KEY_ENTER, false);
+    nk_input_key(&ctx, NK_KEY_UP, false);
+    nk_input_key(&ctx, NK_KEY_DOWN, false);
+    nk_input_key(&ctx, NK_KEY_LEFT, false);
+    nk_input_key(&ctx, NK_KEY_RIGHT, false);
     nk_input_end(&ctx);  // End input processing
 }
