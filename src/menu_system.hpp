@@ -63,6 +63,6 @@ private:
     enum {EASY, HARD};
     int op = EASY;
     float value = 0.6f;
-    int i =  17;
+    int i =  1;
     int j =  7;
 };

@@ -119,6 +119,17 @@ void Menu::nk_cairo_render(cairo_t *cr, struct nk_context *ctx) const {
                 }
                 break;
             }
+            case NK_COMMAND_TRIANGLE_FILLED:
+            {
+                const struct nk_command_triangle_filled *t = (const struct nk_command_triangle_filled *)cmd;
+                //cairo_set_source_rgba(cr, NK_TO_CAIRO(t->color.r), NK_TO_CAIRO(t->color.g), NK_TO_CAIRO(t->color.b), NK_TO_CAIRO(t->color.a));
+                cairo_move_to(cr, t->a.x, t->a.y);
+                cairo_line_to(cr, t->b.x, t->b.y);
+                cairo_line_to(cr, t->c.x, t->c.y);
+                cairo_close_path(cr);
+                cairo_fill(cr);
+            }
+            break;            
             default:
                 SPDLOG_INFO("Unsupportet Nuklear command {}",cmd->type);
                 break;
@@ -131,20 +142,10 @@ void Menu::initMenu() {
     // Set up the console within the Nuklear context
     console = nk_console_init(&ctx);
 
-    // Add some widgets
-    //nk_console_button(console, "New Game");
-    // nk_console* options = nk_console_button(console, "Options");
-    // {
-    //     nk_console_button(options, "Some cool option!");
-    //     nk_console_button(options, "Option #2");
-    //     nk_console_button_onclick(options, "Back", nk_console_button_back);
-    // }
-    // nk_console_button(console, "Load Game");
-    // nk_console_button(console, "Save Game");
-    // Sliders
-    nk_console_slider_int(console, "Slider Int", 0, &i, 20, 1);
-    nk_console_slider_int(console, "Slider Int2", 0, &j, 20, 1);
-
+    nk_console_combobox(console, "Resolution", "1920x1080@60;1280x720@50;1600x1200@60", ';', &i)
+        ->tooltip = "Select display resolution";
+    nk_console_combobox(console, "Channel", "36;40;44;48;52;56;60;64;100;104;108;112;116;120;124;128;132;136;140;144;149;153;157;161;165", ';', &i)
+        ->tooltip = "Select wfb channel";
 }
 
 void Menu::drawMenu(struct modeset_buf *buf) {
@@ -162,7 +163,7 @@ void Menu::drawMenu(struct modeset_buf *buf) {
     cairo_set_source_rgba(cr, 0, 0, 0, 0); // Transparent black (alpha = 0)
     cairo_paint(cr);
 
-    nk_console_render_window(console, "nuklear_console", nk_rect(200, 200, 800, 600), NK_WINDOW_TITLE);
+    nk_console_render_window(console, "VRX Settings", nk_rect(200, 200, 800, 600), NK_WINDOW_TITLE);
 
     // Render Nuklear commands using Cairo
     nk_cairo_render(cr, &ctx);
