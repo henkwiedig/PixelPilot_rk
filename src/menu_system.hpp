@@ -65,4 +65,6 @@ private:
     float value = 0.6f;
     int i =  1;
     int j =  7;
+    const int textedit_buffer_size = 256;
+    char textedit_buffer[256] = "123456ABFCD";    
 };

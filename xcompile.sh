@@ -36,7 +36,7 @@ if [ ! -f $output/tmp/prepare_chroot.done ]; then
     echo 'deb [signed-by=/usr/share/keyrings/radxa-archive-keyring.gpg] https://radxa-repo.github.io/bullseye rockchip-bullseye main' > /etc/apt/sources.list.d/80-rockchip.list
 
     apt-get update
-    apt-get install -y cmake g++ git pkg-config librockchip-mpp-dev libcairo-dev libdrm-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libspdlog-dev nlohmann-json3-dev libyaml-cpp-dev
+    apt-get install -y cmake g++ git pkg-config librockchip-mpp-dev libcairo-dev libdrm-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libspdlog-dev nlohmann-json3-dev libyaml-cpp-dev libgpiod-dev
     apt clean
     touch /tmp/prepare_chroot.done
 EOL

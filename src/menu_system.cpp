@@ -119,17 +119,27 @@ void Menu::nk_cairo_render(cairo_t *cr, struct nk_context *ctx) const {
                 }
                 break;
             }
+            case NK_COMMAND_TRIANGLE:
+            {
+                const struct nk_command_triangle *t = (const struct nk_command_triangle *)cmd;
+                cairo_set_line_width(cr, t->line_thickness);
+                cairo_move_to(cr, t->a.x, t->a.y);
+                cairo_line_to(cr, t->b.x, t->b.y);
+                cairo_line_to(cr, t->c.x, t->c.y);
+                cairo_close_path(cr);
+                cairo_stroke(cr);
+                break;
+            }
             case NK_COMMAND_TRIANGLE_FILLED:
             {
                 const struct nk_command_triangle_filled *t = (const struct nk_command_triangle_filled *)cmd;
-                //cairo_set_source_rgba(cr, NK_TO_CAIRO(t->color.r), NK_TO_CAIRO(t->color.g), NK_TO_CAIRO(t->color.b), NK_TO_CAIRO(t->color.a));
                 cairo_move_to(cr, t->a.x, t->a.y);
                 cairo_line_to(cr, t->b.x, t->b.y);
                 cairo_line_to(cr, t->c.x, t->c.y);
                 cairo_close_path(cr);
                 cairo_fill(cr);
+                break;
             }
-            break;            
             default:
                 SPDLOG_INFO("Unsupportet Nuklear command {}",cmd->type);
                 break;
@@ -146,6 +156,8 @@ void Menu::initMenu() {
         ->tooltip = "Select display resolution";
     nk_console_combobox(console, "Channel", "36;40;44;48;52;56;60;64;100;104;108;112;116;120;124;128;132;136;140;144;149;153;157;161;165", ';', &i)
         ->tooltip = "Select wfb channel";
+    nk_console_textedit(console, "WLAN Key", textedit_buffer, textedit_buffer_size);
+
 }
 
 void Menu::drawMenu(struct modeset_buf *buf) {

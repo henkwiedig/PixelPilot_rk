@@ -26,6 +26,7 @@ extern "C" {
 #include "spdlog/spdlog.h"
 #include <fmt/ranges.h>
 #include "menu_system.hpp"
+#include "GPIOManager.hpp"
 
 #define WFB_LINK_LOST 1
 #define WFB_LINK_JAMMED 2
@@ -1482,7 +1483,7 @@ cairo_surface_t * surface_from_embedded_png(const char * png, size_t length)
 		closure);
 }
 
-bool checkForInput(std::string& input) {
+bool checkForInput(GPIOManager& gpio, std::string& input) {
     char buffer[256];
     ssize_t bytesRead = read(STDIN_FILENO, buffer, sizeof(buffer) - 1);
     if (bytesRead > 0) {
@@ -1490,6 +1491,24 @@ bool checkForInput(std::string& input) {
         input = std::string(buffer);
         return true;
     }
+
+    if (gpio.getValue("Up") == 0) {  // Active LOW
+        input = "w";
+        return true;
+    } else if (gpio.getValue("Down") == 0) {
+        input = "s";
+        return true;
+    } else if (gpio.getValue("Left") == 0) {
+        input = "a";
+        return true;
+    } else if (gpio.getValue("Right") == 0) {
+        input = "d";
+        return true;
+    } else if (gpio.getValue("Ok") == 0) {
+        input = "e";
+        return true;
+    }
+	
     return false; // No input available
 }
 
@@ -1520,6 +1539,13 @@ void *__OSD_THREAD__(void *param) {
     std::string input;
     int flags = fcntl(STDIN_FILENO, F_GETFL, 0); // Get current flags
     fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK); // Set non-blocking mode
+
+	GPIOManager gpio;
+    gpio.addLine("Up", "gpiochip4", 19);
+    gpio.addLine("Down", "gpiochip4", 21);
+    gpio.addLine("Left", "gpiochip4", 18);
+    gpio.addLine("Right", "gpiochip3", 11);
+    gpio.addLine("Ok", "gpiochip3", 12);
 
 	while (!osd_thread_signal) {
 		std::unique_lock<std::mutex> lock(mtx);
@@ -1552,7 +1578,7 @@ void *__OSD_THREAD__(void *param) {
 			struct modeset_buf *buf = &p->out->osd_bufs[buf_idx];
 
 			// Check if input is available
-			if (checkForInput(input)) {
+	        if (checkForInput(gpio, input)) {
 				SPDLOG_INFO("You typed: {}",input.c_str());				
 				switch (input[0]) {
 					case 'm':
