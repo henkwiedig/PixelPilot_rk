@@ -9,6 +9,8 @@
 #include "nuklear_settings.h"
 #include "MenuConfig.hpp"
 
+#define MAX_LINE_LENGTH 1024
+
 class Menu {
 public:
     Menu(){
@@ -16,7 +18,26 @@ public:
         YAML::Node config = YAML::LoadFile("menu.yml");
         spdlog::debug("Loaded YAML file");
         gpioConfig = config["gpio"].as<GPIOConfig>();
+
+        //wfb-ng channels
         wfbChannels = config["menu"]["wfb_channels"].as<std::vector<WLANChannel>>();
+        int current_channel_value = read_wifi_channel("/etc/wifibroadcast.cfg");
+        if (current_channel_value == -1) {
+            spdlog::error("Failed to read the current WiFi channel");
+        }
+        // Find the index of the current channel in wfbChannels
+        current_channel = -1;
+        for (size_t i = 0; i < wfbChannels.size(); ++i) {
+            if (wfbChannels[i].channel == current_channel_value) {
+                current_channel = static_cast<int>(i); // Found the matching index
+                break;
+            }
+        }
+        if (current_channel == -1) {
+            spdlog::error("Current channel {} not found in wfbChannels");
+        } else {
+            spdlog::debug("Current channel index: {}", current_channel);
+        }        
 
         default_font.userdata.ptr = NULL; // No additional font data
         default_font.height = 23.0f; // Font height
@@ -60,18 +81,20 @@ private:
     struct nk_context ctx;
     nk_console* console;
 
-    // init gui state
+    // wfb_ng channel
+    char* concatChannels(const std::vector<WLANChannel>& wfbChannels);
+    static void wlan_channel_changed(struct nk_console* button, void* user_data);
+    void execute_command(const char *command);
+    void update_config(const char *config_path, int channel);
+    void read_and_process_nics(const char *default_path, int channel);
+    void process_interfaces(const char *interfaces, int channel);
+    int read_wifi_channel(const char *config_path);
     std::vector<WLANChannel> wfbChannels;
+    int current_channel = 1;
    
-    enum {EASY, HARD};
-    int op = EASY;
-    float value = 0.6f;
-    int i =  1;
-    int j =  7;
-    int wlan_channel = 161;
-    const int textedit_buffer_size = 256;
-    char textedit_buffer[256] = "123456ABFCD";
-    nk_bool radio_option = nk_false;
-    char file_path_buffer[1024] = {0};
-    int file_path_buffer_size = 1024;    
+    // const int textedit_buffer_size = 256;
+    // char textedit_buffer[256] = "123456ABFCD";
+    // nk_bool radio_option = nk_false;
+    // char file_path_buffer[1024] = {0};
+    // int file_path_buffer_size = 1024;    
 };

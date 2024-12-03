@@ -1,3 +1,7 @@
+#include <sys/reboot.h>
+#include <linux/reboot.h> // For specific LINUX_REBOOT_CMD_* macros
+#include <cstdlib> // for malloc and free
+
 #include "menu_system.hpp"
 #include "drm.h"
 #include "spdlog.h"
@@ -7,9 +11,6 @@
 #define NK_GAMEPAD_IMPLEMENTATION
 #define NK_CONSOLE_IMPLEMENTATION
 #include "nuklear_settings.h"
-
-
-#include <cstdlib> // for malloc and free
 
 extern bool menuActive;
 extern struct osd_vars osd_vars;
@@ -141,33 +142,69 @@ void Menu::nk_cairo_render(cairo_t *cr, struct nk_context *ctx) const {
     }
 }
 
+void reboot_clicked(struct nk_console* button, void* user_data) {
+    // Sync filesystem to ensure all changes are written
+    sync();
+
+    // Trigger a system reboot
+    if (reboot(LINUX_REBOOT_CMD_RESTART) != 0) {
+        perror("Reboot failed");
+    }    
+ 
+}
+
 void exit_clicked(struct nk_console* button, void* user_data) {
     menuActive = false;
     osd_vars.refresh_frequency_ms = 1000;
 }
 
-void wlan_channel_changed(struct nk_console* button, void* user_data) {
-    int* chan = static_cast<int*>(user_data);
-    SPDLOG_INFO("Changeing wlan channel to {}", *chan);
+void Menu::wlan_channel_changed(struct nk_console* button, void* user_data) {
+    Menu* menu_instance = static_cast<Menu*>(user_data);
+
+    spdlog::info("Changeing wlan channel to chan {} freq {}", 
+        menu_instance->wfbChannels[menu_instance->current_channel].channel,
+        menu_instance->wfbChannels[menu_instance->current_channel].frequency);
+
+    menu_instance->read_and_process_nics("/etc/default/wifibroadcast", menu_instance->wfbChannels[menu_instance->current_channel].channel);
+    menu_instance->update_config("/etc/wifibroadcast.cfg", menu_instance->wfbChannels[menu_instance->current_channel].channel);        
+ 
+ }
+
+char* Menu::concatChannels(const std::vector<WLANChannel>& wfbChannels) {
+    std::ostringstream oss;
+
+    for (const auto& wlanChannel : wfbChannels) {
+        oss << wlanChannel.channel
+            << " (" << wlanChannel.frequency << " MHz);";
+    }
+
+    // Convert the string stream to a std::string
+    std::string result = oss.str();
+
+    // Remove the last semicolon if the result is not empty
+    if (!result.empty() && result.back() == ';') {
+        result.pop_back();
+    }
+
+    // Allocate memory for the C-string and copy the content
+    char* cStr = new char[result.size() + 1];
+    std::strcpy(cStr, result.c_str());
+
+    return cStr; // Caller must free this memory with `delete[]`
 }
+
 
 void Menu::initMenu() {
 
     // Set up the console within the Nuklear context
     console = nk_console_init(&ctx);
 
+    // nk_console_combobox(console, "Resolution", "1920x1080@60;1280x720@50;1600x1200@60", ';', &i)
+    //     ->tooltip = "Select display resolution";
 
-    nk_console_file(console, "File", file_path_buffer, file_path_buffer_size);
-
-    nk_console_combobox(console, "Resolution", "1920x1080@60;1280x720@50;1600x1200@60", ';', &i)
-        ->tooltip = "Select display resolution";
-    nk_console* wlan_channel_options = nk_console_combobox(console, "Channel",  "36;40;44;48;52;56;60;64;100;104;108;112;116;120;124;128;132;136;140;144;149;153;157;161;165", ';', &wlan_channel);
+    nk_console* wlan_channel_options = nk_console_combobox(console, "Channel",  concatChannels(wfbChannels), ';', &current_channel);
     wlan_channel_options->tooltip = "Select wfb channel";
-    nk_console_add_event_handler(wlan_channel_options, NK_CONSOLE_EVENT_CHANGED, &wlan_channel_changed,&wlan_channel,NULL);
-    nk_console_checkbox(console, "Ad-Hoc network", &radio_option)
-        ->tooltip = "Enable/Disable the Ad-Hoc network access point";
-    nk_console_textedit(console, "WLAN Key", textedit_buffer, textedit_buffer_size)
-       ->tooltip = "CHange WLAN Key";
+    nk_console_add_event_handler(wlan_channel_options, NK_CONSOLE_EVENT_CHANGED, &wlan_channel_changed,this,NULL);
 
     // setup theme dark
     struct nk_color table[NK_COLOR_COUNT];
@@ -205,8 +242,8 @@ void Menu::initMenu() {
     table[NK_COLOR_KNOB_CURSOR_ACTIVE] = table[NK_COLOR_SLIDER_CURSOR_ACTIVE];
     nk_style_from_table(&ctx, table);    
 
+    nk_console_button_onclick(console, "Reboot VRX", &reboot_clicked);
     nk_console_button_onclick(console, "Exit Menu", &exit_clicked);
-
 
 }
 
@@ -272,4 +309,129 @@ void Menu::releaseKeys(void) {
     nk_input_key(&ctx, NK_KEY_LEFT, false);
     nk_input_key(&ctx, NK_KEY_RIGHT, false);
     nk_input_end(&ctx);  // End input processing
+}
+
+
+
+void Menu::execute_command(const char *command) {
+    if (system(command) != 0) {
+        fprintf(stderr, "Error executing command: %s\n", command);
+    }
+}
+
+void Menu::update_config(const char *config_path, int channel) {
+    FILE *file = fopen(config_path, "r");
+    if (!file) {
+        fprintf(stderr, "Error opening config file: %s\n", config_path);
+        return;
+    }
+
+    char temp_path[] = "/tmp/wifibroadcast.cfgXXXXXX";
+    int temp_fd = mkstemp(temp_path);
+    if (temp_fd == -1) {
+        fprintf(stderr, "Error creating temporary file\n");
+        fclose(file);
+        return;
+    }
+
+    FILE *temp_file = fdopen(temp_fd, "w");
+    if (!temp_file) {
+        fprintf(stderr, "Error opening temporary file for writing\n");
+        fclose(file);
+        return;
+    }
+
+    char line[MAX_LINE_LENGTH];
+    int updated = 0;
+
+    while (fgets(line, sizeof(line), file)) {
+        if (strstr(line, "wifi_channel =") != NULL) {
+            fprintf(temp_file, "wifi_channel = %d\n", channel);
+            updated = 1;
+        } else {
+            fputs(line, temp_file);
+        }
+    }
+
+    if (!updated) {
+        fprintf(temp_file, "wifi_channel = %d\n", channel);
+    }
+
+    fclose(file);
+    fclose(temp_file);
+
+    if (rename(temp_path, config_path) != 0) {
+        fprintf(stderr, "Error updating config file: %s\n", config_path);
+        remove(temp_path);
+    }
+}
+
+void Menu::process_interfaces(const char *interfaces, int channel) {
+    char *nics = strdup(interfaces);
+    if (!nics) {
+        fprintf(stderr, "Memory allocation error\n");
+        return;
+    }
+
+    char *nic = strtok(nics, " ");
+    while (nic) {
+        char command[256];
+        snprintf(command, sizeof(command), "iw %s set channel %d", nic, channel);
+        execute_command(command);
+        nic = strtok(NULL, " ");
+    }
+
+    free(nics);
+}
+
+void Menu::read_and_process_nics(const char *default_path, int channel) {
+    FILE *file = fopen(default_path, "r");
+    if (!file) {
+        fprintf(stderr, "Error opening file: %s\n", default_path);
+        return;
+    }
+
+    char line[MAX_LINE_LENGTH];
+    while (fgets(line, sizeof(line), file)) {
+        if (strstr(line, "WFB_NICS=") == line) {
+            char *start = strchr(line, '"');
+            char *end = strrchr(line, '"');
+            if (start && end && end > start) {
+                *end = '\0';
+                process_interfaces(start + 1, channel);
+            }
+        }
+    }
+
+    fclose(file);
+}
+
+int Menu::read_wifi_channel(const char *config_path) {
+    FILE *file = fopen(config_path, "r");
+    if (!file) {
+        perror("Error opening config file");
+        return -1; // Return -1 on error
+    }
+
+    char line[MAX_LINE_LENGTH];
+    int wifi_channel = -1;
+
+    while (fgets(line, sizeof(line), file)) {
+        if (strstr(line, "wifi_channel =") != NULL) {
+            // Extract the channel value
+            char *equals_sign = strchr(line, '=');
+            if (equals_sign) {
+                wifi_channel = atoi(equals_sign + 1); // Convert to integer
+                break; // Exit the loop once the channel is found
+            }
+        }
+    }
+
+    fclose(file);
+
+    if (wifi_channel == -1) {
+        fprintf(stderr, "wifi_channel not found in config file\n");
+    }
+
+    return wifi_channel;
 }
