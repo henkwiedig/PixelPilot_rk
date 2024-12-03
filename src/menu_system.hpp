@@ -11,6 +11,19 @@
 
 #define MAX_LINE_LENGTH 1024
 
+struct DRMMode {
+    uint width;
+    uint height;
+    uint refresh_rate;
+    uint16_t flags : 2; // Only 2 bits required: 1 for is_preferred, 1 for is_current
+
+    // Helper functions for clarity
+    bool is_preferred() const { return flags & 0x1; }
+    bool is_current() const { return flags & 0x2; }    
+};
+
+extern int drm_fd;
+
 class Menu {
 public:
     Menu(){
@@ -37,8 +50,14 @@ public:
             spdlog::error("Current channel {} not found in wfbChannels");
         } else {
             spdlog::debug("Current channel index: {}", current_channel);
-        }        
+        }
+        
 
+        // screen-mode
+        drmModes = get_supported_modes(drm_fd);
+
+
+        // nuklear setup
         default_font.userdata.ptr = NULL; // No additional font data
         default_font.height = 23.0f; // Font height
         default_font.width = font_width_calculator; // Text width calculation function
@@ -91,6 +110,13 @@ private:
     int read_wifi_channel(const char *config_path);
     std::vector<WLANChannel> wfbChannels;
     int current_channel = 1;
+
+    //screen mode
+    std::vector<DRMMode> get_supported_modes(int fd);
+    char* concatModes(const std::vector<DRMMode>& drmModes);
+    static void drmmode_changed(struct nk_console* button, void* user_data);
+    std::vector<DRMMode> drmModes;
+    int current_drmmode = 1;
    
     // const int textedit_buffer_size = 256;
     // char textedit_buffer[256] = "123456ABFCD";

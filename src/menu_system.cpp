@@ -1,6 +1,7 @@
 #include <sys/reboot.h>
 #include <linux/reboot.h> // For specific LINUX_REBOOT_CMD_* macros
 #include <cstdlib> // for malloc and free
+#include <fstream>
 
 #include "menu_system.hpp"
 #include "drm.h"
@@ -14,6 +15,7 @@
 
 extern bool menuActive;
 extern struct osd_vars osd_vars;
+extern void sig_handler(int signum);
 
 void Menu::nk_cairo_render(cairo_t *cr, struct nk_context *ctx) const {
     const struct nk_command *cmd;
@@ -168,7 +170,29 @@ void Menu::wlan_channel_changed(struct nk_console* button, void* user_data) {
     menu_instance->read_and_process_nics("/etc/default/wifibroadcast", menu_instance->wfbChannels[menu_instance->current_channel].channel);
     menu_instance->update_config("/etc/wifibroadcast.cfg", menu_instance->wfbChannels[menu_instance->current_channel].channel);        
  
- }
+}
+
+void Menu::drmmode_changed(struct nk_console* button, void* user_data) {
+    Menu* menu_instance = static_cast<Menu*>(user_data);
+
+    const DRMMode& current_mode = menu_instance->drmModes[menu_instance->current_drmmode];
+
+    spdlog::info("Changing screen mode to {}x{}@{}", 
+        current_mode.width,
+        current_mode.height,
+        current_mode.refresh_rate);
+
+    // Write the new screen mode to /config/scripts/screen-mode
+    std::ofstream mode_file("/config/scripts/screen-mode");
+    if (mode_file.is_open()) {
+        mode_file << current_mode.width << "x" << current_mode.height 
+                  << "@" << current_mode.refresh_rate << "\n";
+        mode_file.close();
+        spdlog::info("Updated /config/scripts/screen-mode successfully.");
+    } else {
+        spdlog::error("Failed to open /config/scripts/screen-mode for writing.");
+    }
+}
 
 char* Menu::concatChannels(const std::vector<WLANChannel>& wfbChannels) {
     std::ostringstream oss;
@@ -193,15 +217,52 @@ char* Menu::concatChannels(const std::vector<WLANChannel>& wfbChannels) {
     return cStr; // Caller must free this memory with `delete[]`
 }
 
+char* Menu::concatModes(const std::vector<DRMMode>& drmModes) {
+        std::ostringstream oss;
+
+        for (const auto& mode : drmModes) {
+            oss << mode.width << "x" 
+                << mode.height << "@" 
+                << mode.refresh_rate
+                << (mode.is_preferred() ? " (Preferred)" : "")
+                << (mode.is_current() ? " (Current)" : "")
+                << ";";
+        }
+
+        // Convert the string stream to a std::string
+        std::string result = oss.str();
+
+        // Remove the last semicolon if the result is not empty
+        if (!result.empty() && result.back() == ';') {
+            result.pop_back();
+        }
+
+        // Allocate memory for the C-string and copy the content
+        char* cStr = new char[result.size() + 1];
+        std::strcpy(cStr, result.c_str());
+
+        return cStr; // Caller must free this memory with `delete[]`
+}
+
+// ToDO: Hot reset screenmode
+void apply_clicked(struct nk_console* button, void* user_data) {
+    spdlog::info("Apply screen-mdode. Restart PixelPilot_rk");
+    sig_handler(1);
+}
 
 void Menu::initMenu() {
 
     // Set up the console within the Nuklear context
     console = nk_console_init(&ctx);
 
-    // nk_console_combobox(console, "Resolution", "1920x1080@60;1280x720@50;1600x1200@60", ';', &i)
-    //     ->tooltip = "Select display resolution";
+    // row spacewing for screen mode
+    nk_console* drmmode_options = nk_console_combobox(console, "Resolution", concatModes(drmModes), ';', &current_drmmode);
+    drmmode_options->tooltip = "Select display resolution";
+    nk_console_add_event_handler(drmmode_options, NK_CONSOLE_EVENT_CHANGED, &drmmode_changed,this,NULL);
+   
+    nk_console_button_onclick(console, "Apply", &apply_clicked);
 
+    // wfb-ng channel
     nk_console* wlan_channel_options = nk_console_combobox(console, "Channel",  concatChannels(wfbChannels), ';', &current_channel);
     wlan_channel_options->tooltip = "Select wfb channel";
     nk_console_add_event_handler(wlan_channel_options, NK_CONSOLE_EVENT_CHANGED, &wlan_channel_changed,this,NULL);
@@ -434,4 +495,70 @@ int Menu::read_wifi_channel(const char *config_path) {
     }
 
     return wifi_channel;
+}
+
+
+std::vector<DRMMode> Menu::get_supported_modes(int fd) {
+    std::vector<DRMMode> modes;
+	uint prev_h, prev_v, prev_refresh = 0;
+
+    drmModeRes* res = drmModeGetResources(fd);
+
+    if (!res) {
+        perror("Failed to get DRM resources");
+        return modes; // Return empty vector on error
+    }
+
+    for (int i = 0; i < res->count_connectors; ++i) {
+        drmModeConnector* conn = drmModeGetConnector(fd, res->connectors[i]);
+        if (!conn) continue;
+
+        drmModeCrtc* crtc = nullptr;
+        if (conn->encoder_id) {
+            drmModeEncoder* encoder = drmModeGetEncoder(fd, conn->encoder_id);
+            if (encoder) {
+                crtc = drmModeGetCrtc(fd, encoder->crtc_id);
+                drmModeFreeEncoder(encoder);
+            }
+        }
+
+        for (int j = 0; j < conn->count_modes; ++j) {
+            drmModeModeInfo mode_info = conn->modes[j];
+            DRMMode mode = {
+                mode_info.hdisplay,
+                mode_info.vdisplay,
+                mode_info.vrefresh,
+                0 // Initialize flags to 0
+            };
+
+            // Set the preferred flag
+            if (mode_info.type & DRM_MODE_TYPE_PREFERRED) {
+                mode.flags |= 0x1; // Set bit 0
+            }
+
+            // Check if this mode is the current mode (if CRTC is active)
+            if (crtc && crtc->mode_valid &&
+                crtc->mode.hdisplay == mode_info.hdisplay &&
+                crtc->mode.vdisplay == mode_info.vdisplay &&
+                crtc->mode.vrefresh == mode_info.vrefresh) {
+                mode.flags |= 0x2; // Set bit 1
+            }
+
+            if (mode_info.hdisplay == prev_h && mode_info.vdisplay == prev_v && mode_info.vrefresh == prev_refresh)
+				continue;
+            prev_h = mode_info.hdisplay;
+			prev_v = mode_info.vdisplay;
+			prev_refresh = mode_info.vrefresh;
+
+            modes.push_back(mode);
+        }
+
+        if (crtc) {
+            drmModeFreeCrtc(crtc);
+        }
+        drmModeFreeConnector(conn);
+    }
+
+    drmModeFreeResources(res);
+    return modes;
 }
