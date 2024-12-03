@@ -156,6 +156,9 @@ void Menu::initMenu() {
     // Set up the console within the Nuklear context
     console = nk_console_init(&ctx);
 
+
+    nk_console_file(console, "File", file_path_buffer, file_path_buffer_size);
+
     nk_console_combobox(console, "Resolution", "1920x1080@60;1280x720@50;1600x1200@60", ';', &i)
         ->tooltip = "Select display resolution";
     nk_console* wlan_channel_options = nk_console_combobox(console, "Channel",  "36;40;44;48;52;56;60;64;100;104;108;112;116;120;124;128;132;136;140;144;149;153;157;161;165", ';', &wlan_channel);

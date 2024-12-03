@@ -72,4 +72,6 @@ private:
     const int textedit_buffer_size = 256;
     char textedit_buffer[256] = "123456ABFCD";
     nk_bool radio_option = nk_false;
+    char file_path_buffer[1024] = {0};
+    int file_path_buffer_size = 1024;    
 };

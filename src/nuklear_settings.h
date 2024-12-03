@@ -5,6 +5,7 @@
 #define NK_INCLUDE_FONT_BAKING
 #define NK_INCLUDE_DEFAULT_FONT
 // #define NK_INCLUDE_COMMAND_USERDATA
+#define NK_CONSOLE_ENABLE_TINYDIR
 #include "nuklear_console/vendor/Nuklear/nuklear.h"
 // Gamepad support https://github.com/robloach/nuklear_gamepad
 #define NK_GAMEPAD_NONE
