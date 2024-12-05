@@ -16,6 +16,7 @@
 extern bool menuActive;
 extern struct osd_vars osd_vars;
 extern void sig_handler(int signum);
+const int textedit_buffer_size = 256;
 
 void Menu::nk_cairo_render(cairo_t *cr, struct nk_context *ctx) const {
     const struct nk_command *cmd;
@@ -194,7 +195,7 @@ void Menu::drmmode_changed(struct nk_console* button, void* user_data) {
     }
 }
 
-char* Menu::concatChannels(const std::vector<WLANChannel>& wfbChannels) {
+char* Menu::concatChannels(const std::vector<WFBNGChannel>& wfbChannels) {
     std::ostringstream oss;
 
     for (const auto& wlanChannel : wfbChannels) {
@@ -250,6 +251,36 @@ void apply_clicked(struct nk_console* button, void* user_data) {
     sig_handler(1);
 }
 
+void wlan_apply_clicked(struct nk_console* button, void* user_data) {
+    spdlog::info("wlan_apply_clicked");
+    Menu* menu_instance = static_cast<Menu*>(user_data);
+    spdlog::debug("New WLAN Settings WLan Password: {}", menu_instance->password);
+    spdlog::debug("New Ad-Hoc Settings SSID: {} Password: {} Enabled: {}", menu_instance->ad_hoc_ssid,menu_instance->password,menu_instance->ad_hoc_enabled);
+}
+
+void wlan_toggled(struct nk_console* button, void* user_data) {
+    spdlog::info("wlan_toggled triggered");
+    Menu* menu_instance = static_cast<Menu*>(user_data);
+    menu_instance->ad_hoc_enabled = nk_false;
+    nk_console* wlan_settings= static_cast<nk_console*>(menu_instance->console->children[3]);
+    wlan_settings->children[2]->visible = nk_true;
+    wlan_settings->children[3]->visible = nk_true;
+    wlan_settings->children[4]->visible = nk_false;
+    wlan_settings->children[5]->visible = nk_false;
+}
+
+void hd_hoc_toggled(struct nk_console* button, void* user_data) {
+    spdlog::info("ah_hoc_toggled triggered");
+    Menu* menu_instance = static_cast<Menu*>(user_data);
+    menu_instance->wlan_enabled = nk_false;
+    nk_console* wlan_settings= static_cast<nk_console*>(menu_instance->console->children[3]);
+    wlan_settings->children[2]->visible = nk_false;
+    wlan_settings->children[3]->visible = nk_false;
+    wlan_settings->children[4]->visible = nk_true;
+    wlan_settings->children[5]->visible = nk_true;
+}
+
+
 void Menu::initMenu() {
 
     // Set up the console within the Nuklear context
@@ -266,6 +297,33 @@ void Menu::initMenu() {
     nk_console* wlan_channel_options = nk_console_combobox(console, "Channel",  concatChannels(wfbChannels), ';', &current_channel);
     wlan_channel_options->tooltip = "Select wfb channel";
     nk_console_add_event_handler(wlan_channel_options, NK_CONSOLE_EVENT_CHANGED, &wlan_channel_changed,this,NULL);
+
+
+    // WLAN Settings
+    nk_console* wlan_settings = nk_console_button(console, "WLAN Settings");
+    {
+
+        nk_console* nk_wlan_enabled = nk_console_checkbox(wlan_settings, "WLAN Enabled", &wlan_enabled);
+        nk_console_add_event_handler(nk_wlan_enabled, NK_CONSOLE_EVENT_CHANGED, &wlan_toggled, this, NULL);
+        nk_console* nk_ad_hoc_enabled = nk_console_checkbox(wlan_settings, "Ad-Hoc Enabled", &ad_hoc_enabled);
+        nk_console_add_event_handler(nk_ad_hoc_enabled, NK_CONSOLE_EVENT_CHANGED, &hd_hoc_toggled, this, NULL);
+
+
+        nk_console* nk_current_wlan_index = nk_console_combobox(wlan_settings, "SSID", "MySSiD", ';', &current_wlan_index);
+        nk_console* nk_password = nk_console_textedit(wlan_settings, "Password", password, textedit_buffer_size);
+        nk_current_wlan_index->visible = wlan_enabled;
+        nk_password->visible = wlan_enabled;
+
+        nk_console* nk_ad_hoc_ssid = nk_console_textedit(wlan_settings, "Ad-Hoc SSID", ad_hoc_ssid, textedit_buffer_size);
+        nk_console* nk_ad_hoc_password = nk_console_textedit(wlan_settings, "Ad-Hoc Password", ad_hoc_password, textedit_buffer_size);
+        nk_ad_hoc_ssid->visible = ad_hoc_enabled;
+        nk_ad_hoc_password->visible = ad_hoc_enabled;
+
+        nk_console* wlan_apply_button = nk_console_button(wlan_settings, "Apply");
+        nk_console_add_event_handler(wlan_apply_button, NK_CONSOLE_EVENT_CLICKED, &wlan_apply_clicked,this,NULL);
+
+        nk_console_button_onclick(wlan_settings, "Back", &nk_console_button_back);
+    }    
 
     // setup theme dark
     struct nk_color table[NK_COLOR_COUNT];

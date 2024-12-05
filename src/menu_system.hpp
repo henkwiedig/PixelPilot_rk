@@ -22,6 +22,15 @@ struct DRMMode {
     bool is_current() const { return flags & 0x2; }    
 };
 
+struct WLAN {
+    std::string bssid;
+    std::string ssid;
+    int signal_strength;
+    int channel;
+    std::string security;  // e.g., WPA2, None, etc.
+    std::string password;
+};
+
 extern int drm_fd;
 
 class Menu {
@@ -33,7 +42,7 @@ public:
         gpioConfig = config["gpio"].as<GPIOConfig>();
 
         //wfb-ng channels
-        wfbChannels = config["menu"]["wfb_channels"].as<std::vector<WLANChannel>>();
+        wfbChannels = config["menu"]["wfb_channels"].as<std::vector<WFBNGChannel>>();
         int current_channel_value = read_wifi_channel("/etc/wifibroadcast.cfg");
         if (current_channel_value == -1) {
             spdlog::error("Failed to read the current WiFi channel");
@@ -52,10 +61,9 @@ public:
             spdlog::debug("Current channel index: {}", current_channel);
         }
         
-
         // screen-mode
         drmModes = get_supported_modes(drm_fd);
-
+     
 
         // nuklear setup
         default_font.userdata.ptr = NULL; // No additional font data
@@ -72,6 +80,13 @@ public:
     void initMenu();
     void releaseKeys(void);
     GPIOConfig gpioConfig;
+    char password[256] = "PassW0rd!!!";
+    nk_bool wlan_enabled = nk_true;
+    char ad_hoc_ssid[256] = "OpenIPC GS";
+    char ad_hoc_password[256] = "openipc";
+    nk_bool ad_hoc_enabled = nk_false;
+    nk_console* console;
+    
 private:
 
     // Wrapper functions for the custom allocator
@@ -98,17 +113,16 @@ private:
 
     void nk_cairo_render(cairo_t *cr, struct nk_context *ctx) const;
     struct nk_context ctx;
-    nk_console* console;
 
     // wfb_ng channel
-    char* concatChannels(const std::vector<WLANChannel>& wfbChannels);
+    char* concatChannels(const std::vector<WFBNGChannel>& wfbChannels);
     static void wlan_channel_changed(struct nk_console* button, void* user_data);
     void execute_command(const char *command);
     void update_config(const char *config_path, int channel);
     void read_and_process_nics(const char *default_path, int channel);
     void process_interfaces(const char *interfaces, int channel);
     int read_wifi_channel(const char *config_path);
-    std::vector<WLANChannel> wfbChannels;
+    std::vector<WFBNGChannel> wfbChannels;
     int current_channel = 1;
 
     //screen mode
@@ -117,7 +131,12 @@ private:
     static void drmmode_changed(struct nk_console* button, void* user_data);
     std::vector<DRMMode> drmModes;
     int current_drmmode = 1;
-   
+
+    // wlan
+    std::vector<WLAN> get_available_wlans();
+    std::vector<WLAN> availableWlans;
+    int current_wlan_index;
+    
     // const int textedit_buffer_size = 256;
     // char textedit_buffer[256] = "123456ABFCD";
     // nk_bool radio_option = nk_false;

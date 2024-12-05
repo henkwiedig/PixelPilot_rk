@@ -20,7 +20,7 @@ struct GPIOConfig {
 };
 
 // Define a struct to hold the WLAN channel and frequency
-struct WLANChannel {
+struct WFBNGChannel {
     int channel;
     int frequency;
 };
@@ -58,8 +58,8 @@ namespace YAML {
 
     // Specialize YAML::convert for WLANChannel
     template<>
-    struct convert<WLANChannel> {
-        static bool decode(const Node& node, WLANChannel& wlanChannel) {
+    struct convert<WFBNGChannel> {
+        static bool decode(const Node& node, WFBNGChannel& wlanChannel) {
             if (node.IsMap()) {
                 wlanChannel.channel = node["channel"].as<int>();
                 wlanChannel.frequency = node["frequency"].as<int>();
@@ -73,11 +73,11 @@ namespace YAML {
 
     // Specialize for the list of WLANChannels
     template<>
-    struct convert<std::vector<WLANChannel>> {
-        static bool decode(const Node& node, std::vector<WLANChannel>& wlanChannels) {
+    struct convert<std::vector<WFBNGChannel>> {
+        static bool decode(const Node& node, std::vector<WFBNGChannel>& wlanChannels) {
             if (node.IsSequence()) {
                 for (const auto& item : node) {
-                    WLANChannel wlanChannel = item.as<WLANChannel>();
+                    WFBNGChannel wlanChannel = item.as<WFBNGChannel>();
                     wlanChannels.push_back(wlanChannel);
                 }
                 return true;
