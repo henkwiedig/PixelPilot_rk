@@ -28,7 +28,6 @@ struct WLAN {
     int signal_strength;
     int channel;
     std::string security;  // e.g., WPA2, None, etc.
-    std::string password;
 };
 
 extern int drm_fd;
@@ -80,6 +79,11 @@ public:
     void initMenu();
     void releaseKeys(void);
     GPIOConfig gpioConfig;
+
+
+    // wlan
+    std::vector<WLAN> availableWlans;
+    int current_wlan_index;
     char password[256] = "PassW0rd!!!";
     nk_bool wlan_enabled = nk_true;
     char ad_hoc_ssid[256] = "OpenIPC GS";
@@ -132,11 +136,9 @@ private:
     std::vector<DRMMode> drmModes;
     int current_drmmode = 1;
 
-    // wlan
-    std::vector<WLAN> get_available_wlans();
-    std::vector<WLAN> availableWlans;
-    int current_wlan_index;
-    
+    //WLAN
+    static void wlan_apply_clicked(struct nk_console* button, void* user_data);
+
     // const int textedit_buffer_size = 256;
     // char textedit_buffer[256] = "123456ABFCD";
     // nk_bool radio_option = nk_false;

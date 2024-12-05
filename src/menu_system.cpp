@@ -245,16 +245,40 @@ char* Menu::concatModes(const std::vector<DRMMode>& drmModes) {
         return cStr; // Caller must free this memory with `delete[]`
 }
 
+char* concatWLANs(const std::vector<WLAN>& wlans) {
+    std::ostringstream oss;
+
+    for (const auto& wlan : wlans) {
+        oss << wlan.ssid
+            << " (" << wlan.security << ");";
+    }
+
+    // Convert the string stream to a std::string
+    std::string result = oss.str();
+
+    // Remove the last semicolon if the result is not empty
+    if (!result.empty() && result.back() == ';') {
+        result.pop_back();
+    }
+
+    // Allocate memory for the C-string and copy the content
+    char* cStr = new char[result.size() + 1];
+    std::strcpy(cStr, result.c_str());
+
+    return cStr; // Caller must free this memory with `delete[]`
+}
+
+
 // ToDO: Hot reset screenmode
 void apply_clicked(struct nk_console* button, void* user_data) {
     spdlog::info("Apply screen-mdode. Restart PixelPilot_rk");
     sig_handler(1);
 }
 
-void wlan_apply_clicked(struct nk_console* button, void* user_data) {
+void Menu::wlan_apply_clicked(struct nk_console* button, void* user_data) {
     spdlog::info("wlan_apply_clicked");
     Menu* menu_instance = static_cast<Menu*>(user_data);
-    spdlog::debug("New WLAN Settings WLan Password: {}", menu_instance->password);
+    spdlog::debug("New WLAN Settings WLan SSID: {} Password: {}", menu_instance->availableWlans[menu_instance->current_wlan_index].ssid,menu_instance->password);
     spdlog::debug("New Ad-Hoc Settings SSID: {} Password: {} Enabled: {}", menu_instance->ad_hoc_ssid,menu_instance->password,menu_instance->ad_hoc_enabled);
 }
 
@@ -265,8 +289,9 @@ void wlan_toggled(struct nk_console* button, void* user_data) {
     nk_console* wlan_settings= static_cast<nk_console*>(menu_instance->console->children[3]);
     wlan_settings->children[2]->visible = nk_true;
     wlan_settings->children[3]->visible = nk_true;
-    wlan_settings->children[4]->visible = nk_false;
+    wlan_settings->children[4]->visible = nk_true;
     wlan_settings->children[5]->visible = nk_false;
+    wlan_settings->children[6]->visible = nk_false;
 }
 
 void hd_hoc_toggled(struct nk_console* button, void* user_data) {
@@ -276,9 +301,174 @@ void hd_hoc_toggled(struct nk_console* button, void* user_data) {
     nk_console* wlan_settings= static_cast<nk_console*>(menu_instance->console->children[3]);
     wlan_settings->children[2]->visible = nk_false;
     wlan_settings->children[3]->visible = nk_false;
-    wlan_settings->children[4]->visible = nk_true;
+    wlan_settings->children[4]->visible = nk_false;
     wlan_settings->children[5]->visible = nk_true;
+    wlan_settings->children[6]->visible = nk_true;
 }
+
+// Function to update the combobox with a new string
+void nk_console_combobox_update(nk_console* combobox, const char* new_items_separated_by_separator) {
+    if (combobox && combobox->data) {
+        nk_console_combobox_data* data = (nk_console_combobox_data*)combobox->data;
+        
+        // Update the string that holds the items
+        data->items_separated_by_separator = new_items_separated_by_separator;
+        
+        // Rebuild the combobox buttons based on the new list of items
+        int separator = data->separator;
+        const char* button_text_start = new_items_separated_by_separator;
+        int text_length = 0;
+        
+        // Manually clear the combobox's children (old buttons)
+        if (combobox->children != NULL) {
+            // Free each old child (button) widget
+            for (int i = 0; i < (int)cvector_size(combobox->children); i++) {
+                nk_console* old_button = combobox->children[i];
+                // Assuming nk_console_free exists or is implemented to free the widget
+                nk_console_free(old_button);  // Free memory allocated for the old button
+            }
+            // Reset the children vector to an empty state
+            combobox->children = NULL;
+        }
+
+        // Re-Add Back button
+        nk_console* backbutton = nk_console_button_onclick(combobox, "SSID", &nk_console_combobox_button_click);
+        nk_console_button_set_symbol(backbutton, NK_SYMBOL_TRIANGLE_UP);
+        
+        // Re-add the new buttons based on the updated string
+        for (int i = 0; new_items_separated_by_separator[i] != 0; i++) {
+            text_length++;
+            if (new_items_separated_by_separator[i] == (char)separator) {
+                nk_console_button_onclick(combobox, button_text_start, &nk_console_combobox_button_click)
+                    ->label_length = text_length - 1;
+                text_length = 0;
+                button_text_start = new_items_separated_by_separator + i + 1;
+            }
+        }
+
+        // Add the last item
+        nk_console_button_onclick(combobox, button_text_start, &nk_console_combobox_button_click)
+            ->label_length = text_length;
+        
+        // Optionally update selected index
+        if (data->selected && *data->selected >= 0) {
+            combobox->label = combobox->children[*data->selected + 1]->label;
+            combobox->label_length = combobox->children[*data->selected + 1]->label_length;
+        }
+    }
+}
+
+#define MAX_LINE_LEN 1024
+
+void rescan_clicked(struct nk_console* button, void* user_data) {
+    Menu* menu_instance = static_cast<Menu*>(user_data);
+    std::vector<WLAN> availableWlans;
+    int i = 0;
+
+    spdlog::info("rescan triggered");
+
+    // Execute the nmcli command
+    FILE *fp = popen("nmcli device wifi list --rescan auto", "r");
+    if (!fp) {
+        spdlog::error("Failed to execute nmcli command.");
+        return;
+    }
+
+    char buffer[MAX_LINE_LEN];
+    bool isHeaderSkipped = false;
+
+    // Read the output line by line
+    while (fgets(buffer, sizeof(buffer), fp)) {
+        std::string line = buffer;
+        spdlog::debug("line: {}", line);
+
+        // Skip the header line
+        if (!isHeaderSkipped) {
+            isHeaderSkipped = true;
+            spdlog::debug("Header skipped");
+            continue;
+        }
+
+        // Skip empty lines
+        if (line.empty() || line.find_first_not_of(" \t\n") == std::string::npos) {
+            continue;
+        }
+
+        // Parse the line into WLAN structure
+        std::istringstream iss(line);
+        WLAN wlan;
+
+        std::string inUse;
+        iss >> inUse;  // Skip "IN-USE" column, we don't need it
+        
+        // Handle cases where there's a '*' in front of BSSID
+        if (inUse == "*") {
+            iss >> wlan.bssid;
+            menu_instance->current_wlan_index = i;
+        } else {
+            wlan.bssid = inUse;  // If no *, treat first value as BSSID
+            i++;
+        }
+
+        // Extract the SSID: Take everything until we hit the mode (Infra/Ad-Hoc)
+        std::string ssidPart;
+        while (iss >> ssidPart) {
+            // Stop when the mode column is reached (typically "Infra" or "Ad-Hoc")
+            if (ssidPart == "Infra" || ssidPart == "Ad-Hoc") {
+                break;
+            }
+            wlan.ssid += ssidPart + " ";  // Add SSID part
+        }
+        wlan.ssid = wlan.ssid.substr(0, wlan.ssid.size() - 1);  // Remove the trailing space
+
+        // Skip unnecessary columns
+        std::string mode, channel, rate, signalStrength, bars, security;
+        iss >> mode >> channel >> rate >> signalStrength >> bars;
+
+        // Handle signal strength safely
+        try {
+            wlan.signal_strength = std::stoi(signalStrength); // Parse signal percentage
+        } catch (const std::invalid_argument& e) {
+            spdlog::warn("Invalid signal strength value: {}. Skipping entry.", signalStrength);
+            continue;
+        }
+
+        // Extract the security types
+        std::getline(iss, security);  // Security column (rest of the line after the bars)
+
+        // Trim whitespace from security type
+        security.erase(0, security.find_first_not_of(" \t"));
+        security.erase(security.find_last_not_of(" \t") + 1);
+        wlan.security = security;
+
+        // Add WLAN to the list if valid
+        if (!wlan.bssid.empty() && !wlan.ssid.empty()) {
+            availableWlans.push_back(wlan);
+        } else {
+            spdlog::warn("Skipping invalid WLAN entry: BSSID or SSID is empty.");
+        }
+    }
+
+    // Update the available WLANs in the menu instance
+    menu_instance->availableWlans = availableWlans;
+
+    spdlog::debug("Available WLANs:");
+    for (const auto& wlan : availableWlans) {
+        spdlog::debug("BSSID: {}, SSID: {}, Signal: {}%, Channel: {}, Security: {}", wlan.bssid, wlan.ssid, wlan.signal_strength, wlan.channel, wlan.security);
+    }
+
+    pclose(fp);
+
+    // update the nuklear with found wlans
+    nk_console* wlan_settings= static_cast<nk_console*>(menu_instance->console->children[3]);
+    nk_console* nk_current_wlan_index = wlan_settings->children[2];
+
+    const char* updated_items = concatWLANs(availableWlans);
+    // Assuming combobox is already created with nk_console_combobox earlier
+    nk_console_combobox_update(nk_current_wlan_index, updated_items);
+
+}
+
 
 
 void Menu::initMenu() {
@@ -311,8 +501,11 @@ void Menu::initMenu() {
 
         nk_console* nk_current_wlan_index = nk_console_combobox(wlan_settings, "SSID", "MySSiD", ';', &current_wlan_index);
         nk_console* nk_password = nk_console_textedit(wlan_settings, "Password", password, textedit_buffer_size);
+        nk_console* rescan_button = nk_console_button(wlan_settings, "Rescan WLANs");
+        nk_console_add_event_handler(rescan_button, NK_CONSOLE_EVENT_CLICKED, &rescan_clicked,this,NULL);
         nk_current_wlan_index->visible = wlan_enabled;
         nk_password->visible = wlan_enabled;
+        rescan_button->visible = wlan_enabled;
 
         nk_console* nk_ad_hoc_ssid = nk_console_textedit(wlan_settings, "Ad-Hoc SSID", ad_hoc_ssid, textedit_buffer_size);
         nk_console* nk_ad_hoc_password = nk_console_textedit(wlan_settings, "Ad-Hoc Password", ad_hoc_password, textedit_buffer_size);
