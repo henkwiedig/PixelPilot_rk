@@ -2,6 +2,8 @@
 #include <linux/reboot.h> // For specific LINUX_REBOOT_CMD_* macros
 #include <cstdlib> // for malloc and free
 #include <fstream>
+#include <regex>
+
 
 #include "menu_system.hpp"
 #include "drm.h"
@@ -278,8 +280,49 @@ void apply_clicked(struct nk_console* button, void* user_data) {
 void Menu::wlan_apply_clicked(struct nk_console* button, void* user_data) {
     spdlog::info("wlan_apply_clicked");
     Menu* menu_instance = static_cast<Menu*>(user_data);
-    spdlog::debug("New WLAN Settings WLan SSID: {} Password: {}", menu_instance->availableWlans[menu_instance->current_wlan_index].ssid,menu_instance->password);
+    spdlog::debug("New WLAN Settings WLan SSID: {} Password: {} Enabled:{}", menu_instance->availableWlans[menu_instance->current_wlan_index].ssid,menu_instance->password,menu_instance->wlan_enabled);
     spdlog::debug("New Ad-Hoc Settings SSID: {} Password: {} Enabled: {}", menu_instance->ad_hoc_ssid,menu_instance->password,menu_instance->ad_hoc_enabled);
+
+
+    if (menu_instance->wlan_enabled) {
+
+        std::ofstream configFile("/config/config.txt");
+        if (!configFile.is_open()) {
+            spdlog::error("Failed to open the file for writing: /config/config.txt");
+            return;
+        }
+        // Write the Wi-Fi connection line
+        configFile << "# rsetup config file\n";
+        configFile << "# Configurations here will be applied on every boot.\n";
+        configFile << "#\n";
+        configFile << "connect_wi-fi " << menu_instance->availableWlans[menu_instance->current_wlan_index].ssid << " " << menu_instance->password << "\n";
+        configFile.close();
+    }
+
+
+    // Construct the nmcli command
+    std::string command = "nmcli dev wifi connect \"" + 
+        menu_instance->availableWlans[menu_instance->current_wlan_index].ssid + 
+        "\" password \"" + menu_instance->password + "\"";
+
+    spdlog::debug("nmcli command: {}", command);
+
+    // Execute the nmcli command
+    FILE *fp = popen(command.c_str(), "r");
+    if (!fp) {
+        spdlog::error("Failed to execute nmcli command.");
+        return;
+    }
+
+    // Read the output from the command if needed
+    char buffer[128];
+    while (fgets(buffer, sizeof(buffer), fp) != nullptr) {
+        spdlog::info("nmcli output: {}", buffer);
+    }
+
+    // Close the file pointer
+    pclose(fp);
+
 }
 
 void wlan_toggled(struct nk_console* button, void* user_data) {
@@ -499,7 +542,7 @@ void Menu::initMenu() {
         nk_console_add_event_handler(nk_ad_hoc_enabled, NK_CONSOLE_EVENT_CHANGED, &hd_hoc_toggled, this, NULL);
 
 
-        nk_console* nk_current_wlan_index = nk_console_combobox(wlan_settings, "SSID", "MySSiD", ';', &current_wlan_index);
+        nk_console* nk_current_wlan_index = nk_console_combobox(wlan_settings, "SSID", concatWLANs(availableWlans), ';', &current_wlan_index);
         nk_console* nk_password = nk_console_textedit(wlan_settings, "Password", password, textedit_buffer_size);
         nk_console* rescan_button = nk_console_button(wlan_settings, "Rescan WLANs");
         nk_console_add_event_handler(rescan_button, NK_CONSOLE_EVENT_CLICKED, &rescan_clicked,this,NULL);
@@ -812,4 +855,44 @@ std::vector<DRMMode> Menu::get_supported_modes(int fd) {
 
     drmModeFreeResources(res);
     return modes;
+}
+
+void Menu::parseWLANConfigFile() {
+    spdlog::debug("Parseing /config/config.txt");
+    std::ifstream configFile("/config/config.txt");
+    if (!configFile.is_open()) {
+        spdlog::error("Failed to open the file: /config/config.txt");
+        return;
+    }
+
+    std::string line;
+    std::regex connectRegex(R"(^connect_wi-fi\s+(\S+)\s+(\S+)$)");
+    std::smatch match;
+
+    while (std::getline(configFile, line)) {
+        // Skip comments and empty lines
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+
+        // Check for Wi-Fi connection command
+        if (std::regex_search(line, match, connectRegex)) {
+            std::string networkName = match[1];
+            std::string networkPassword = match[2];
+            spdlog::debug("line: {} , networkName: {} , networkPassword: {}",line, networkName, networkPassword);
+            strncpy(password, networkPassword.c_str(), 256); // Copy password into the buffer
+            password[255] = '\0'; // Ensure null termination
+            availableWlans.clear();
+            availableWlans.push_back({"00:11:22:33:44:55", networkName, -1, 0, "unknown"});
+            continue;
+        }
+
+        // Parse WLAN definitions (e.g., stub for future extensions)
+        // Example parsing logic could go here if WLANs are defined explicitly in the file
+        // For now, we'll assume WLANs are not directly listed in this specific file.
+    }
+
+    configFile.close();
+
+    // Example: Adding a stub WLAN to `availableWlans` for demonstration purposes
 }

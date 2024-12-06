@@ -64,6 +64,14 @@ public:
         drmModes = get_supported_modes(drm_fd);
      
 
+        // WLAN
+        WLAN dummy;
+        dummy.ssid = "empty";
+        dummy.security = "unknown";
+        availableWlans.push_back(dummy);
+        parseWLANConfigFile();
+
+
         // nuklear setup
         default_font.userdata.ptr = NULL; // No additional font data
         default_font.height = 23.0f; // Font height
@@ -84,7 +92,7 @@ public:
     // wlan
     std::vector<WLAN> availableWlans;
     int current_wlan_index;
-    char password[256] = "PassW0rd!!!";
+    char password[256] = "empty";
     nk_bool wlan_enabled = nk_true;
     char ad_hoc_ssid[256] = "OpenIPC GS";
     char ad_hoc_password[256] = "openipc";
@@ -137,6 +145,7 @@ private:
     int current_drmmode = 1;
 
     //WLAN
+    void parseWLANConfigFile();
     static void wlan_apply_clicked(struct nk_console* button, void* user_data);
 
     // const int textedit_buffer_size = 256;
