@@ -283,6 +283,8 @@ void Menu::wlan_apply_clicked(struct nk_console* button, void* user_data) {
     spdlog::debug("New WLAN Settings WLan SSID: {} Password: {} Enabled:{}", menu_instance->availableWlans[menu_instance->current_wlan_index].ssid,menu_instance->password,menu_instance->wlan_enabled);
     spdlog::debug("New Ad-Hoc Settings SSID: {} Password: {} Enabled: {}", menu_instance->ad_hoc_ssid,menu_instance->password,menu_instance->ad_hoc_enabled);
 
+    // Construct the nmcli command
+    std::string command;
 
     if (menu_instance->wlan_enabled) {
 
@@ -297,13 +299,18 @@ void Menu::wlan_apply_clicked(struct nk_console* button, void* user_data) {
         configFile << "#\n";
         configFile << "connect_wi-fi " << menu_instance->availableWlans[menu_instance->current_wlan_index].ssid << " " << menu_instance->password << "\n";
         configFile.close();
-    }
 
-
-    // Construct the nmcli command
-    std::string command = "nmcli dev wifi connect \"" + 
+        command = "nmcli dev wifi connect \"" + 
         menu_instance->availableWlans[menu_instance->current_wlan_index].ssid + 
         "\" password \"" + menu_instance->password + "\"";
+
+    }
+
+    if (menu_instance->ad_hoc_enabled) {
+        command = "nmcli dev wifi hotspot ifname wlan0 ssid \"" + 
+                    std::string(menu_instance->ad_hoc_ssid) + 
+                    "\" password \"" + menu_instance->ad_hoc_password + "\"";
+    }
 
     spdlog::debug("nmcli command: {}", command);
 
@@ -321,7 +328,7 @@ void Menu::wlan_apply_clicked(struct nk_console* button, void* user_data) {
     }
 
     // Close the file pointer
-    pclose(fp);
+    pclose(fp);    
 
 }
 

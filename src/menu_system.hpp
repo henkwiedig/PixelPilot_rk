@@ -95,7 +95,7 @@ public:
     char password[256] = "empty";
     nk_bool wlan_enabled = nk_true;
     char ad_hoc_ssid[256] = "OpenIPC GS";
-    char ad_hoc_password[256] = "openipc";
+    char ad_hoc_password[256] = "openipcgs";
     nk_bool ad_hoc_enabled = nk_false;
     nk_console* console;
     
