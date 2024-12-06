@@ -7,6 +7,7 @@
 
 #include "menu_system.hpp"
 #include "drm.h"
+#include "nuklear_console/nuklear_console.h"
 #include "spdlog.h"
 #include "osd.h"
 
@@ -161,6 +162,42 @@ void reboot_clicked(struct nk_console* button, void* user_data) {
 void exit_clicked(struct nk_console* button, void* user_data) {
     menuActive = false;
     osd_vars.refresh_frequency_ms = 1000;
+}
+
+void Menu::osdpos(struct nk_console* button, void* user_data) {
+    // Get the label for the pressed button
+    const char* label = nk_console_get_label(button);
+
+    // Log the button press using spdlog
+    spdlog::info("{} pressed", label);
+
+    // Access the Menu instance
+    Menu* menu_instance = static_cast<Menu*>(user_data);
+
+    // Handle button presses and update menu position accordingly
+    if (label == std::string("Up")) {
+        menu_instance->menuSettings.y -= 10;
+    } else if (label == std::string("Down")) {
+        menu_instance->menuSettings.y += 10;
+    } else if (label == std::string("Left")) {
+        menu_instance->menuSettings.x -= 10;
+    } else if (label == std::string("Right")) {
+        menu_instance->menuSettings.x += 10;
+    }
+    menu_instance->config["menu"]["x"] = menu_instance->menuSettings.x;
+    menu_instance->config["menu"]["y"] = menu_instance->menuSettings.y;
+    menu_instance->config["menu"]["width"] = menu_instance->menuSettings.width;
+    menu_instance->config["menu"]["height"] = menu_instance->menuSettings.height;
+    
+    std::ofstream outFile("menu.yml");
+
+    if (outFile) {
+        // Use the YAML::Emitter to write the config to the file
+        outFile << menu_instance->config;
+        spdlog::info("YAML data saved to menu.yml");
+    } else {
+        spdlog::error("Failed to open file for writing");
+    }
 }
 
 void Menu::wlan_channel_changed(struct nk_console* button, void* user_data) {
@@ -605,6 +642,41 @@ void Menu::initMenu() {
     nk_style_from_table(&ctx, table);    
 
     nk_console_button_onclick(console, "Reboot VRX", &reboot_clicked);
+
+    nk_console* osd_position = nk_console_button(console, "OSD Settings");
+    {
+        nk_console* row = nk_console_row_begin(osd_position);
+        nk_console_spacing(row, 1);
+        nk_console* b = nk_console_button(row,"Up");
+        nk_console_add_event_handler(b, NK_CONSOLE_EVENT_CLICKED, &osdpos,this,NULL);
+        nk_console_button_set_symbol(b, NK_SYMBOL_TRIANGLE_UP);
+        nk_console_spacing(row, 1);
+        nk_console_row_end(row);
+
+        row = nk_console_row_begin(osd_position);
+        b = nk_console_button(row,"Left");
+        nk_console_add_event_handler(b, NK_CONSOLE_EVENT_CLICKED, &osdpos,this,NULL);
+        nk_console_button_set_symbol(b, NK_SYMBOL_TRIANGLE_LEFT);
+        nk_console_spacing(row, 1);
+        b = nk_console_button(row,"Right");
+        nk_console_add_event_handler(b, NK_CONSOLE_EVENT_CLICKED, &osdpos,this,NULL);
+        nk_console_button_set_symbol(b, NK_SYMBOL_TRIANGLE_RIGHT);
+        nk_console_row_end(row);
+
+        row = nk_console_row_begin(osd_position);
+        nk_console_spacing(row, 1);
+        b = nk_console_button(row,"Down");
+        nk_console_add_event_handler(b, NK_CONSOLE_EVENT_CLICKED, &osdpos,this,NULL);
+        nk_console_button_set_symbol(b, NK_SYMBOL_TRIANGLE_DOWN);
+        nk_console_spacing(row, 1);
+        nk_console_row_end(row);
+
+        nk_console_slider_int(osd_position, "Width", 400, &menuSettings.width, 1024, 1);
+        nk_console_slider_int(osd_position, "Height", 400, &menuSettings.height, 786, 1);
+
+        nk_console_button_onclick(osd_position, "Back", &nk_console_button_back);
+    }
+
     nk_console_button_onclick(console, "Exit Menu", &exit_clicked);
 
 }
@@ -624,7 +696,7 @@ void Menu::drawMenu(struct modeset_buf *buf) {
     cairo_set_source_rgba(cr, 0, 0, 0, 0); // Transparent black (alpha = 0)
     cairo_paint(cr);
 
-    nk_console_render_window(console, "VRX Settings", nk_rect(200, 200, 800, 600), NK_WINDOW_TITLE);
+    nk_console_render_window(console, "VRX Settings", nk_rect(menuSettings.x, menuSettings.y, menuSettings.width, menuSettings.height), NK_WINDOW_TITLE);
 
     // Render Nuklear commands using Cairo
     nk_cairo_render(cr, &ctx);

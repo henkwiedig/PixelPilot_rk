@@ -35,10 +35,23 @@ extern int drm_fd;
 class Menu {
 public:
     Menu(){
-        SPDLOG_INFO("Menu opened ...");
-        YAML::Node config = YAML::LoadFile("menu.yml");
+        SPDLOG_INFO("Lading Menu ...");
+        config = YAML::LoadFile("menu.yml");
         spdlog::debug("Loaded YAML file");
         gpioConfig = config["gpio"].as<GPIOConfig>();
+
+        //Menu Settings
+        menuSettings.x = 200;
+        menuSettings.y = 200;
+        menuSettings.width = 800;
+        menuSettings.height = 600;
+        MenuSettings menu = config["menu"].as<MenuSettings>();
+        spdlog::info("Menu Settings: x = {}, y = {}, width = {}, height = {}", 
+                 menu.x, menu.y, menu.width, menu.height);
+        menuSettings.x = menu.x;
+        menuSettings.y = menu.y;
+        menuSettings.width = menu.width;
+        menuSettings.height = menu.height;        
 
         //wfb-ng channels
         wfbChannels = config["menu"]["wfb_channels"].as<std::vector<WFBNGChannel>>();
@@ -101,6 +114,8 @@ public:
     
 private:
 
+    YAML::Node config;
+
     // Wrapper functions for the custom allocator
     static void* custom_alloc(nk_handle, void*, nk_size size) {
         return malloc(size);    
@@ -147,6 +162,11 @@ private:
     //WLAN
     void parseWLANConfigFile();
     static void wlan_apply_clicked(struct nk_console* button, void* user_data);
+
+
+    //Osd
+    static void osdpos(struct nk_console* button, void* user_data);
+    MenuSettings menuSettings;
 
     // const int textedit_buffer_size = 256;
     // char textedit_buffer[256] = "123456ABFCD";
