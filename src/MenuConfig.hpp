@@ -96,14 +96,12 @@ namespace YAML {
         static bool decode(const Node& node, MenuSettings& menu) {
             if (node.IsMap()) {
                 // Extract the x, y, width, height from the menu section
-                menu.x = node["x"].as<int>();
-                menu.y = node["y"].as<int>();
                 menu.width = node["width"].as<int>();
                 menu.height = node["height"].as<int>();
 
                 // Optional: log the loaded menu settings for debugging purposes
-                spdlog::debug("Loaded menu: x = {}, y = {}, width = {}, height = {}",
-                    menu.x, menu.y, menu.width, menu.height);
+                spdlog::debug("Loaded menu: width = {}, height = {}",
+                    menu.width, menu.height);
                 return true;
             }
             return false;

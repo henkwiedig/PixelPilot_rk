@@ -41,15 +41,11 @@ public:
         gpioConfig = config["gpio"].as<GPIOConfig>();
 
         //Menu Settings
-        menuSettings.x = 200;
-        menuSettings.y = 200;
         menuSettings.width = 800;
         menuSettings.height = 600;
         MenuSettings menu = config["menu"].as<MenuSettings>();
-        spdlog::info("Menu Settings: x = {}, y = {}, width = {}, height = {}", 
-                 menu.x, menu.y, menu.width, menu.height);
-        menuSettings.x = menu.x;
-        menuSettings.y = menu.y;
+        spdlog::info("Menu Settings:width = {}, height = {}", 
+                menu.width, menu.height);
         menuSettings.width = menu.width;
         menuSettings.height = menu.height;        
 
@@ -165,7 +161,7 @@ private:
 
 
     //Osd
-    static void osdpos(struct nk_console* button, void* user_data);
+    static void saveosd(struct nk_console* button, void* user_data);
     MenuSettings menuSettings;
 
     // const int textedit_buffer_size = 256;
