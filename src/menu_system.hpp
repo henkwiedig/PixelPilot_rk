@@ -78,7 +78,9 @@ public:
         dummy.ssid = "empty";
         dummy.security = "unknown";
         availableWlans.push_back(dummy);
+        wlan_mode = 0;
         parseWLANConfigFile();
+        get_ip_addresses();
 
 
         // nuklear setup
@@ -101,11 +103,11 @@ public:
     // wlan
     std::vector<WLAN> availableWlans;
     int current_wlan_index;
+    int wlan_mode;
     char password[256] = "empty";
-    nk_bool wlan_enabled = nk_true;
     char ad_hoc_ssid[256] = "OpenIPC GS";
     char ad_hoc_password[256] = "openipcgs";
-    nk_bool ad_hoc_enabled = nk_false;
+
     nk_console* console;
     
 private:
@@ -153,20 +155,17 @@ private:
     char* concatModes(const std::vector<DRMMode>& drmModes);
     static void drmmode_changed(struct nk_console* button, void* user_data);
     std::vector<DRMMode> drmModes;
-    int current_drmmode = 1;
+    int current_drmmode;
 
     //WLAN
     void parseWLANConfigFile();
     static void wlan_apply_clicked(struct nk_console* button, void* user_data);
+    void get_ip_addresses();
+    char ips[1024];
 
 
     //Osd
     static void saveosd(struct nk_console* button, void* user_data);
     MenuSettings menuSettings;
-
-    // const int textedit_buffer_size = 256;
-    // char textedit_buffer[256] = "123456ABFCD";
-    // nk_bool radio_option = nk_false;
-    // char file_path_buffer[1024] = {0};
-    // int file_path_buffer_size = 1024;    
+  
 };

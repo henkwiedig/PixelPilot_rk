@@ -3,6 +3,8 @@
 #include <cstdlib> // for malloc and free
 #include <fstream>
 #include <regex>
+#include <ifaddrs.h>
+#include <arpa/inet.h>
 
 
 #include "menu_system.hpp"
@@ -302,13 +304,14 @@ void apply_clicked(struct nk_console* button, void* user_data) {
 void Menu::wlan_apply_clicked(struct nk_console* button, void* user_data) {
     spdlog::info("wlan_apply_clicked");
     Menu* menu_instance = static_cast<Menu*>(user_data);
-    spdlog::debug("New WLAN Settings WLan SSID: {} Password: {} Enabled:{}", menu_instance->availableWlans[menu_instance->current_wlan_index].ssid,menu_instance->password,menu_instance->wlan_enabled);
-    spdlog::debug("New Ad-Hoc Settings SSID: {} Password: {} Enabled: {}", menu_instance->ad_hoc_ssid,menu_instance->password,menu_instance->ad_hoc_enabled);
+    spdlog::debug("New WLAN Settings WLan SSID: {} Password: {}", menu_instance->availableWlans[menu_instance->current_wlan_index].ssid,menu_instance->password);
+    spdlog::debug("New Ad-Hoc Settings SSID: {} Password: {}", menu_instance->ad_hoc_ssid,menu_instance->password);
+    spdlog::debug("WLAN Mode: {}", menu_instance->wlan_mode);
 
     // Construct the nmcli command
     std::string command;
 
-    if (menu_instance->wlan_enabled) {
+    if (menu_instance->wlan_mode == 0) {
 
         std::ofstream configFile("/config/config.txt");
         if (!configFile.is_open()) {
@@ -328,7 +331,7 @@ void Menu::wlan_apply_clicked(struct nk_console* button, void* user_data) {
 
     }
 
-    if (menu_instance->ad_hoc_enabled) {
+    if (menu_instance->wlan_mode == 1) {
         command = "nmcli dev wifi hotspot ifname wlan0 ssid \"" + 
                     std::string(menu_instance->ad_hoc_ssid) + 
                     "\" password \"" + menu_instance->ad_hoc_password + "\"";
@@ -350,32 +353,36 @@ void Menu::wlan_apply_clicked(struct nk_console* button, void* user_data) {
     }
 
     // Close the file pointer
-    pclose(fp);    
+    pclose(fp);
 
+
+    menu_instance->get_ip_addresses();
+    button->parent->children[9]->label = menu_instance->ips;
 }
 
 void wlan_toggled(struct nk_console* button, void* user_data) {
-    spdlog::info("wlan_toggled triggered");
-    Menu* menu_instance = static_cast<Menu*>(user_data);
-    menu_instance->ad_hoc_enabled = nk_false;
-    nk_console* wlan_settings= static_cast<nk_console*>(menu_instance->console->children[3]);
-    wlan_settings->children[2]->visible = nk_true;
-    wlan_settings->children[3]->visible = nk_true;
-    wlan_settings->children[4]->visible = nk_true;
-    wlan_settings->children[5]->visible = nk_false;
-    wlan_settings->children[6]->visible = nk_false;
-}
 
-void hd_hoc_toggled(struct nk_console* button, void* user_data) {
-    spdlog::info("ah_hoc_toggled triggered");
+    const char* label = nk_console_get_label(button);
+    spdlog::info("wlan_toggled triggered for {}",label);
+
     Menu* menu_instance = static_cast<Menu*>(user_data);
-    menu_instance->wlan_enabled = nk_false;
     nk_console* wlan_settings= static_cast<nk_console*>(menu_instance->console->children[3]);
-    wlan_settings->children[2]->visible = nk_false;
-    wlan_settings->children[3]->visible = nk_false;
-    wlan_settings->children[4]->visible = nk_false;
-    wlan_settings->children[5]->visible = nk_true;
-    wlan_settings->children[6]->visible = nk_true;
+
+
+    // Handle button presses and update menu position accordingly
+    if (label == std::string("Client")) {
+        wlan_settings->children[2]->visible = nk_true;
+        wlan_settings->children[3]->visible = nk_true;
+        wlan_settings->children[4]->visible = nk_true;
+        wlan_settings->children[5]->visible = nk_false;
+        wlan_settings->children[6]->visible = nk_false;
+    } else if (label == std::string("Ad-Hoc")) {
+        wlan_settings->children[2]->visible = nk_false;
+        wlan_settings->children[3]->visible = nk_false;
+        wlan_settings->children[4]->visible = nk_false;
+        wlan_settings->children[5]->visible = nk_true;
+        wlan_settings->children[6]->visible = nk_true;
+    }
 }
 
 // Function to update the combobox with a new string
@@ -553,7 +560,8 @@ void Menu::initMenu() {
     drmmode_options->tooltip = "Select display resolution";
     nk_console_add_event_handler(drmmode_options, NK_CONSOLE_EVENT_CHANGED, &drmmode_changed,this,NULL);
    
-    nk_console_button_onclick(console, "Apply", &apply_clicked);
+    nk_console* nk_apply_res = nk_console_button_onclick(console, "Apply Resolution", &apply_clicked);
+    nk_apply_res->tooltip = "... restarts Pixelpilot, my take some seconds";
 
     // wfb-ng channel
     nk_console* wlan_channel_options = nk_console_combobox(console, "Channel",  concatChannels(wfbChannels), ';', &current_channel);
@@ -565,29 +573,31 @@ void Menu::initMenu() {
     nk_console* wlan_settings = nk_console_button(console, "WLAN Settings");
     {
 
-        nk_console* nk_wlan_enabled = nk_console_checkbox(wlan_settings, "WLAN Enabled", &wlan_enabled);
-        nk_console_add_event_handler(nk_wlan_enabled, NK_CONSOLE_EVENT_CHANGED, &wlan_toggled, this, NULL);
-        nk_console* nk_ad_hoc_enabled = nk_console_checkbox(wlan_settings, "Ad-Hoc Enabled", &ad_hoc_enabled);
-        nk_console_add_event_handler(nk_ad_hoc_enabled, NK_CONSOLE_EVENT_CHANGED, &hd_hoc_toggled, this, NULL);
+        nk_console* nk_wlan_client = nk_console_radio(wlan_settings, "Client", &wlan_mode);
+        nk_console* nk_wlan_ad_hoc = nk_console_radio(wlan_settings, "Ad-Hoc", &wlan_mode);
+        nk_console_add_event_handler(nk_wlan_client, NK_CONSOLE_EVENT_CHANGED, &wlan_toggled, this, NULL);
+        nk_console_add_event_handler(nk_wlan_ad_hoc, NK_CONSOLE_EVENT_CHANGED, &wlan_toggled, this, NULL);
 
 
         nk_console* nk_current_wlan_index = nk_console_combobox(wlan_settings, "SSID", concatWLANs(availableWlans), ';', &current_wlan_index);
         nk_console* nk_password = nk_console_textedit(wlan_settings, "Password", password, textedit_buffer_size);
         nk_console* rescan_button = nk_console_button(wlan_settings, "Rescan WLANs");
         nk_console_add_event_handler(rescan_button, NK_CONSOLE_EVENT_CLICKED, &rescan_clicked,this,NULL);
-        nk_current_wlan_index->visible = wlan_enabled;
-        nk_password->visible = wlan_enabled;
-        rescan_button->visible = wlan_enabled;
+        nk_current_wlan_index->visible = wlan_mode == 0 ? nk_true : false;
+        nk_password->visible = wlan_mode == 0 ? nk_true : false;
+        rescan_button->visible = wlan_mode == 0 ? nk_true : false;
 
         nk_console* nk_ad_hoc_ssid = nk_console_textedit(wlan_settings, "Ad-Hoc SSID", ad_hoc_ssid, textedit_buffer_size);
         nk_console* nk_ad_hoc_password = nk_console_textedit(wlan_settings, "Ad-Hoc Password", ad_hoc_password, textedit_buffer_size);
-        nk_ad_hoc_ssid->visible = ad_hoc_enabled;
-        nk_ad_hoc_password->visible = ad_hoc_enabled;
+        nk_ad_hoc_ssid->visible = wlan_mode == 1 ? nk_true : false;
+        nk_ad_hoc_password->visible = wlan_mode == 1 ? nk_true : false;
 
         nk_console* wlan_apply_button = nk_console_button(wlan_settings, "Apply");
         nk_console_add_event_handler(wlan_apply_button, NK_CONSOLE_EVENT_CLICKED, &wlan_apply_clicked,this,NULL);
 
         nk_console_button_onclick(wlan_settings, "Back", &nk_console_button_back);
+        nk_console_label(wlan_settings, ips)
+            ->disabled = nk_true;        
     }    
 
     // setup theme dark
@@ -630,8 +640,8 @@ void Menu::initMenu() {
 
     nk_console* osd_position = nk_console_button(console, "OSD Settings");
     {
-        nk_console_slider_int(osd_position, "Width", 400, &menuSettings.width, 1024, 1);
-        nk_console_slider_int(osd_position, "Height", 400, &menuSettings.height, 786, 1);
+        nk_console_property_int(osd_position, "Width", 10, &menuSettings.width, 1024, 1, 1);
+        nk_console_property_int(osd_position, "Height", 10, &menuSettings.height, 786, 1, 1);
         nk_console* save = nk_console_button(osd_position, "Save & Back");
         nk_console_add_event_handler(save, NK_CONSOLE_EVENT_CLICKED, &saveosd,this,NULL);
     }
@@ -833,6 +843,7 @@ int Menu::read_wifi_channel(const char *config_path) {
 std::vector<DRMMode> Menu::get_supported_modes(int fd) {
     std::vector<DRMMode> modes;
 	uint prev_h, prev_v, prev_refresh = 0;
+    int  used_modes = -1;
 
     drmModeRes* res = drmModeGetResources(fd);
 
@@ -863,6 +874,13 @@ std::vector<DRMMode> Menu::get_supported_modes(int fd) {
                 0 // Initialize flags to 0
             };
 
+            if (mode_info.hdisplay == prev_h && mode_info.vdisplay == prev_v && mode_info.vrefresh == prev_refresh)
+				continue;
+            prev_h = mode_info.hdisplay;
+			prev_v = mode_info.vdisplay;
+			prev_refresh = mode_info.vrefresh;            
+            used_modes++;
+
             // Set the preferred flag
             if (mode_info.type & DRM_MODE_TYPE_PREFERRED) {
                 mode.flags |= 0x1; // Set bit 0
@@ -874,14 +892,8 @@ std::vector<DRMMode> Menu::get_supported_modes(int fd) {
                 crtc->mode.vdisplay == mode_info.vdisplay &&
                 crtc->mode.vrefresh == mode_info.vrefresh) {
                 mode.flags |= 0x2; // Set bit 1
+                current_drmmode = used_modes;
             }
-
-            if (mode_info.hdisplay == prev_h && mode_info.vdisplay == prev_v && mode_info.vrefresh == prev_refresh)
-				continue;
-            prev_h = mode_info.hdisplay;
-			prev_v = mode_info.vdisplay;
-			prev_refresh = mode_info.vrefresh;
-
             modes.push_back(mode);
         }
 
@@ -933,4 +945,37 @@ void Menu::parseWLANConfigFile() {
     configFile.close();
 
     // Example: Adding a stub WLAN to `availableWlans` for demonstration purposes
+}
+
+void Menu::get_ip_addresses() {
+    struct ifaddrs *ifaddr, *ifa;
+    ips[0] = '\0'; // Initialize the string as empty
+    strcat(ips, "IPs: ");
+
+
+    // Get the list of network interfaces
+    if (getifaddrs(&ifaddr) == -1) {
+        perror("getifaddrs failed");
+    }
+
+    // Iterate through the list of interfaces
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        // Check if the interface has an IPv4 address
+        if (ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_INET) {
+            struct sockaddr_in *sockaddr_in = (struct sockaddr_in*) ifa->ifa_addr;
+            char ip[INET_ADDRSTRLEN];
+
+            // Convert the IP address to a string
+            if (inet_ntop(AF_INET, &sockaddr_in->sin_addr, ip, sizeof(ip)) != NULL) {
+                // If ips is not empty, add a comma before appending the next IP
+                if (strlen(ips) > 5) {
+                    strcat(ips, ", ");
+                }
+                strcat(ips, ip); // Append the IP address
+            }
+        }
+    }
+
+    // Free the memory allocated for the interface list
+    freeifaddrs(ifaddr);
 }
