@@ -1,19 +1,24 @@
 gpio:
-  up:
-    chip: gpiochip4
-    line: 19
-  down:
-    chip: gpiochip4
-    line: 21
-  left:
-    chip: gpiochip4
+  up: #Ruby Up/Plus
+    chip: gpiochip3
+    line: 9
+    activeHigh: true
+  down: #Ruby Down/Minus
+    chip: gpiochip3
+    line: 10
+    activeHigh: true
+  left: #Ruby Back/Canel
+    chip: gpiochip3
+    line: 2
+    activeHigh: true
+  right: #Ruby Menu/ok
+    chip: gpiochip3
+    line: 1
+    activeHigh: true
+  ok: #Ruby Quick Action 1
+    chip: gpiochip3
     line: 18
-  right:
-    chip: gpiochip3
-    line: 11
-  ok:
-    chip: gpiochip3
-    line: 12
+    activeHigh: true
 menu:
   width: 800
   height: 600

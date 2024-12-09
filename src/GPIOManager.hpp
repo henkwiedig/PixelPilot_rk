@@ -23,7 +23,7 @@ public:
 
     ~GPIOManager();
 
-    void addLine(const std::string& name, const std::string& chip_name, int line_num);
+    void addLine(const std::string& name, const std::string& chip_name, int line_num, bool activeHigh);
     int getValue(const std::string& name);
 
     // Non-blocking press detection
@@ -32,6 +32,7 @@ public:
 private:
     std::map<std::string, Line> lines;
     std::map<std::string, PressState> states;
+    std::map<std::string, bool> linePolarity;
 };
 
 #endif // GPIOMANAGER_H

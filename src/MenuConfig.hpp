@@ -8,6 +8,7 @@
 struct GPIO {
     std::string chip;
     int line;
+    bool activeHigh;
 };
 
 // Define a struct to represent the full GPIO configuration
@@ -37,7 +38,8 @@ namespace YAML {
             if (node.IsMap()) {
                 gpio.chip = node["chip"].as<std::string>();
                 gpio.line = node["line"].as<int>();
-                spdlog::debug("Loaded chip {} line {}", gpio.chip, gpio.line);
+                gpio.activeHigh = node["activeHigh"].as<bool>();
+                spdlog::debug("Loaded chip {} line {} activeHigh {}", gpio.chip, gpio.line, gpio.activeHigh);
                 return true;
             }
             return false;
