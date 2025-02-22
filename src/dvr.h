@@ -85,6 +85,12 @@ private:
     FILE *dvr_file;
     MP4E_mux_tag *mux;
     mp4_h26x_writer_tag *mp4wr;
+    std::chrono::high_resolution_clock::time_point last_frame_time;
+    double average_frame_delta = 0.0;
+    int frame_count = 0;
+    const int frame_rate_window = 50; // Number of frames to average over
+    void update_frame_rate();
+    double get_frame_rate() const;
 };
 
 #endif

@@ -41,6 +41,7 @@ Dvr::Dvr(dvr_thread_params params) {
 Dvr::~Dvr() {}
 
 void Dvr::frame(std::shared_ptr<std::vector<uint8_t>> frame) {
+	update_frame_rate(); // Update frame rate calculation
 	dvr_rpc rpc = {
 		.command = dvr_rpc::RPC_FRAME,
 		.frame = frame
@@ -163,9 +164,12 @@ void Dvr::loop() {
 						break;
 					}
 					std::shared_ptr<std::vector<uint8_t>> frame = rpc.frame;
-					auto res = mp4_h26x_write_nal(mp4wr, frame->data(), frame->size(), 90000/video_framerate);
-					if (!(MP4E_STATUS_OK == res || MP4E_STATUS_BAD_ARGUMENTS == res)) {
-						spdlog::warn("mp4_h26x_write_nal failed with error {}", res);
+					double current_frame_rate = get_frame_rate();
+					if (current_frame_rate > 0.0) {
+						auto res = mp4_h26x_write_nal(mp4wr, frame->data(), frame->size(), 90000/(int)current_frame_rate);
+						if (!(MP4E_STATUS_OK == res || MP4E_STATUS_BAD_ARGUMENTS == res)) {
+							spdlog::warn("mp4_h26x_write_nal failed with error {}", res);
+						}
 					}
 					break;
 				}
@@ -272,6 +276,22 @@ void Dvr::stop() {
 	_ready_to_write = 0;
 }
 
+void Dvr::update_frame_rate() {
+	auto now = std::chrono::high_resolution_clock::now();
+	if (frame_count > 0) {
+		auto delta = std::chrono::duration_cast<std::chrono::microseconds>(now - last_frame_time).count();
+		average_frame_delta = (average_frame_delta * (frame_rate_window - 1) + delta) / frame_rate_window;
+	}
+	last_frame_time = now;
+	frame_count++;
+}
+
+double Dvr::get_frame_rate() const {
+	if (average_frame_delta == 0.0) {
+		return 0.0;
+	}
+	return 1.0 / (average_frame_delta / 1e6); // Convert microseconds to seconds
+}   
 
 // C-compatible interface
 extern "C" {
