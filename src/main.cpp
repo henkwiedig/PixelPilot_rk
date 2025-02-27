@@ -714,8 +714,7 @@ int main(int argc, char **argv)
 	spdlog::set_level(log_level);
 
 	if (dvr_template != NULL && video_framerate < 0 ) {
-		printf("--dvr-framerate must be provided when dvr is enabled.\n");
-		return 0;
+		printf("Recording FPS auto detection enabled\n");
 	}
 
 	printf("PixelPilot Rockchip %d.%d\n", APP_VERSION_MAJOR, APP_VERSION_MINOR);

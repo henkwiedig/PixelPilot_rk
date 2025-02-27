@@ -164,8 +164,13 @@ void Dvr::loop() {
 						break;
 					}
 					std::shared_ptr<std::vector<uint8_t>> frame = rpc.frame;
-					double current_frame_rate = get_frame_rate();
+					double current_frame_rate;
+					if ( video_framerate < 0 )
+						current_frame_rate = get_frame_rate();
+					else
+						current_frame_rate = video_framerate;
 					if (current_frame_rate > 0.0) {
+						spdlog::debug("Current current_frame_rate: {}",current_frame_rate);
 						auto res = mp4_h26x_write_nal(mp4wr, frame->data(), frame->size(), 90000/(int)current_frame_rate);
 						if (!(MP4E_STATUS_OK == res || MP4E_STATUS_BAD_ARGUMENTS == res)) {
 							spdlog::warn("mp4_h26x_write_nal failed with error {}", res);
