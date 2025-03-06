@@ -505,7 +505,7 @@ struct modeset_output *modeset_output_create(int fd, drmModeRes *res, drmModeCon
 	out->video_request = drmModeAtomicAlloc();
 	assert(out->video_request);
 	out->osd_request = drmModeAtomicAlloc();
-	assert(out->video_request);
+	assert(out->osd_request);
 
 	return out;
 

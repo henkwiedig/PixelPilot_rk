@@ -1239,8 +1239,6 @@ cairo_surface_t *lat_icon;
 cairo_surface_t* net_icon;
 cairo_surface_t* sdcard_icon;
 
-pthread_mutex_t osd_mutex;
-
 void modeset_paint_buffer(struct modeset_buf *buf, Osd *osd) {
 	unsigned int j,k,off;
 	cairo_t* cr;
@@ -1577,8 +1575,7 @@ void *__OSD_THREAD__(void *param) {
 	net_icon = surface_from_embedded_png(bandwidth_icon, bandwidth_icon_length);
 	sdcard_icon = surface_from_embedded_png(sdcard_white_icon, sdcard_white_icon_length);
 
-	int ret = pthread_mutex_init(&osd_mutex, NULL);
-	assert(!ret);
+	int ret;
 
 	struct modeset_buf *buf = &p->out->osd_bufs[p->out->osd_buf_switch];
 	ret = modeset_perform_modeset(p->fd, p->out, p->out->osd_request, &p->out->osd_plane,
@@ -1615,11 +1612,13 @@ void *__OSD_THREAD__(void *param) {
 			struct modeset_buf *buf = &p->out->osd_bufs[buf_idx];
 			modeset_paint_buffer(buf, osd);
 
-			int ret = pthread_mutex_lock(&osd_mutex);
-			assert(!ret);	
 			p->out->osd_buf_switch = buf_idx;
-			ret = pthread_mutex_unlock(&osd_mutex);
-			assert(!ret);
+
+			// show DRM FB in plane
+			drmModeAtomicSetCursor(p->out->osd_request, 0);
+			set_drm_object_property(p->out->osd_request, &p->out->osd_plane, "FB_ID", p->out->osd_bufs[p->out->osd_buf_switch].fb);
+			drmModeAtomicCommit(p->fd, p->out->osd_request, DRM_MODE_ATOMIC_NONBLOCK, NULL);
+
 			last_display_at = std::chrono::steady_clock::now();
 		}
     }
