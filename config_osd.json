@@ -301,6 +301,39 @@
             ]
         },
         {
+            "name": "RSSI of antenna 1",
+            "type": "IconSelectorWidget",
+            "x": 0,
+            "y": 0,
+            "facts": [
+                {
+                    "name": "wfbcli.rx.ant_stats.rssi_avg",
+                    "tags": {
+                        "id": "video rx",
+                        "ant_id": "0"
+                    }
+                }
+            ],
+            "ranges_and_icons": [
+                {
+                    "range": [-29, -20],
+                    "icon_path": "signal1.png"
+                },
+                {
+                    "range": [-39, -30],
+                    "icon_path": "signal2.png"
+                },
+                {
+                    "range": [-49, -40],
+                    "icon_path": "signal3.png"
+                },
+                {
+                    "range": [-101, -50],
+                    "icon_path": "signal4.png"
+                }
+            ]
+        },        
+        {
             "name": "Dump raw facts to the scren (remove `--` from `type` to enable)",
             "type": "---DebugWidget",
             "x": 10,
