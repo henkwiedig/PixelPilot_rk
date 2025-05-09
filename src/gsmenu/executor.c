@@ -26,6 +26,7 @@ extern lv_indev_t * indev_drv;
 lv_obj_t * msgbox = NULL;
 lv_obj_t * msgbox_label = NULL;
 char buffer[BUFFER_SIZE];
+extern lv_group_t *main_group;
 extern lv_group_t *loader_group;
 extern lv_group_t * default_group;
 
@@ -189,8 +190,12 @@ void check_thread_complete(lv_timer_t* timer) {
             lv_indev_set_group(indev_drv, error_group);
         } else {
             lv_obj_t * current_page = lv_menu_get_cur_main_page(menu);
-            menu_page_data_t* menu_page_data = lv_obj_get_user_data(current_page);
-            lv_indev_set_group(indev_drv,menu_page_data->indev_group);
+            if (current_page) {
+                menu_page_data_t* menu_page_data = lv_obj_get_user_data(current_page);
+                lv_indev_set_group(indev_drv,menu_page_data->indev_group);
+            } else {
+                lv_indev_set_group(indev_drv,main_group);
+            }
         }
 
         // Free the command string if it exists
@@ -209,7 +214,7 @@ void check_thread_complete(lv_timer_t* timer) {
 }
 
 void run_command_and_block(lv_event_t* e, const char *command, callback_fn callback) {
-    lv_obj_t* parent = lv_event_get_current_target(e);
+    // lv_obj_t* parent = lv_event_get_current_target(e);
 
     // disable input
     lv_indev_set_group(indev_drv,default_group);
@@ -218,7 +223,7 @@ void run_command_and_block(lv_event_t* e, const char *command, callback_fn callb
     thread_data_t* data = calloc(1, sizeof(thread_data_t));
     if (!data) return;  // Always check allocation
     
-    data->parent = parent;
+    // data->parent = parent;
     data->work_complete = false;
     data->command = strdup(command);
     data->callback_fn = callback;

@@ -25,6 +25,8 @@ set(SIMULATOR_SOURCES
         src/simulator.c
         src/gsmenu/executor.h
         src/gsmenu/executor.c
+        src/gsmenu/air_simple.h
+        src/gsmenu/air_simple.c
         src/gsmenu/air_presets.h
         src/gsmenu/air_presets.c
         src/gsmenu/air_telemetry.h
@@ -69,6 +71,8 @@ set(SOURCE_FILES
         src/drm.c
         src/gsmenu/executor.h
         src/gsmenu/executor.c
+        src/gsmenu/air_simple.h
+        src/gsmenu/air_simple.c
         src/gsmenu/air_presets.h
         src/gsmenu/air_presets.c
         src/gsmenu/air_telemetry.c

@@ -7,11 +7,14 @@
 #include "ui.h"
 #include "executor.h"
 
+extern uint32_t MY_EVENT_1;
+
 extern gsmenu_control_mode_t control_mode;
 extern lv_obj_t * menu;
 extern lv_indev_t * indev_drv;
 extern lv_obj_t * sub_gs_main_page;
 
+extern lv_obj_t * air_simple_cont;
 extern lv_obj_t * air_presets_cont;
 extern lv_obj_t * air_wfbng_cont;
 extern lv_obj_t * air_camera_cont;
@@ -65,40 +68,16 @@ void loader_cancel_button_cb(lv_event_t * e) {
 }
 
 void* generic_page_load_thread(void *arg) {
+
+    lv_obj_t * label = lv_obj_get_child_by_type(loader_msgbox,0,&lv_label_class);
+    lv_obj_t * bar = lv_obj_get_child_by_type(loader_msgbox,0,&lv_bar_class);
+
     // Set cancel type to deferred to allow cleanup
     pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
     
     lv_obj_t *page = (lv_obj_t*)arg;
     menu_page_data_t *menu_page_data = lv_obj_get_user_data(page);
     PageEntry *entries = menu_page_data->page_entries;
-
-    lv_lock(); // Lock LVGL before any GUI operations
-
-    // Create progress UI
-    loader_msgbox = lv_msgbox_create(NULL);
-    lv_obj_add_style(loader_msgbox, &style_openipc_lightdark_background, LV_PART_MAIN | LV_STATE_DEFAULT);
-
-    lv_obj_t *label = lv_label_create(loader_msgbox);
-    lv_obj_t *bar = lv_bar_create(loader_msgbox);
-    lv_obj_add_style(bar, &style_openipc, LV_PART_INDICATOR | LV_STATE_DEFAULT);
-    lv_obj_add_style(bar, &style_openipc_dropdown, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_bar_set_range(bar, 0, menu_page_data->entry_count);
-    lv_obj_center(bar);
-
-    lv_obj_t * cancel_button =  lv_msgbox_add_footer_button(loader_msgbox, "Canel");
-    lv_group_add_obj(loader_group,cancel_button);
-    lv_obj_add_style(cancel_button, &style_openipc, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_add_style(cancel_button, &style_openipc_outline, LV_PART_MAIN | LV_STATE_FOCUS_KEY);
-    lv_obj_add_event_cb(cancel_button,loader_cancel_button_cb,LV_EVENT_CLICKED,menu_page_data);
-    lv_obj_center(cancel_button);
-
-    // lv_obj_set_width(loader_msgbox, LV_SIZE_CONTENT);
-    // lv_obj_set_flex_grow(cancel_button, 1);
-    // lv_obj_align_to(bar, cancel_button, LV_ALIGN_OUT_BOTTOM_MID, 0, -50);
-    // lv_obj_set_height(loader_msgbox, LV_SIZE_CONTENT);
-
-
-    lv_unlock();
 
     // Process entries with cancellation point
     for (int i = 0; i < menu_page_data->entry_count; i++) {
@@ -112,6 +91,7 @@ void* generic_page_load_thread(void *arg) {
             lv_bar_set_value(bar, i, LV_ANIM_OFF);
             lv_unlock();
             entry->reload(page, entry->target);
+            lv_obj_send_event(entry->target,MY_EVENT_1,NULL);
         }
     }
 
@@ -132,6 +112,30 @@ void* generic_page_load_thread(void *arg) {
 
 void generic_page_load_callback(lv_obj_t *page) {
 
+    menu_page_data_t *menu_page_data = lv_obj_get_user_data(page);
+
+    // Create progress UI
+    loader_msgbox = lv_msgbox_create(NULL);
+    lv_obj_add_style(loader_msgbox, &style_openipc_lightdark_background, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+    lv_obj_t *label = lv_label_create(loader_msgbox);
+    lv_label_set_text(label, "Loading ...");
+
+    lv_obj_t *bar = lv_bar_create(loader_msgbox);
+    lv_obj_add_style(bar, &style_openipc, LV_PART_INDICATOR | LV_STATE_DEFAULT);
+    lv_obj_add_style(bar, &style_openipc_dropdown, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_bar_set_range(bar, 0, menu_page_data->entry_count);
+    lv_obj_center(bar);
+
+    lv_obj_t * cancel_button =  lv_msgbox_add_footer_button(loader_msgbox, "Canel");
+    lv_group_add_obj(loader_group,cancel_button);
+    lv_obj_add_style(cancel_button, &style_openipc, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_add_style(cancel_button, &style_openipc_outline, LV_PART_MAIN | LV_STATE_FOCUS_KEY);
+    lv_obj_add_event_cb(cancel_button,loader_cancel_button_cb,LV_EVENT_CLICKED,menu_page_data);
+    lv_obj_center(cancel_button);
+
+    lv_refr_now(NULL);
+
     if (!loader_group)
         loader_group = lv_group_create();
     lv_indev_set_group(indev_drv,loader_group);
@@ -143,6 +147,7 @@ void back_event_handler(lv_event_t * e) {
     lv_key_t key = lv_event_get_key(e);
     if (key == LV_KEY_HOME) {
         lv_menu_set_page(menu,NULL);
+        lv_obj_remove_state(air_simple_cont, LV_STATE_CHECKED);
         lv_obj_remove_state(air_presets_cont, LV_STATE_CHECKED);
         lv_obj_remove_state(air_wfbng_cont, LV_STATE_CHECKED);
         lv_obj_remove_state(air_camera_cont, LV_STATE_CHECKED);
@@ -314,7 +319,7 @@ lv_obj_t * create_slider(lv_obj_t * parent, const char * icon, const char * txt,
     lv_obj_add_event_cb(slider, generic_slider_event_cb, LV_EVENT_CLICKED,data);
     lv_obj_add_event_cb(slider, back_event_handler, LV_EVENT_KEY,NULL);
 
-    get_slider_value(obj);
+    // get_slider_value(obj);
 
     return obj;
 }
@@ -493,7 +498,7 @@ lv_obj_t * create_dropdown(lv_obj_t * parent, const char * icon, const char * la
     lv_obj_add_event_cb(dd, back_event_handler, LV_EVENT_KEY,NULL);
     lv_obj_add_event_cb(dd, on_focus, LV_EVENT_FOCUSED, NULL);
 
-    get_dropdown_value(obj);
+    // get_dropdown_value(obj);
 
     return obj;
 }
@@ -644,6 +649,7 @@ void reload_switch_value(lv_obj_t * page,lv_obj_t * parameter) {
 }
 
 void reload_dropdown_value(lv_obj_t * page,lv_obj_t * parameter) {
+    get_dropdown_value(parameter);
     lv_obj_t * obj = lv_obj_get_child_by_type(parameter,0,&lv_dropdown_class);
     thread_data_t * param_user_data = (thread_data_t*) lv_obj_get_user_data(obj);
     char * value = get_paramater(page, param_user_data->parameter);
@@ -662,6 +668,7 @@ void reload_textarea_value(lv_obj_t * page,lv_obj_t * parameter) {
 }
 
 void reload_slider_value(lv_obj_t * page,lv_obj_t * parameter) {
+    get_slider_value(parameter);
     lv_obj_t * obj = lv_obj_get_child_by_type(parameter,0,&lv_slider_class);
     lv_obj_t * label = lv_obj_get_child_by_type(parameter,1,&lv_label_class);
     thread_data_t * param_user_data  = (thread_data_t*) lv_obj_get_user_data(obj);
@@ -691,11 +698,15 @@ void get_slider_value(lv_obj_t * parent) {
     if (sscanf(value_line, "%d %d", &min, &max) != 2) {
         return;
     }
+    lv_lock();
     lv_slider_set_range(obj,min,max);
+    lv_unlock();
 }
 
 void get_dropdown_value(lv_obj_t * parent) {
     lv_obj_t * obj = lv_obj_get_child_by_type(parent,0,&lv_dropdown_class);
     thread_data_t * param_user_data  = (thread_data_t*) lv_obj_get_user_data(obj);
+    lv_lock();
     lv_dropdown_set_options(obj,get_values(param_user_data));
+    lv_unlock();
 }

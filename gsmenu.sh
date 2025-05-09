@@ -8,6 +8,7 @@ CACHE_DIR="/tmp/gsmenu_cache"
 CACHE_TTL=10 # seconds
 MAJESTIC_YAML="/etc/majestic.yaml"
 WFB_YAML="/etc/wfb.yaml"
+WLAN_ADAPTERS="/etc/wlan_adapters.yaml"
 PRESET_DIR="/etc/presets"
 
 # SSH command setup
@@ -27,6 +28,8 @@ refresh_cache() {
         # Copy the YAML configuration files
         $SSH "cat $MAJESTIC_YAML" > "$CACHE_DIR/majestic.yaml" 2>/dev/null
         $SSH "cat $WFB_YAML" > "$CACHE_DIR/wfb.yaml" 2>/dev/null
+        $SSH "cat $WLAN_ADAPTERS" > "$CACHE_DIR/wlan_adapters.yaml" 2>/dev/null
+        $SSH "ipcinfo -s" > "$CACHE_DIR/ipcinfo" 2>/dev/null
         
         # Update refresh timestamp
         echo "$current_time" > "$CACHE_DIR/last_refresh"
@@ -47,12 +50,43 @@ get_wfb_value() {
 
 # Refresh cache for get
 case "$@" in
+  "air connected")
+    refresh_cache
+    exit 0
+    ;;
   "get air"*)
     [ "$3" != "presets" ] && refresh_cache
+    [ "$3" != "simple"  ] && refresh_cache
     ;;
 esac
 
 case "$@" in
+    "values air simple video_mode")
+        sensor=$(cat "$CACHE_DIR/ipcinfo")
+        grep ^\" /etc/video_modes_${sensor}.ini | awk -F "\"" '{print $2}'
+        echo "Select"
+    ;;
+    "values air simple wlan_adapter")
+        yq '.all_profiles[]' "$CACHE_DIR/wlan_adapters.yaml"
+    ;;
+    "values air simple datalink_mode")
+        echo -e "Manual\nAlink"
+    ;;
+    "values air simple preset")
+        wlan_adapter=$(gsmenu.sh get air simple wlan_adapter)
+        yq '.profiles.'$wlan_adapter'.presets.all_presets.[]' "$CACHE_DIR/wlan_adapters.yaml"
+        echo "Select"
+    ;;
+    "values air simple bandwidth")
+        gsmenu.sh values air camera bitrate
+    ;;
+    "values air simple channel")
+        gsmenu.sh values air wfbng air_channel
+    ;;
+    "values air simple txpower")
+        wlan_adapter=$(gsmenu.sh get air simple wlan_adapter)
+        yq '.profiles.'$wlan_adapter'.pwr_mw| to_entries | .[].value | .[0]' "$CACHE_DIR/wlan_adapters.yaml"
+    ;;
     "values air presets preset")
         if [ -d $PRESET_DIR ]; then
             for dir in $PRESET_DIR/presets/*; do
@@ -103,7 +137,7 @@ case "$@" in
         echo -n 0 60
         ;;
     "values air wfbng power")
-        echo -e "1\n20\n25\n30\n35\n40\n45\n50\n55\n58"
+        gsmenu.sh values air simple txpower
         ;;
     "values air wfbng air_channel")
         iw list | grep MHz | grep -v disabled | grep -v "radar detection" | grep \* | tr -d '[]' | awk '{print $4 " (" $2 " " $3 ")"}' | grep '^[1-9]' | sort -n |  uniq
@@ -139,6 +173,34 @@ case "$@" in
         echo -e "mavfwd\nmsposd"
         ;;
 
+    "get air simple video_mode")
+        echo "Select"
+    ;;
+    "get air simple wlan_adapter")
+        get_wfb_value '.wireless.wlan_adapter'
+    ;;
+    "get air simple datalink_mode")
+        alink_enabled=$(gsmenu.sh get air wfbng adaptivelink)
+        if [ "$alink_enabled" == "0" ]; then
+            echo "Manual"
+        elif [ "$alink_enabled" == "1" ]; then
+            echo "Alink"
+        fi
+    ;;
+    "get air simple preset")
+        echo "Select"
+    ;;
+    "get air simple bandwidth")
+        gsmenu.sh get air camera bitrate
+    ;;
+    "get air simple channel")
+        gsmenu.sh get air wfbng air_channel
+    ;;
+    "get air simple txpower")
+        power_index=$(get_wfb_value '.wireless.txpower')
+        wlan_adapter=$(gsmenu.sh get air simple wlan_adapter)
+        yq '.profiles.'$wlan_adapter'.pwr_mw.['$power_index'].[0]' "$CACHE_DIR/wlan_adapters.yaml"
+    ;;
     "get air presets info"*)
         if [ "$5" == "" ] ; then
             echo ""
@@ -226,6 +288,39 @@ case "$@" in
         get_majestic_value '.fpv.noiseLevel'
         ;;
 
+    "set air simple video_mode"*)
+        set -x
+        sensor=$(cat "$CACHE_DIR/ipcinfo")
+        mode=$(grep "$5" /etc/video_modes_${sensor}.ini | awk -F "\"" '{print $4}')
+        air_man_gs $REMOTE_IP "$mode"
+    ;;
+    "set air simple wlan_adapter"*)
+        $SSH wifibroadcast cli -s .wireless.wlan_adapter "$5"
+    ;;
+    "set air simple preset"*)
+        $SSH datalink_manager.sh --set-preset "$5"
+    ;;
+    "set air simple bandwidth"*)
+        $SSH /usr/bin/auto_bitrate.sh "$5"
+    ;;
+    "set air simple channel"*)
+        channel=$(echo $5 | awk '{print $1}')
+        air_man_gs  10.5.0.10 "change_channel $channel"
+    ;;
+    "set air simple txpower"*)
+        wlan_adapter=$(gsmenu.sh get air simple wlan_adapter)
+        tx_power=$(yq '.profiles.'$wlan_adapter'.pwr_mw| to_entries | map(select(.value[0] == "'$5'")) | .[].key' "$CACHE_DIR/wlan_adapters.yaml")
+
+        alink_enabled=$(gsmenu.sh get air wfbng adaptivelink)
+        if [ "$alink_enabled" == "0" ]; then
+            $SSH wifibroadcast cli -s .wireless.txpower $tx_power
+            air_man_gs 10.5.0.10 "set_alink_power $tx_power"
+            $SSH "(wifibroadcast stop ;wifibroadcast stop; sleep 1;  wifibroadcast start) >/dev/null 2>&1 &"
+        elif [ "$alink_enabled" == "1" ]; then
+            $SSH wifibroadcast cli -s .wireless.txpower $tx_power
+            air_man_gs 10.5.0.10 "set_alink_power $tx_power"
+        fi
+    ;;
     "set air presets "*)
         PRESET="$PRESET_DIR/presets/$4/preset-config.yaml"
 
@@ -395,7 +490,7 @@ case "$@" in
         ;;
 
     "get air wfbng power")
-        get_wfb_value '.wireless.txpower'
+        gsmenu.sh get air simple txpower
         ;;
     "get air wfbng air_channel")
         channel=$(get_wfb_value '.wireless.channel' | tr -d '\n')
@@ -423,19 +518,18 @@ case "$@" in
         get_wfb_value '.wireless.mlink'
         ;;
     "get air wfbng adaptivelink")
-        $SSH grep ^alink_drone /etc/rc.local | grep -q 'alink_drone' && echo 1 || echo 0
+        if [ "$(get_wfb_value '.wireless.link_control')" == "alink" ]; then
+            echo "1"
+        elif [ "$(get_wfb_value '.wireless.link_control')" == "manual" ]; then
+            echo "0"
+        fi
         ;;
 
     "set air wfbng power"*)
-        $SSH wifibroadcast cli -s .wireless.txpower $5
-        $SSH "(wifibroadcast stop ;wifibroadcast stop; sleep 1;  wifibroadcast start) >/dev/null 2>&1 &"
+        gsmenu.sh set air simple txpower $5
         ;;
     "set air wfbng air_channel"*)
-        channel=$(echo $5 | awk '{print $1}')
-        $SSH wifibroadcast cli -s .wireless.channel $channel
-        $SSH "(wifibroadcast stop ;wifibroadcast stop; sleep 1;  wifibroadcast start) >/dev/null 2>&1 &"
-        sed -i "s/^wifi_channel =.*/wifi_channel = $channel/" /etc/wifibroadcast.cfg
-        systemctl restart wifibroadcast.service
+        gsmenu.sh set air simple "$5"
         ;;
     "set air wfbng width"*)
         $SSH wifibroadcast cli -s .wireless.width $5
@@ -479,9 +573,11 @@ case "$@" in
     "set air wfbng adaptivelink"*)
         if [ "$5" = "on" ]
         then
-            $SSH 'sed -i "/alink_drone &/d" /etc/rc.local && sed -i -e "\$i alink_drone &" /etc/rc.local && cli -s .video0.qpDelta -12 && killall -1 majestic && (nohup alink_drone >/dev/null 2>&1 &)'
+            $SSH wifibroadcast cli -s .wireless.link_control alink
+            air_man_gs 10.5.0.10 start_alink
         else
-            $SSH 'killall -q -9 alink_drone;  sed -i "/alink_drone &/d" /etc/rc.local  ; cli -d .video0.qpDelta && killall -1 majestic'
+            $SSH wifibroadcast cli -s .wireless.link_control manual
+            air_man_gs 10.5.0.10 stop_alink
         fi
         ;;
 
