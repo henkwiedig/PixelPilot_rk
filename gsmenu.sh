@@ -140,7 +140,9 @@ case "$@" in
         gsmenu.sh values air simple txpower
         ;;
     "values air wfbng air_channel")
-        iw list | grep MHz | grep -v disabled | grep -v "radar detection" | grep \* | tr -d '[]' | awk '{print $4 " (" $2 " " $3 ")"}' | grep '^[1-9]' | sort -n |  uniq  | sed -z '$ s/\n$//'
+        wlan_adapter=$(gsmenu.sh get air simple wlan_adapter)
+        bandwidth=$(get_wfb_value '.wireless.width')
+        yq '.profiles.'$wlan_adapter'.channels.'$bandwidth'.non-dfs.[]' "$CACHE_DIR/wlan_adapters.yaml" | sed -z '$ s/\n$//'
         ;;
     "values air wfbng width")
         echo -n -e "20\n40"
