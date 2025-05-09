@@ -51,6 +51,7 @@ void air_presets_update_callback(lv_event_t * e) {
 }
 
 void air_presets_page_load_callback(lv_obj_t *page) {
+    get_dropdown_value(preset);
     lv_obj_send_event(lv_obj_get_child_by_type(preset,0,&lv_dropdown_class),LV_EVENT_VALUE_CHANGED,preset);
 }
 

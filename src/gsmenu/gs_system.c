@@ -9,11 +9,15 @@
 
 extern lv_group_t * default_group;
 
+extern lv_obj_t * air_wfbng_cont;
+extern lv_obj_t * air_camera_cont;
+
 lv_obj_t * gs_rendering;
 lv_obj_t * resolution;
 lv_obj_t * rec_enabled;
 lv_obj_t * rec_fps;
 lv_obj_t * vsync_disabled;
+lv_obj_t * advanced_menu;
 
 typedef struct Dvr* Dvr; // Forward declaration
 void dvr_start_recording(Dvr* dvr);
@@ -74,6 +78,20 @@ void disable_vsync_cb(lv_event_t *e) {
     }
 }
 
+void advanced_menu_cb(lv_event_t *e) {
+    lv_event_code_t event = lv_event_get_code(e);
+    if (event == LV_EVENT_VALUE_CHANGED) {
+        lv_obj_t *ta = lv_event_get_target(e);
+        if (lv_obj_has_state(ta, LV_STATE_CHECKED)) {
+            lv_obj_remove_flag(air_wfbng_cont,LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(air_camera_cont,LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(air_wfbng_cont,LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(air_camera_cont,LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
 void rec_fps_cb(lv_event_t *e) {
     lv_event_code_t event = lv_event_get_code(e);
     if (event == LV_EVENT_VALUE_CHANGED) {
@@ -114,6 +132,8 @@ void create_gs_system_menu(lv_obj_t * parent) {
     resolution = create_dropdown(cont,LV_SYMBOL_SETTINGS, "Resolution","","resolution",menu_page_data,false);
     vsync_disabled = create_switch(cont,LV_SYMBOL_SETTINGS,"Disable VSYNC","disable_vsync", NULL,false);
     lv_obj_add_event_cb(lv_obj_get_child_by_type(vsync_disabled,0,&lv_switch_class), disable_vsync_cb, LV_EVENT_VALUE_CHANGED,NULL);
+    advanced_menu = create_switch(cont,LV_SYMBOL_SETTINGS,"Advanced Menu","advanced_menu", NULL,false);
+    lv_obj_add_event_cb(lv_obj_get_child_by_type(advanced_menu,0,&lv_switch_class), advanced_menu_cb, LV_EVENT_VALUE_CHANGED,NULL);
 
     create_text(parent, NULL, "Recording", NULL, NULL, false, LV_MENU_ITEM_BUILDER_VARIANT_1);
     section = lv_menu_section_create(parent);

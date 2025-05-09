@@ -6,8 +6,8 @@
 typedef void (*callback_fn)(void);
 
 typedef struct {
-    lv_event_t * event;
-    lv_obj_t* parent;
+    // lv_event_t * event;
+    // lv_obj_t* parent;
     bool blocking;
     bool work_complete;
     pthread_t thread_id;

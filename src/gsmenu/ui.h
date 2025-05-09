@@ -1,7 +1,6 @@
 #pragma once
 
 #include "../../lvgl/lvgl.h"
-#include "ui.h"
 
 typedef void (*ReloadFunc)(lv_obj_t * page, lv_obj_t * target);
 
