@@ -142,7 +142,12 @@ case "$@" in
     "values air wfbng air_channel")
         wlan_adapter=$(gsmenu.sh get air simple wlan_adapter)
         bandwidth=$(get_wfb_value '.wireless.width')
-        yq '.profiles.'$wlan_adapter'.channels.'$bandwidth'.non-dfs.[]' "$CACHE_DIR/wlan_adapters.yaml" | sed -z '$ s/\n$//'
+        output=""
+        for CHANNEL in $(yq '.profiles.'$wlan_adapter'.channels.'$bandwidth'.non-dfs.[]' "$CACHE_DIR/wlan_adapters.yaml")
+        do
+            output+=$(iw list | grep -E "\[$CHANNEL\]" | head -1| awk '{print $4 " (" $2 " " $3")"}'| tr -d '\[' | tr -d '\]')$'\n'
+        done
+        printf "%s" "${output%$'\n'}"
         ;;
     "values air wfbng width")
         echo -n -e "20\n40"
@@ -291,7 +296,6 @@ case "$@" in
         ;;
 
     "set air simple video_mode"*)
-        set -x
         sensor=$(cat "$CACHE_DIR/ipcinfo")
         mode=$(grep "$5" /etc/video_modes_${sensor}.ini | awk -F "\"" '{print $4}')
         air_man_gs $REMOTE_IP "$mode"
@@ -531,7 +535,7 @@ case "$@" in
         gsmenu.sh set air simple txpower $5
         ;;
     "set air wfbng air_channel"*)
-        gsmenu.sh set air simple "$5"
+        gsmenu.sh set air simple channel "$5"
         ;;
     "set air wfbng width"*)
         $SSH wifibroadcast cli -s .wireless.width $5
@@ -720,11 +724,11 @@ case "$@" in
     "set gs wfbng gs_channel"*)
         channel=$(echo $5 | awk '{print $1}')
         if [ "$GSMENU_VTX_DETECTED" -eq "1" ]; then
-            $SSH wifibroadcast cli -s .wireless.channel $channel
-            $SSH "(wifibroadcast stop ;wifibroadcast stop; sleep 1;  wifibroadcast start) >/dev/null 2>&1 &"
+            gsmenu.sh set air simple channel "$5"
+        else
+            sed -i "s/^wifi_channel =.*/wifi_channel = $channel/" /etc/wifibroadcast.cfg
+            systemctl restart wifibroadcast.service
         fi
-        sed -i "s/^wifi_channel =.*/wifi_channel = $channel/" /etc/wifibroadcast.cfg
-        systemctl restart wifibroadcast.service
         ;;
     "set gs wfbng bandwidth"*)
         sed -i "s/^bandwidth = .*/bandwidth = $5/" /etc/wifibroadcast.cfg
