@@ -39,6 +39,38 @@ void simple_datalink_mode_cb(lv_event_t *e) {
     lv_obj_send_event(alink,LV_EVENT_VALUE_CHANGED,NULL);
 }
 
+extern lv_obj_t * rec_fps;
+void simple_video_mode_cb(lv_event_t *e) {
+    char val[100] = "";
+    char fps_str[10] = "";
+    int element_count = 0;
+
+    lv_obj_t *ta = lv_event_get_target(e);
+    lv_dropdown_get_selected_str(ta, val, sizeof(val) - 1);
+
+    // Parse the third element (expecting format like "4:3 1080p 90")
+    char *token = strtok(val, " ");
+    while (token != NULL && element_count < 3) {
+        element_count++;
+        if (element_count == 3) {
+            strncpy(fps_str, token, sizeof(fps_str) - 1);
+            fps_str[sizeof(fps_str) - 1] = '\0'; // Ensure null termination
+            break;
+        }
+        token = strtok(NULL, " ");
+    }
+
+    if (element_count < 3) {
+        // Handle error - string didn't have three elements
+        return;
+    }
+
+    lv_obj_t *obj = lv_obj_get_child_by_type(rec_fps, 0, &lv_dropdown_class);
+    int index = lv_dropdown_get_option_index(obj,fps_str);
+    lv_dropdown_set_selected(obj, index);
+    lv_obj_send_event(obj,LV_EVENT_VALUE_CHANGED,NULL);
+}
+
 void create_air_simple_menu(lv_obj_t * parent) {
 
     menu_page_data_t *menu_page_data = malloc(sizeof(menu_page_data_t) + sizeof(PageEntry) * ENTRIES);
@@ -59,6 +91,7 @@ void create_air_simple_menu(lv_obj_t * parent) {
     lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
 
     simple_video_mode = create_dropdown(cont,LV_SYMBOL_SETTINGS, "Video mode","","video_mode",menu_page_data,false);
+    lv_obj_add_event_cb(lv_obj_get_child_by_type(simple_video_mode,0,&lv_dropdown_class), simple_video_mode_cb, LV_EVENT_VALUE_CHANGED,simple_video_mode);
     simple_wlan_adapter = create_dropdown(cont,LV_SYMBOL_SETTINGS, "WLAN Adapter","","wlan_adapter",menu_page_data,false);
     simple_datalink_mode = create_dropdown(cont,LV_SYMBOL_SETTINGS, "Datalink mode","","datalink_mode",menu_page_data,false);
     simple_preset = create_dropdown(cont,LV_SYMBOL_SETTINGS, "Preset","","preset",menu_page_data,false);
