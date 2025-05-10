@@ -460,16 +460,16 @@ case "$@" in
         ;;
 
     "get air telemetry serial")
-        $SSH wifibroadcast cli -g .telemetry.serial
+        get_wfb_value '.telemetry.serial'
         ;;
     "get air telemetry router")
-        $SSH wifibroadcast cli -g .telemetry.router
+        get_wfb_value '.telemetry.router'
         ;;
     "get air telemetry osd_fps")
-        $SSH wifibroadcast cli -g .telemetry.osd_fps
+        get_wfb_value '.telemetry.osd_fps'
         ;;
     "get air telemetry gs_rendering")
-        $SSH 'grep "\-z \"\$size\"" /usr/bin/wifibroadcast' | grep -q size && echo 0 || echo 1
+        get_wfb_value '.telemetry.downlink' | grep -q tunnel && echo 1 || echo 0
         ;;
 
     "set air telemetry serial"*)
@@ -486,11 +486,11 @@ case "$@" in
         ;;
     "set air telemetry gs_rendering"*)
         if [ "$5" = "on" ]
-        then -o 127.0.0.1:"$port_tx" -z "$size"
-            $SSH 'sed -i "s/-o 127\.0\.0\.1:\"\$port_tx\" -z \"\$size\"/-o 10\.5\.0\.1:\"\$port_tx\"/" /usr/bin/wifibroadcast'
+        then
+            $SSH 'wifibroadcast cli -s .telemetry.downlink tunnel && sed -i "s/-z \"\$size\"/-zz \"\$size\"/" /usr/bin/wifibroadcast'
             $SSH "(wifibroadcast stop ;wifibroadcast stop; sleep 1;  wifibroadcast start) >/dev/null 2>&1 &"
         else
-            $SSH 'sed -i "s/-o 10\.5\.0\.1:\"\$port_tx\"/-o 127\.0\.0\.1:\"\$port_tx\" -z \"\$size\"/" /usr/bin/wifibroadcast'
+            $SSH 'wifibroadcast cli -s .telemetry.downlink tun && sed -i "s/-zz/-z/" /usr/bin/wifibroadcast'
             $SSH "(wifibroadcast stop ;wifibroadcast stop; sleep 1;  wifibroadcast start) >/dev/null 2>&1 &"
         fi
         ;;
