@@ -601,29 +601,29 @@ case "$@" in
         ;;
 
     "get gs system gs_rendering")
-        [ "$(grep ground /config/scripts/osd | cut -d ' ' -f 3)" = "ground" ] && echo 1 || echo 0
+        [ "$(grep ^osd /config/setup.txt | cut -d ' ' -f 3)" = "ground" ] && echo 1 || echo 0
         ;;
     "get gs system resolution")
         drm_info -j /dev/dri/card0 2>/dev/null | jq -r '."/dev/dri/card0".crtcs[0].mode| .name + "@" + (.vrefresh|tostring)'
         ;;
     "get gs system rec_fps")
-        grep fps /config/scripts/rec-fps | cut -d ' ' -f 3 
+        grep ^rec_fps /config/setup.txt | cut -d ' ' -f 3 
         ;;
     "set gs system gs_rendering"*)
         if [ "$5" = "off" ]
         then
-            sed -i 's/^render =.*/render = air/' /config/scripts/osd
+            sed -i 's/^osd =.*/osd = air/' /config/setup.txt
             killall -q msposd_rockchip
         else
-            sed -i 's/^render =.*/render = ground/' /config/scripts/osd
+            sed -i 's/^osd =.*/osd = ground/' /config/setup.txt
             msposd_rockchip --osd --ahi 0 --matrix 11 -v -r 5 --master 0.0.0.0:14551 &
         fi
         ;;
     "set gs system resolution"*)
-        sed -i "s/^mode =.*/mode = $5/" /config/scripts/screen-mode
+        sed -i "s/^screen_mode =.*/screen_mode = $5/" /config/setup.txt
         ;;
     "set gs system rec_fps"*)
-        sed -i "s/^fps =.*/fps = $5/" /config/scripts/rec-fps
+        sed -i "s/^rec_fps =.*/rec_fps = $5/" /config/setup.txt
         ;;
     "set gs system rec_enabled"*)
         if [ "$5" = "off" ]
