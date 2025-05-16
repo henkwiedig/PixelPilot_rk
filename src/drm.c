@@ -18,6 +18,8 @@
 #include <rockchip/rk_mpi.h>
 #include <assert.h>
 
+extern bool skyo4xpro;
+
 int modeset_open(int *out, const char *node)
 {
 	int fd, ret;
@@ -414,6 +416,24 @@ void modeset_output_destroy(int fd, struct modeset_output *out)
 	free(out);
 }
 
+// Skyzone 04X Pro 100Hz fix
+// Thanks to https://github.com/redwineproof for provideing this custom drm mode
+drmModeModeInfo custom_mode_1280_720_100 = {
+    .clock = 119100, // Pixel clock in kHz
+    .hdisplay = 1280,
+    .hsync_start = 1377,
+    .hsync_end = 1425,
+    .htotal = 1588,
+    .vdisplay = 720,
+    .vsync_start = 725,
+    .vsync_end = 730,
+    .vtotal = 750,
+    .vrefresh = 100,
+    .flags = DRM_MODE_FLAG_NHSYNC | DRM_MODE_FLAG_PVSYNC,
+    .type = DRM_MODE_TYPE_DRIVER,
+    .name = "1280x720@100",
+};
+
 struct modeset_output *modeset_output_create(int fd, drmModeRes *res, drmModeConnector *conn, uint16_t mode_width, uint16_t mode_height, uint32_t mode_vrefresh)
 {
 	int ret;
@@ -463,7 +483,12 @@ struct modeset_output *modeset_output_create(int fd, drmModeRes *res, drmModeCon
 		}
 		printf( "Using screen mode %dx%d@%d\n",conn->modes[fc].hdisplay, conn->modes[fc].vdisplay , conn->modes[fc].vrefresh );
 	}
-	memcpy(&out->mode, &conn->modes[fc], sizeof(out->mode));
+	if (skyo4xpro) {
+		printf("Skyzone O4X Pro 100hz fix enabled\n");
+		memcpy(&out->mode, &custom_mode_1280_720_100, sizeof(out->mode));
+	} else {
+		memcpy(&out->mode, &conn->modes[fc], sizeof(out->mode));
+	}
 	if (drmModeCreatePropertyBlob(fd, &out->mode, sizeof(out->mode), &out->mode_blob_id) != 0) {
 		fprintf(stderr, "couldn't create a blob property\n");
 		goto out_error;

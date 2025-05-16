@@ -86,6 +86,7 @@ bool mavlink_dvr_on_arm = false;
 bool osd_custom_message = false;
 bool disable_vsync = false;
 uint32_t refresh_frequency_ms = 1000;
+bool skyo4xpro = false;
 
 VideoCodec codec = VideoCodec::H265;
 Dvr *dvr = NULL;
@@ -535,6 +536,8 @@ void printHelp() {
     "\n"
     "    --wfb-api-port         - Port of wfb-server for cli statistics. (Default: 8003)\n"
 	"                             Use \"0\" to disable this stats\n"
+	"\n"
+    "    --skyo4xpro            - Use custom drm mode. Use on your own risk\n"
     "\n"
     "    --version              - Show program version\n"
     "\n", APP_VERSION_MAJOR, APP_VERSION_MINOR
@@ -702,6 +705,11 @@ int main(int argc, char **argv)
 
 	__OnArgument("--wfb-api-port") {
 		wfb_port = atoi(__ArgValue);
+		continue;
+	}
+
+	__OnArgument("--skyo4xpro") {
+		skyo4xpro = true;
 		continue;
 	}
 
