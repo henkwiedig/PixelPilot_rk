@@ -18,6 +18,8 @@
 #include <rockchip/rk_mpi.h>
 #include <assert.h>
 
+extern int osd_zpos;
+
 int modeset_open(int *out, const char *node)
 {
 	int fd, ret;
@@ -416,13 +418,46 @@ void modeset_destroy_fb(int fd, struct modeset_buf *buf)
 
 int modeset_setup_framebuffers(int fd, drmModeConnector *conn, struct modeset_output *out)
 {
+	int ret;
 	for (int i=0; i<OSD_BUF_COUNT; i++) {
 		out->osd_bufs[i].width = out->mode.hdisplay;
 		out->osd_bufs[i].height = out->mode.vdisplay;
-		int ret = modeset_create_fb(fd, &out->osd_bufs[i]);
+		if (out->rotation == 90 || out->rotation == 270) {
+			out->osd_bufs[i].width = out->mode.vdisplay;
+			out->osd_bufs[i].height = out->mode.hdisplay;
+		}
+		ret = modeset_create_fb(fd, &out->osd_bufs[i]);
 		if (ret) {
 			return ret;
 		}
+
+		// import buffer to rga
+		im_handle_param_t param;
+		param.width = out->osd_bufs[i].width;
+		param.height = out->osd_bufs[i].height;
+		param.format = RK_FORMAT_RGBA_8888;
+		out->rotated_osd_bufs[i].rga_src_handle = importbuffer_virtualaddr(
+			out->osd_bufs[i].map,
+			&param
+		);
+
+		// Also create the rotated buffer
+		out->rotated_osd_bufs[i].width = out->mode.hdisplay;
+		out->rotated_osd_bufs[i].height = out->mode.vdisplay;
+		ret = modeset_create_fb(fd, &out->rotated_osd_bufs[i]);
+		if (ret) {
+			return ret;
+		}
+
+		im_handle_param_t param_rot;
+		param_rot.width = out->rotated_osd_bufs[i].width;
+		param_rot.height = out->rotated_osd_bufs[i].height;
+		param_rot.format = RK_FORMAT_RGBA_8888;
+		out->rotated_osd_bufs[i].rga_dst_handle = importbuffer_virtualaddr(
+			out->rotated_osd_bufs[i].map,
+			&param_rot
+		);
+
 	}
 	out->video_crtc_width = out->mode.hdisplay;
 	out->video_crtc_height = out->mode.vdisplay;
@@ -437,11 +472,14 @@ void modeset_output_destroy(int fd, struct modeset_output *out)
 	for (int i=0; i<OSD_BUF_COUNT; i++) { 
 		modeset_destroy_fb(fd, &out->osd_bufs[i]);
 	}
+	for (int i=0; i<MAX_FRAMES; i++) {
+		modeset_destroy_fb(fd, &out->rotated_bufs[i]);
+	}	
 	drmModeDestroyPropertyBlob(fd, out->mode_blob_id);
 	free(out);
 }
 
-struct modeset_output *modeset_output_create(int fd, drmModeRes *res, drmModeConnector *conn, uint16_t mode_width, uint16_t mode_height, uint32_t mode_vrefresh, uint32_t video_plane_id, uint32_t osd_plane_id)
+struct modeset_output *modeset_output_create(int fd, drmModeRes *res, drmModeConnector *conn, uint16_t mode_width, uint16_t mode_height, uint32_t mode_vrefresh, uint32_t video_plane_id, uint32_t osd_plane_id, int rotate)
 {
 	int ret;
 	struct modeset_output *out;
@@ -449,6 +487,7 @@ struct modeset_output *modeset_output_create(int fd, drmModeRes *res, drmModeCon
 	out = malloc(sizeof(*out));
 	memset(out, 0, sizeof(*out));
 	out->connector.id = conn->connector_id;
+	out->rotation = rotate;
 
 	if (conn->connection != DRM_MODE_CONNECTED) {
 		fprintf(stderr, "ignoring unused connector %u\n",
@@ -587,7 +626,7 @@ void *modeset_print_modes(int fd)
 
 }
 
-struct modeset_output *modeset_prepare(int fd, uint16_t mode_width, uint16_t mode_height, uint32_t mode_vrefresh, uint32_t video_plane_id, uint32_t osd_plane_id)
+struct modeset_output *modeset_prepare(int fd, uint16_t mode_width, uint16_t mode_height, uint32_t mode_vrefresh, uint32_t video_plane_id, uint32_t osd_plane_id, int rotate)
 {
 	drmModeRes *res;
 	drmModeConnector *conn;
@@ -609,7 +648,7 @@ struct modeset_output *modeset_prepare(int fd, uint16_t mode_width, uint16_t mod
 			continue;
 		}
 
-		out = modeset_output_create(fd, res, conn, mode_width, mode_height, mode_vrefresh, video_plane_id, osd_plane_id);
+		out = modeset_output_create(fd, res, conn, mode_width, mode_height, mode_vrefresh, video_plane_id, osd_plane_id, rotate);
 		drmModeFreeConnector(conn);
 		if (out) {
 			drmModeFreeResources(res);
@@ -652,6 +691,12 @@ int modeset_perform_modeset(int fd, struct modeset_output *out, drmModeAtomicReq
 int modeset_atomic_prepare_commit(int fd, struct modeset_output *out, drmModeAtomicReq *req, struct drm_object *plane, 
 	int fb_id, uint32_t width, uint32_t height, int zpos)
 {
+	if ((out->rotation == 90 || out->rotation == 270) && (zpos != osd_zpos)) { // rotate only on non osd plane and non 180°
+		int tmp = width;
+		width = height;
+		height = tmp;
+	}
+
 	if (set_drm_object_property(req, &out->connector, "CRTC_ID", out->crtc.id) < 0)
 		return -1;
 	if (set_drm_object_property(req, &out->crtc, "MODE_ID", out->mode_blob_id) < 0)
