@@ -1,5 +1,6 @@
 #pragma once
 
+#define MAX_FRAMES 24		// min 16 and 20+ recommended (mpp/readme.txt)
 
 void sig_handler(int signum);
 

@@ -145,7 +145,7 @@ else()
   find_package(yaml-cpp REQUIRED)
   pkg_check_modules(LIBGPIOD REQUIRED libgpiod)
   add_executable(${PROJECT_NAME} ${SOURCE_FILES})
-  target_link_libraries(${PROJECT_NAME} rockchip_mpp pthread drm m cairo spdlog::spdlog nlohmann_json::nlohmann_json yaml-cpp rt lvgl ${LIBGPIOD_LIBRARIES} ${PNG_LIBRARIES})
+  target_link_libraries(${PROJECT_NAME} rockchip_mpp rga pthread drm m cairo spdlog::spdlog nlohmann_json::nlohmann_json yaml-cpp rt lvgl ${LIBGPIOD_LIBRARIES} ${PNG_LIBRARIES})
   # Embed gstreamer
   find_package(PkgConfig REQUIRED)
   pkg_search_module(GST REQUIRED
@@ -169,7 +169,7 @@ if(CMAKE_BUILD_TYPE MATCHES "Debug")
   )
 endif()
 
-target_include_directories(${PROJECT_NAME} PUBLIC "${PROJECT_BINARY_DIR}")
+target_include_directories(${PROJECT_NAME} PUBLIC "${PROJECT_BINARY_DIR}" "/usr/include/rga")
 
 include(GNUInstallDirs)
 install(TARGETS ${PROJECT_NAME}

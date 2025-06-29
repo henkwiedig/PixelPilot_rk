@@ -32,6 +32,9 @@
 #include <drm_fourcc.h>
 #include <linux/videodev2.h>
 #include <rockchip/rk_mpi.h>
+#include "rga.h"
+#include "RgaUtils.h"
+#include "im2d.hpp"
 #include <nlohmann/json.hpp>
 #include <yaml-cpp/yaml.h>
 #include "spdlog/spdlog.h"
@@ -57,8 +60,6 @@ extern "C" {
 
 
 #define READ_BUF_SIZE (1024*1024) // SZ_1M https://github.com/rockchip-linux/mpp/blob/ed377c99a733e2cdbcc457a6aa3f0fcd438a9dff/osal/inc/mpp_common.h#L179
-#define MAX_FRAMES 24		// min 16 and 20+ recommended (mpp/readme.txt)
-
 #define CODEC_ALIGN(x, a)   (((x)+(a)-1)&~((a)-1))
 
 #define DEFAULT_CONFIG_PATH "/etc/pixelpilot.yaml"
@@ -116,10 +117,18 @@ void init_buffer(MppFrame frame) {
 	spdlog::info("Frame info changed {}({})x{}({})",
 				 output_list->video_frm_width, hor_stride, output_list->video_frm_height, ver_stride);
 
+    // These will be the dimensions after rotation
+    output_list->rotated_width = output_list->video_frm_height;  // 720
+    output_list->rotated_height = output_list->video_frm_width;  // 1080
+	if (output_list->rotation == 180) { // no side flip for 180°
+		output_list->rotated_width = output_list->video_frm_width;
+		output_list->rotated_height = output_list->video_frm_height;
+	}
+    
 	output_list->video_fb_x = 0;
 	output_list->video_fb_y = 0;
 	output_list->video_fb_width = output_list->mode.hdisplay;
-	output_list->video_fb_height =output_list->mode.vdisplay;	
+	output_list->video_fb_height =output_list->mode.vdisplay;
 
 	osd_publish_uint_fact("video.width", NULL, 0, output_list->video_frm_width);
 	osd_publish_uint_fact("video.height", NULL, 0, output_list->video_frm_height);
@@ -144,6 +153,9 @@ void init_buffer(MppFrame frame) {
 				ioctl(drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dmd);
 				mpi.frame_to_drm[i].handle = 0;
 			}
+			// Cleanup old rotated buffers as well
+			modeset_destroy_fb(drm_fd, &output_list->rotated_bufs[i]);
+			memset(&output_list->rotated_bufs[i], 0, sizeof(struct modeset_buf));
 		}
 		
 		mpp_buffer_group_clear(mpi.frm_grp);
@@ -212,13 +224,125 @@ void init_buffer(MppFrame frame) {
 	ret = mpi.mpi->control(mpi.ctx, MPP_DEC_SET_EXT_BUF_GROUP, mpi.frm_grp);
 	ret = mpi.mpi->control(mpi.ctx, MPP_DEC_SET_INFO_CHANGE_READY, NULL);
 
-	ret = modeset_perform_modeset(drm_fd, output_list, output_list->video_request, &output_list->video_plane, mpi.frame_to_drm[0].fb_id, output_list->video_frm_width, output_list->video_frm_height, video_zpos);
+	for (int i=0; i<MAX_FRAMES; i++) {
+
+		struct modeset_buf *buf = &output_list->rotated_bufs[i];
+		buf->width = output_list->rotated_width;
+		buf->height = output_list->rotated_height;
+
+		// new DRM buffer
+		struct drm_mode_create_dumb creq;
+		memset(&creq, 0, sizeof(creq));
+		creq.bpp = fmt==MPP_FMT_YUV420SP?8:10;
+        // For 180 degree rotation, we keep the same dimensions as original
+        if (output_list->rotation == 180) {
+            creq.width = hor_stride;
+            creq.height = ver_stride*2;
+        } else { // 90/270 degree rotation
+            creq.width = ver_stride;
+            creq.height = hor_stride*2;
+        }
+		do {
+			ret = ioctl(drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq);
+		} while (ret == -1 && (errno == EINTR || errno == EAGAIN));
+		assert(!ret);
+		buf->handle = creq.handle;
+		buf->stride = creq.pitch;
+
+		struct drm_prime_handle dph;
+		memset(&dph, 0, sizeof(struct drm_prime_handle));
+		dph.handle = creq.handle;
+		dph.fd = -1;
+		do {
+			ret = ioctl(drm_fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &dph);
+		} while (ret == -1 && (errno == EINTR || errno == EAGAIN));
+		assert(!ret);
+		buf->prime_fd = dph.fd;
+
+		// allocate DRM FB from DRM buffer
+		uint32_t handles[4], pitches[4], offsets[4];
+		memset(handles, 0, sizeof(handles));
+		memset(pitches, 0, sizeof(pitches));
+		memset(offsets, 0, sizeof(offsets));
+		handles[0] = buf->handle;
+		offsets[0] = 0;
+        if (output_list->rotation == 180) {
+            pitches[0] = hor_stride;
+            handles[1] = buf->handle;
+            offsets[1] = pitches[0] * ver_stride;
+            pitches[1] = pitches[0];
+        } else {
+            pitches[0] = ver_stride;
+            handles[1] = buf->handle;
+            offsets[1] = pitches[0] * hor_stride;
+            pitches[1] = pitches[0];
+        }
+
+		ret = drmModeAddFB2(drm_fd, buf->width, buf->height, 
+						DRM_FORMAT_NV12, handles, pitches, offsets, &buf->rotated_fd, 0);
+		assert(!ret);
+
+		int src_buf_size = output_list->video_frm_width * output_list->video_frm_height * 3 / 2; // NV12 is 1.5 bytes per pixel
+		int dst_buf_size = buf->width * buf->height * 3 / 2; // Rotated dimensions
+
+		buf->rga_src_handle = importbuffer_fd(
+				mpi.frame_to_drm[i].prime_fd,
+				src_buf_size
+			);
+		buf->rga_dst_handle = importbuffer_fd(
+				buf->prime_fd,
+				dst_buf_size
+			);
+	}
+
+	ret = modeset_perform_modeset(
+		drm_fd,
+		output_list,
+		output_list->video_request,
+		&output_list->video_plane,
+		output_list->rotation > 0 ? output_list->rotated_bufs[0].rotated_fd : mpi.frame_to_drm[0].fb_id, // use rotated buffers if rotation is enabled
+		output_list->video_frm_width,
+		output_list->video_frm_height,
+		video_zpos
+	);
 	assert(ret >= 0);
 
 	// dvr setup
 	if (dvr != NULL){
 		dvr->set_video_params(output_list->video_frm_width, output_list->video_frm_height, codec);
 	}
+}
+
+void rotate(int current_frame) {
+
+    int ret;
+    struct modeset_buf *outbuf = &output_list->rotated_bufs[current_frame];
+
+    rga_buffer_t src_img, dst_img;
+    memset(&src_img, 0, sizeof(src_img));
+    memset(&dst_img, 0, sizeof(dst_img));
+
+    src_img = wrapbuffer_handle(outbuf->rga_src_handle,
+                               output_list->video_frm_width,
+                               output_list->video_frm_height,
+                               RK_FORMAT_YCrCb_420_SP);
+    dst_img = wrapbuffer_handle(outbuf->rga_dst_handle,
+                               outbuf->width,
+                               outbuf->height,
+                               RK_FORMAT_YCrCb_420_SP);
+
+
+	uint32_t rotation_flags;
+    switch (output_list->rotation) {
+        case 90:  rotation_flags = IM_HAL_TRANSFORM_ROT_90; break;
+        case 180: rotation_flags = IM_HAL_TRANSFORM_ROT_180; break;
+        case 270: rotation_flags = IM_HAL_TRANSFORM_ROT_270; break;
+    }
+
+    ret = imrotate(src_img, dst_img, rotation_flags);
+    if (ret != IM_STATUS_SUCCESS) {
+        spdlog::error("RGA rotation failed: {}", imStrError((IM_STATUS)ret));
+    }
 }
 
 // __FRAME_THREAD__
@@ -265,12 +389,17 @@ void *__FRAME_THREAD__(void *param)
 					}
 					assert(i!=MAX_FRAMES);
 
+					if (output_list->rotation > 0) rotate(i);
+
 					ts = ats;
-					
 					// send DRM FB to display thread
 					ret = pthread_mutex_lock(&video_mutex);
 					assert(!ret);
-					output_list->video_fb_id = mpi.frame_to_drm[i].fb_id;
+					if (output_list->rotation > 0) {
+						output_list->video_fb_id = output_list->rotated_bufs[i].rotated_fd;
+					} else {
+						output_list->video_fb_id = mpi.frame_to_drm[i].fb_id;
+					}
                     //output_list->video_fb_index=i;
                     output_list->decoding_pts=feed_data_ts;
 					ret = pthread_cond_signal(&video_cond);
@@ -334,8 +463,12 @@ void *__DISPLAY_THREAD__(void *param)
 
 		if(enable_osd) {
 			ret = pthread_mutex_lock(&osd_mutex);
-			assert(!ret);		
-			ret = set_drm_object_property(output_list->video_request, &output_list->osd_plane, "FB_ID", output_list->osd_bufs[output_list->osd_buf_switch].fb);
+			assert(!ret);
+			if (output_list->rotation > 0) {
+				ret = set_drm_object_property(output_list->video_request, &output_list->osd_plane, "FB_ID", output_list->rotated_osd_bufs[output_list->osd_buf_switch].fb);
+			} else {
+				ret = set_drm_object_property(output_list->video_request, &output_list->osd_plane, "FB_ID", output_list->osd_bufs[output_list->osd_buf_switch].fb);
+			}
 			assert(ret>0);
 		}
 		drmModeAtomicCommit(drm_fd, output_list->video_request, flags, NULL);
@@ -583,6 +716,8 @@ void printHelp() {
     "\n"
     "    --screen-mode <mode>   - Override default screen mode. <width>x<heigth>@<fps> ex: 1920x1080@120\n"
     "\n"
+    "    --screen-rotate <deg>  - Rotate the screen useing RGA, adds ~2.5ms latency, Default: 0, Values: 0,90,180,270\n"
+    "\n"
     "    --video-plane-id       - Override default drm plane used for video by plane-id\n"
     "\n"
     "    --osd-plane-id         - Override default drm plane used for osd by plane-id\n"
@@ -615,6 +750,7 @@ int main(int argc, char **argv)
 	uint16_t mode_width = 0;
 	uint16_t mode_height = 0;
 	uint32_t mode_vrefresh = 0;
+	int rotate = 0;
 	std::string osd_config_path;
 	auto log_level = spdlog::level::info;
 	
@@ -783,6 +919,12 @@ int main(int argc, char **argv)
 		continue;
 	}
 
+	__OnArgument("--screen-rotate") {
+		rotate = atoi(__ArgValue);
+		spdlog::info("Screen rotation enabled at {}°", rotate);
+		continue;
+	}
+
 	__OnArgument("--disable-vsync") {
 		disable_vsync = true;
 		continue;
@@ -848,7 +990,7 @@ int main(int argc, char **argv)
 		return 0;
 	}
 
-	output_list = modeset_prepare(drm_fd, mode_width, mode_height, mode_vrefresh, video_plane_id_override, osd_plane_id_override);
+	output_list = modeset_prepare(drm_fd, mode_width, mode_height, mode_vrefresh, video_plane_id_override, osd_plane_id_override, rotate);
 	if (!output_list) {
 		fprintf(stderr,
 				"cannot initialize display. Is display connected? Is --screen-mode correct?\n");

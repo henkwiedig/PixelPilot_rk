@@ -1438,6 +1438,41 @@ cairo_surface_t * surface_from_embedded_png(const char * png, size_t length)
 }
 
 
+void rotate_osd(int current_frame) {
+
+    int ret;
+    // The destination buffer is the rotated one
+    struct modeset_buf *outbuf = &p->out->rotated_osd_bufs[current_frame];
+    // The source buffer is the original, un-rotated one
+    struct modeset_buf *inbuf = &p->out->osd_bufs[current_frame];
+
+    rga_buffer_t src_img, dst_img;
+    memset(&src_img, 0, sizeof(src_img));
+    memset(&dst_img, 0, sizeof(dst_img));
+
+    src_img = wrapbuffer_handle(outbuf->rga_src_handle,
+                               inbuf->width,
+                               inbuf->height,
+                               RK_FORMAT_RGBA_8888);
+    dst_img = wrapbuffer_handle(outbuf->rga_dst_handle,
+                               outbuf->width,
+                               outbuf->height,
+                               RK_FORMAT_RGBA_8888);
+
+
+	uint32_t rotation_flags;
+    switch (p->out->rotation) {
+        case 90:  rotation_flags = IM_HAL_TRANSFORM_ROT_90; break;
+        case 180: rotation_flags = IM_HAL_TRANSFORM_ROT_180; break;
+        case 270: rotation_flags = IM_HAL_TRANSFORM_ROT_270; break;
+    }
+
+    ret = imrotate(src_img, dst_img, rotation_flags);
+    if (ret != IM_STATUS_SUCCESS) {
+        spdlog::error("RGA rotation failed: {}", imStrError((IM_STATUS)ret));
+    }
+}
+
 void my_flush_cb(lv_display_t * display, const lv_area_t * area, uint8_t * px_map)
 {
 
@@ -1452,6 +1487,7 @@ void my_flush_cb(lv_display_t * display, const lv_area_t * area, uint8_t * px_ma
     } else {
         spdlog::error("Unknown buffer being flushed");
     }
+	if (p->out->rotation > 0) rotate_osd(p->out->osd_buf_switch);
 	ret = pthread_mutex_unlock(&osd_mutex);
 	assert(!ret);
 
@@ -1513,7 +1549,9 @@ void *__OSD_THREAD__(void *param) {
 	int ret = pthread_mutex_init(&osd_mutex, NULL);
 	assert(!ret);
 
-	struct modeset_buf *buf = &p->out->osd_bufs[p->out->osd_buf_switch];
+	struct modeset_buf *buf;
+	if (p->out->rotation > 0) buf = &p->out->rotated_osd_bufs[p->out->osd_buf_switch];
+	else buf = &p->out->osd_bufs[p->out->osd_buf_switch];
 	ret = modeset_perform_modeset(p->fd, p->out, p->out->osd_request, &p->out->osd_plane,
 								  buf->fb, buf->width, buf->height, osd_zpos);
 
@@ -1560,7 +1598,7 @@ void *__OSD_THREAD__(void *param) {
 				int buf_idx = p->out->osd_buf_switch ^ 1;
 				struct modeset_buf *buf = &p->out->osd_bufs[buf_idx];
 				modeset_paint_buffer(buf, osd);
-
+				if (p->out->rotation > 0) rotate_osd(buf_idx);
 				int ret = pthread_mutex_lock(&osd_mutex);
 				assert(!ret);	
 				p->out->osd_buf_switch = buf_idx;

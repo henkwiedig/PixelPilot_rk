@@ -22,7 +22,11 @@
 #include <drm_fourcc.h>
 #include <pthread.h>
 #include <rockchip/rk_mpi.h>
+#include "rga.h"
+#include "RgaUtils.h"
+#include "im2d.h"
 #include <assert.h>
+#include "main.h"
 
 #define OSD_BUF_COUNT	2
 
@@ -40,6 +44,10 @@ struct modeset_buf {
 	uint32_t handle;
 	uint8_t *map;
 	uint32_t fb;
+	int prime_fd;
+	uint32_t rotated_fd;
+	rga_buffer_handle_t rga_src_handle;
+	rga_buffer_handle_t rga_dst_handle;
 };
 
 struct modeset_output {
@@ -66,6 +74,15 @@ struct modeset_output {
 	uint32_t video_frm_height;
 	int video_fb_x, video_fb_y, video_fb_width, video_fb_height;
 	int video_fb_id;
+
+    // New fields for rotation
+    struct modeset_buf rotated_bufs[MAX_FRAMES];
+    struct modeset_buf rotated_osd_bufs[OSD_BUF_COUNT];
+    int rotated_buf_idx;
+    int rotation; // 0, 90, 180, 270
+    uint32_t rotated_width;
+    uint32_t rotated_height;
+
 
     // Used to calculate latency
     uint64_t decoding_pts;
@@ -103,9 +120,9 @@ int modeset_setup_framebuffers(int fd, drmModeConnector *conn, struct modeset_ou
 
 void modeset_output_destroy(int fd, struct modeset_output *out);
 
-struct modeset_output *modeset_output_create(int fd, drmModeRes *res, drmModeConnector *conn, uint16_t mode_width, uint16_t mode_height, uint32_t mode_vrefresh, uint32_t video_plane_id, uint32_t osd_plane_id);
+struct modeset_output *modeset_output_create(int fd, drmModeRes *res, drmModeConnector *conn, uint16_t mode_width, uint16_t mode_height, uint32_t mode_vrefresh, uint32_t video_plane_id, uint32_t osd_plane_id, int rotate);
 
-struct modeset_output *modeset_prepare(int fd, uint16_t mode_width, uint16_t mode_height, uint32_t mode_vrefresh, uint32_t video_plane_id, uint32_t osd_plane_id);
+struct modeset_output *modeset_prepare(int fd, uint16_t mode_width, uint16_t mode_height, uint32_t mode_vrefresh, uint32_t video_plane_id, uint32_t osd_plane_id, int rotate);
 
 void *modeset_print_modes(int fd);
 
