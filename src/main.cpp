@@ -341,8 +341,13 @@ void rotate(int current_frame) {
                                outbuf->height,
                                RK_FORMAT_YCbCr_420_SP);
 
-	dst_img.wstride = output_list->ver_stride;
-    dst_img.hstride = output_list->hor_stride;
+	if (output_list->rotation == 180) {
+		dst_img.wstride = output_list->hor_stride;
+		dst_img.hstride = output_list->ver_stride;
+	} else { // 90/270 degree rotation
+		dst_img.wstride = output_list->ver_stride;
+		dst_img.hstride = output_list->hor_stride;
+	}
 
 	uint32_t rotation_flags;
     switch (output_list->rotation) {
