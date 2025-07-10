@@ -109,13 +109,13 @@ uint32_t osd_plane_id_override = 0;
 void init_buffer(MppFrame frame) {
 	output_list->video_frm_width = mpp_frame_get_width(frame);
 	output_list->video_frm_height = mpp_frame_get_height(frame);
-	RK_U32 hor_stride = mpp_frame_get_hor_stride(frame);
-	RK_U32 ver_stride = mpp_frame_get_ver_stride(frame);
+	output_list->hor_stride = mpp_frame_get_hor_stride(frame);
+	output_list->ver_stride = mpp_frame_get_ver_stride(frame);
 	MppFrameFormat fmt = mpp_frame_get_fmt(frame);
 	assert((fmt == MPP_FMT_YUV420SP) || (fmt == MPP_FMT_YUV420SP_10BIT));
 
 	spdlog::info("Frame info changed {}({})x{}({})",
-				 output_list->video_frm_width, hor_stride, output_list->video_frm_height, ver_stride);
+				 output_list->video_frm_width, output_list->hor_stride, output_list->video_frm_height, output_list->ver_stride);
 
     // These will be the dimensions after rotation
     output_list->rotated_width = output_list->video_frm_height;  // 720
@@ -173,8 +173,8 @@ void init_buffer(MppFrame frame) {
 		struct drm_mode_create_dumb dmcd;
 		memset(&dmcd, 0, sizeof(dmcd));
 		dmcd.bpp = fmt==MPP_FMT_YUV420SP?8:10;
-		dmcd.width = hor_stride;
-		dmcd.height = ver_stride*2; // documentation say not v*2/3 but v*2 (additional info included)
+		dmcd.width = output_list->hor_stride;
+		dmcd.height = output_list->ver_stride*2; // documentation say not v*2/3 but v*2 (additional info included)
 		do {
 			ret = ioctl(drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &dmcd);
 		} while (ret == -1 && (errno == EINTR || errno == EAGAIN));
@@ -212,9 +212,9 @@ void init_buffer(MppFrame frame) {
 		memset(offsets, 0, sizeof(offsets));
 		handles[0] = mpi.frame_to_drm[i].handle;
 		offsets[0] = 0;
-		pitches[0] = hor_stride;						
+		pitches[0] = output_list->hor_stride;						
 		handles[1] = mpi.frame_to_drm[i].handle;
-		offsets[1] = pitches[0] * ver_stride;
+		offsets[1] = pitches[0] * output_list->ver_stride;
 		pitches[1] = pitches[0];
 		ret = drmModeAddFB2(drm_fd, output_list->video_frm_width, output_list->video_frm_height, DRM_FORMAT_NV12, handles, pitches, offsets, &mpi.frame_to_drm[i].fb_id, 0);
 		assert(!ret);
@@ -236,11 +236,11 @@ void init_buffer(MppFrame frame) {
 		creq.bpp = fmt==MPP_FMT_YUV420SP?8:10;
         // For 180 degree rotation, we keep the same dimensions as original
         if (output_list->rotation == 180) {
-            creq.width = hor_stride;
-            creq.height = ver_stride*2;
+            creq.width = output_list->hor_stride;
+            creq.height = output_list->ver_stride*2;
         } else { // 90/270 degree rotation
-            creq.width = ver_stride;
-            creq.height = hor_stride*2;
+            creq.width = output_list->ver_stride;
+            creq.height = output_list->hor_stride*2;
         }
 		do {
 			ret = ioctl(drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq);
@@ -267,14 +267,14 @@ void init_buffer(MppFrame frame) {
 		handles[0] = buf->handle;
 		offsets[0] = 0;
         if (output_list->rotation == 180) {
-            pitches[0] = hor_stride;
+            pitches[0] = output_list->hor_stride;
             handles[1] = buf->handle;
-            offsets[1] = pitches[0] * ver_stride;
+            offsets[1] = pitches[0] * output_list->ver_stride;
             pitches[1] = pitches[0];
         } else {
-            pitches[0] = ver_stride;
+            pitches[0] = output_list->ver_stride;
             handles[1] = buf->handle;
-            offsets[1] = pitches[0] * hor_stride;
+            offsets[1] = pitches[0] * output_list->hor_stride;
             pitches[1] = pitches[0];
         }
 
@@ -282,16 +282,23 @@ void init_buffer(MppFrame frame) {
 						DRM_FORMAT_NV12, handles, pitches, offsets, &buf->rotated_fd, 0);
 		assert(!ret);
 
-		int src_buf_size = output_list->video_frm_width * output_list->video_frm_height * 3 / 2; // NV12 is 1.5 bytes per pixel
-		int dst_buf_size = buf->width * buf->height * 3 / 2; // Rotated dimensions
+		im_handle_param_t src_param;
+		src_param.width = output_list->video_frm_width;
+		src_param.height = output_list->video_frm_height;
+		src_param.format = RK_FORMAT_YCbCr_420_SP;
+
+		im_handle_param_t dst_param;
+		dst_param.width = buf->width;
+		dst_param.height = buf->height;
+		dst_param.format = RK_FORMAT_YCbCr_420_SP;
 
 		buf->rga_src_handle = importbuffer_fd(
 				mpi.frame_to_drm[i].prime_fd,
-				src_buf_size
+				&src_param
 			);
 		buf->rga_dst_handle = importbuffer_fd(
 				buf->prime_fd,
-				dst_buf_size
+				&dst_param
 			);
 	}
 
@@ -325,18 +332,31 @@ void rotate(int current_frame) {
     src_img = wrapbuffer_handle(outbuf->rga_src_handle,
                                output_list->video_frm_width,
                                output_list->video_frm_height,
-                               RK_FORMAT_YCrCb_420_SP);
+                               RK_FORMAT_YCbCr_420_SP);
+	src_img.wstride = output_list->hor_stride; // e.g., 2304
+    src_img.hstride = output_list->ver_stride; // e.g., 1080
+
     dst_img = wrapbuffer_handle(outbuf->rga_dst_handle,
                                outbuf->width,
                                outbuf->height,
-                               RK_FORMAT_YCrCb_420_SP);
+                               RK_FORMAT_YCbCr_420_SP);
 
+	dst_img.wstride = output_list->ver_stride;
+    dst_img.hstride = output_list->hor_stride;
 
 	uint32_t rotation_flags;
     switch (output_list->rotation) {
         case 90:  rotation_flags = IM_HAL_TRANSFORM_ROT_90; break;
         case 180: rotation_flags = IM_HAL_TRANSFORM_ROT_180; break;
         case 270: rotation_flags = IM_HAL_TRANSFORM_ROT_270; break;
+    }
+
+    im_rect src_rect = {};
+    im_rect dst_rect = {};
+    ret = imcheck(src_img, dst_img, src_rect, dst_rect);
+    if (IM_STATUS_NOERROR != ret) {
+        printf("%d, check error! %s", __LINE__, imStrError((IM_STATUS)ret));
+        return;
     }
 
     ret = imrotate(src_img, dst_img, rotation_flags);
