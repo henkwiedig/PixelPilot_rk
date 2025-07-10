@@ -72,6 +72,8 @@ struct modeset_output {
 	struct drm_object video_plane;
 	uint32_t video_frm_width;
 	uint32_t video_frm_height;
+	RK_U32 hor_stride;
+	RK_U32 ver_stride;
 	int video_fb_x, video_fb_y, video_fb_width, video_fb_height;
 	int video_fb_id;
 
