@@ -404,6 +404,17 @@ err_destroy:
 
 void modeset_destroy_fb(int fd, struct modeset_buf *buf)
 {
+
+	// Release RGA handles
+    if (buf->rga_src_handle) {
+        releasebuffer_handle(buf->rga_src_handle);
+        buf->rga_src_handle = 0;
+    }
+    if (buf->rga_dst_handle) {
+        releasebuffer_handle(buf->rga_dst_handle);
+        buf->rga_dst_handle = 0;
+    }
+
 	struct drm_mode_destroy_dumb dreq;
 
 	munmap(buf->map, buf->size);
@@ -471,6 +482,7 @@ void modeset_output_destroy(int fd, struct modeset_output *out)
 
 	for (int i=0; i<OSD_BUF_COUNT; i++) { 
 		modeset_destroy_fb(fd, &out->osd_bufs[i]);
+		modeset_destroy_fb(fd, &out->rotated_osd_bufs[i]);
 	}
 	for (int i=0; i<MAX_FRAMES; i++) {
 		modeset_destroy_fb(fd, &out->rotated_bufs[i]);

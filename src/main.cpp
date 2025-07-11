@@ -1133,8 +1133,10 @@ int main(int argc, char **argv)
 		assert(!ret);
 	}
 	if (enable_osd) {
-		ret = pthread_join(tid_wfbcli, NULL);
-		assert(!ret);
+		if (wfb_port) {
+			ret = pthread_join(tid_wfbcli, NULL);
+			assert(!ret);
+		}
 		ret = pthread_join(tid_osd, NULL);
 		assert(!ret);
 	}
@@ -1160,7 +1162,13 @@ int main(int argc, char **argv)
 				ret = ioctl(drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dmdd);
 			} while (ret == -1 && (errno == EINTR || errno == EAGAIN));
 			assert(!ret);
+
+			modeset_destroy_fb(drm_fd, &output_list->rotated_bufs[i]);
+			memset(&output_list->rotated_bufs[i], 0, sizeof(struct modeset_buf));
 		}
+		mpp_buffer_group_clear(mpi.frm_grp);
+		mpp_buffer_group_put(mpi.frm_grp);  // This is important to release the group
+		mpi.frm_grp = NULL;
 	}
 		
 	mpp_packet_deinit(&packet);
