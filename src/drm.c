@@ -358,7 +358,7 @@ int modeset_create_fb(int fd, struct modeset_buf *buf)
 	buf->handle = creq.handle;
 
 	handles[0] = buf->handle;
-	pitches[0] = buf->stride;
+	pitches[0] = buf->width * 4;
 
 	ret = drmModeAddFB2(fd, buf->width, buf->height, DRM_FORMAT_ARGB8888,
 			    handles, pitches, offsets, &buf->fb, 0);
@@ -433,10 +433,6 @@ int modeset_setup_framebuffers(int fd, drmModeConnector *conn, struct modeset_ou
 	for (int i=0; i<OSD_BUF_COUNT; i++) {
 		out->osd_bufs[i].width = out->mode.hdisplay;
 		out->osd_bufs[i].height = out->mode.vdisplay;
-		if (out->rotation == 90 || out->rotation == 270) {
-			out->osd_bufs[i].width = out->mode.vdisplay;
-			out->osd_bufs[i].height = out->mode.hdisplay;
-		}
 		ret = modeset_create_fb(fd, &out->osd_bufs[i]);
 		if (ret) {
 			return ret;
@@ -455,6 +451,10 @@ int modeset_setup_framebuffers(int fd, drmModeConnector *conn, struct modeset_ou
 		// Also create the rotated buffer
 		out->rotated_osd_bufs[i].width = out->mode.hdisplay;
 		out->rotated_osd_bufs[i].height = out->mode.vdisplay;
+		if (out->rotation == 90 || out->rotation == 270) {
+			out->rotated_osd_bufs[i].width = out->mode.vdisplay;
+			out->rotated_osd_bufs[i].height = out->mode.hdisplay;
+		}
 		ret = modeset_create_fb(fd, &out->rotated_osd_bufs[i]);
 		if (ret) {
 			return ret;
