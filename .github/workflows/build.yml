@@ -62,7 +62,7 @@ jobs:
           - openipc_bonnet
           - runcam_wifilink
           - emax_wyvern-link
-
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
