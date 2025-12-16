@@ -90,6 +90,8 @@ jobs:
           ln -s /tmp/ccache ${HOME}/.ccache
 
           NAME=${{ matrix.buildroot_target }}
+          pwd
+          ls -l
           sbc-groundstations/
           DEFCONFIG=${NAME}_defconfig \
           PIXELPILOT_OVERRIDE_SRCDIR=$RUNNER_WORKSPACE/PixelPilot_rk \
