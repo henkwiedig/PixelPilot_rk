@@ -71,8 +71,7 @@ jobs:
         run: |
           echo "nameserver 8.8.8.8" | sudo tee /etc/resolv.conf
           echo "CACHE_DATE=$(date +%m)" >> $GITHUB_ENV
-          sudo apt update
-          sudo apt install -y cpio rsync bc qemu-user-static binfmt-support
+          git clone https://github.com/OpenIPC/sbc-groundstations.git
 
       - name: Setup ccache
         uses: actions/cache@v4
@@ -91,14 +90,17 @@ jobs:
           ln -s /tmp/ccache ${HOME}/.ccache
 
           NAME=${{ matrix.buildroot_target }}
-          DEFCONFIG=${NAME}_defconfig bash build.sh pixelpilot-rebuild
+          sbc-groundstations/
+          DEFCONFIG=${NAME}_defconfig \
+          PIXELPILOT_OVERRIDE_SRCDIR=$RUNNER_WORKSPACE/PixelPilot_rk \
+          bash build.sh
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.buildroot_target }}-bin
           path: |
-            output/${{ matrix.buildroot_target }}_defconfig/build/pixelpilot-*/pixelpilot
+            sbc-groundstations/output/${{ matrix.buildroot_target }}_defconfig/build/pixelpilot-custom/pixelpilot
 
   build_deb:
     name: Build DEB pkg for ${{ matrix.debian_codename }}
