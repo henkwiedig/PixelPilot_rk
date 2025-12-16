@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  build-debian:
     name: Build for ${{ matrix.debian_codename }}
     strategy:
       matrix:
@@ -52,6 +52,53 @@ jobs:
           name: ${{ matrix.debian_codename }}-bin
           path: |
             ${{ matrix.debian_codename }}_pixelpilot
+
+  build-buildroot:
+    name: Build for ${{ matrix.buildroot_target }}
+    strategy:
+      matrix:
+        buildroot_target:
+          - radxa_zero3
+          - openipc_bonnet
+          - runcam_wifilink
+          - emax_wyvern-link
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Prepare firmware
+        run: |
+          echo "nameserver 8.8.8.8" | sudo tee /etc/resolv.conf
+          echo "CACHE_DATE=$(date +%m)" >> $GITHUB_ENV
+          sudo apt update
+          sudo apt install -y cpio rsync bc qemu-user-static binfmt-support
+
+      - name: Setup ccache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/ccache
+          key: ${{ matrix.buildroot_target }}-${{ env.CACHE_DATE }}
+
+      - name: Build firmware
+        run: |
+          export GIT_HASH=$(git rev-parse --short $GITHUB_SHA)
+          export GIT_BRANCH=${GITHUB_REF_NAME}
+          echo "GIT_HASH=${GIT_HASH}" >> $GITHUB_ENV
+          echo "GIT_BRANCH=${GITHUB_BRANCH}" >> $GITHUB_ENV
+
+          mkdir -p /tmp/ccache
+          ln -s /tmp/ccache ${HOME}/.ccache
+
+          NAME=${{ matrix.buildroot_target }}
+          DEFCONFIG=${NAME}_defconfig bash build.sh pixelpilot-rebuild
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.buildroot_target }}-bin
+          path: |
+            output/${{ matrix.buildroot_target }}_defconfig/build/pixelpilot-*/pixelpilot
 
   build_deb:
     name: Build DEB pkg for ${{ matrix.debian_codename }}
