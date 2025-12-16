@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-debian:
+  build_debian:
     name: Build for ${{ matrix.debian_codename }}
     strategy:
       matrix:
@@ -53,7 +53,7 @@ jobs:
           path: |
             ${{ matrix.debian_codename }}_pixelpilot
 
-  build-buildroot:
+  build_buildroot:
     name: Build for ${{ matrix.buildroot_target }}
     strategy:
       matrix:
@@ -181,7 +181,7 @@ jobs:
     name: Release Artifacts
     runs-on: ubuntu-latest
     needs:
-      - build
+      - build_debian
       - build_deb
     steps:
       - name: Checkout
