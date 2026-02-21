@@ -5,6 +5,7 @@ find_package(PkgConfig REQUIRED)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(HAVE_RGA 0)
 
 # Option to control wmenu simulator build
 option(USE_SIMULATOR "Build the simulator version of the application" OFF)
@@ -155,6 +156,10 @@ set(LIB_SOURCE_FILES
         src/WiFiRSSIMonitor.hpp
         src/WiFiRSSIMonitor.cpp
         src/scheduling_helper.hpp
+        src/processing_pipeline.hpp
+        src/processing_pipeline.cpp
+        src/processing_gl.hpp
+        src/processing_gl.cpp
         src/gstrtpreceiver.cpp
         src/gstrtpreceiver.h)
 set(SOURCE_FILES
@@ -180,6 +185,20 @@ else()
   
   # GStreamer setup
   find_package(PkgConfig REQUIRED)
+  pkg_search_module(EGL REQUIRED egl)
+  pkg_search_module(GLESv2 REQUIRED glesv2)
+  pkg_search_module(GBM REQUIRED gbm)
+
+  set(HAVE_RGA 0)
+  find_path(RGA_INCLUDE_DIRS NAMES rga.h rga/rga.h)  # Changed from im2d.h to rga.h
+  find_library(RGA_LIBRARIES NAMES rga librga)
+  if (RGA_INCLUDE_DIRS AND RGA_LIBRARIES)
+    set(HAVE_RGA 1)
+    message(STATUS "Found RGA: ${RGA_INCLUDE_DIRS} ${RGA_LIBRARIES}")
+  else()
+    message(STATUS "RGA not found")
+  endif()
+
   pkg_search_module(GST REQUIRED
           gstreamer-1.0>=1.4
           gstreamer-app-1.0>=1.4
@@ -190,6 +209,7 @@ else()
   pkg_search_module(gio REQUIRED IMPORTED_TARGET gio-2.0)
   
   add_executable(${PROJECT_NAME} ${SOURCE_FILES})
+  target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_RGA=${HAVE_RGA})
   
   # Add include directories for the main target
   target_include_directories(${PROJECT_NAME} PRIVATE
@@ -216,7 +236,15 @@ else()
       PkgConfig::gstreamer-app
       PkgConfig::gstnet
       PkgConfig::gio
+      ${EGL_LIBRARIES}
+      ${GLESv2_LIBRARIES}
+      ${GBM_LIBRARIES}
   )
+  target_include_directories(${PROJECT_NAME} PRIVATE ${EGL_INCLUDE_DIRS} ${GLESv2_INCLUDE_DIRS} ${GBM_INCLUDE_DIRS})
+  if (HAVE_RGA)
+    target_include_directories(${PROJECT_NAME} PRIVATE ${RGA_INCLUDE_DIRS})
+    target_link_libraries(${PROJECT_NAME} ${RGA_LIBRARIES})
+  endif()
 endif()
 
 if(CMAKE_BUILD_TYPE MATCHES "Debug")
@@ -252,7 +280,13 @@ if(BUILD_TESTS)
     target_include_directories(pixelpilot_tests PUBLIC "${PROJECT_BINARY_DIR}" ${LIBDRM_INCLUDE_DIRS} ${CAIRO_INCLUDE_DIRS})
     # Define the TEST preprocessor directive
     target_compile_definitions(pixelpilot_tests PRIVATE TEST)
-    target_link_libraries(pixelpilot_tests rockchip_mpp pthread drm m cairo spdlog::spdlog nlohmann_json::nlohmann_json yaml-cpp rt lvgl ${LIBGPIOD_LIBRARIES} ${PNG_LIBRARIES} Catch2::Catch2WithMain)
+    target_compile_definitions(pixelpilot_tests PRIVATE HAVE_RGA=${HAVE_RGA})
+    target_link_libraries(pixelpilot_tests rockchip_mpp pthread drm m cairo spdlog::spdlog nlohmann_json::nlohmann_json yaml-cpp rt lvgl ${LIBGPIOD_LIBRARIES} ${PNG_LIBRARIES} Catch2::Catch2WithMain ${EGL_LIBRARIES} ${GLESv2_LIBRARIES} ${GBM_LIBRARIES})
+    target_include_directories(pixelpilot_tests PRIVATE ${EGL_INCLUDE_DIRS} ${GLESv2_INCLUDE_DIRS} ${GBM_INCLUDE_DIRS})
+    if (HAVE_RGA)
+      target_include_directories(pixelpilot_tests PRIVATE ${RGA_INCLUDE_DIRS})
+      target_link_libraries(pixelpilot_tests ${RGA_LIBRARIES})
+    endif()
 
     find_package(PkgConfig REQUIRED)
     pkg_search_module(GST REQUIRED

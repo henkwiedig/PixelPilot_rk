@@ -19,6 +19,9 @@
 #include <queue>
 #include <mutex>
 #include <condition_variable>
+#include <optional>
+#include <vector>
+#include <cmath>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -32,6 +35,7 @@
 #include <drm_fourcc.h>
 #include <linux/videodev2.h>
 #include <rockchip/rk_mpi.h>
+#include <drm/drm_mode.h>
 #include <nlohmann/json.hpp>
 #include <yaml-cpp/yaml.h>
 #include "spdlog/spdlog.h"
@@ -60,6 +64,7 @@ extern "C" {
 #include "gsmenu/air_actions.h"
 #include "gsmenu/gs_actions.h"
 #include "menu.h"
+#include "processing_pipeline.hpp"
 
 
 #define READ_BUF_SIZE (1024*1024) // SZ_1M https://github.com/rockchip-linux/mpp/blob/ed377c99a733e2cdbcc457a6aa3f0fcd438a9dff/osal/inc/mpp_common.h#L179
@@ -120,6 +125,12 @@ uint32_t osd_plane_id_override = 0;
 
 WiFiRSSIMonitor wifi_monitor;
 extern enum RXMode RXMODE;
+ProcessingPipeline processing_pipeline;
+ProcessingOptions processing_opts;
+bool enable_live_colortrans = false;
+float live_colortrans_offset = -0.15f;
+float live_colortrans_gain = 2.5f;
+uint32_t gamma_lut_blob_id = 0;
 
 void init_buffer(MppFrame frame) {
 	output_list->video_frm_width = mpp_frame_get_width(frame);
@@ -139,6 +150,10 @@ void init_buffer(MppFrame frame) {
 
 	osd_publish_uint_fact("video.width", NULL, 0, output_list->video_frm_width);
 	osd_publish_uint_fact("video.height", NULL, 0, output_list->video_frm_height);
+	processing_pipeline.set_video_info(output_list->video_frm_width, output_list->video_frm_height, hor_stride, ver_stride, fmt);
+	if (dvr) {
+		dvr->set_video_params(output_list->video_frm_width, output_list->video_frm_height, codec);
+	}
 
 	if (mpi.frm_grp) {
 		spdlog::debug("Freeing current mpp_buffer_group");
@@ -296,11 +311,19 @@ void *__FRAME_THREAD__(void *param)
 					assert(i!=MAX_FRAMES);
 
 					ts = ats;
-					
+					uint32_t processed_fb_id = 0;
+					bool processed = false;
+					processing_pipeline.process_frame(frame, processed_fb_id, processed);
+					processing_pipeline.submit_for_encoding(frame, feed_data_ts);
+					uint32_t fb_id_to_display = mpi.frame_to_drm[i].fb_id;
+					if (processed && processed_fb_id != 0) {
+						fb_id_to_display = processed_fb_id;
+					}
+
 					// send DRM FB to display thread
 					ret = pthread_mutex_lock(&video_mutex);
 					assert(!ret);
-					output_list->video_fb_id = mpi.frame_to_drm[i].fb_id;
+					output_list->video_fb_id = fb_id_to_display;
                     //output_list->video_fb_index=i;
                     output_list->decoding_pts=feed_data_ts;
 					ret = pthread_cond_signal(&video_cond);
@@ -384,6 +407,7 @@ end:
 
 int signal_flag = 0;
 int return_value = 0;
+volatile sig_atomic_t dvr_toggle_pending = 0;
 
 void sig_handler(int signum)
 {
@@ -399,9 +423,9 @@ void sig_handler(int signum)
 }
 
 void sigusr1_handler(int signum) {
-	spdlog::info("Received signal {}", signum);
-	if (dvr) {
-		dvr->toggle_recording();
+	(void)signum;
+	if (dvr_toggle_pending < 127) {
+		dvr_toggle_pending++;
 	}
 }
 
@@ -563,6 +587,13 @@ void main_loop() {
     }
 
     while (!signal_flag) {
+		if (dvr_toggle_pending > 0 && dvr) {
+			sig_atomic_t pending = dvr_toggle_pending;
+			dvr_toggle_pending = 0;
+			for (sig_atomic_t i = 0; i < pending; i++) {
+				dvr->toggle_recording();
+			}
+		}
         // TODO: put gsmenu main loop here
         msg_manager.check_message();
 		os_sensors.run();
@@ -606,7 +637,7 @@ void read_gstreamerpipe_stream(MppPacket *packet, int gst_udp_port, const char *
         } else {
             stall_count = 0;
         }
-        if (dvr_enabled && dvr != NULL) {
+        if (dvr_enabled && dvr != NULL && !processing_opts.encode_processed) {
 			dvr->frame(frame);
         }
     };
@@ -712,6 +743,18 @@ void printHelp() {
     "\n"
     "    --dvr-fmp4             - Save the video feed as a fragmented mp4\n"
     "\n"
+    "    --live-colortrans      - Apply colortrans LUT to live display via DRM gamma\n"
+    "\n"
+    "    --live-colortrans-offset <val> - LUT offset (Default: -0.15)\n"
+    "\n"
+    "    --live-colortrans-gain <val>   - LUT gain (Default: 2.5)\n"
+    "\n"
+    "    --dvr-colortrans       - Record shader-processed, re-encoded video\n"
+    "\n"
+    "    --re-encode-fps <fps>  - Cap processed encode fps (Default: 30)\n"
+    "\n"
+    "    --re-encode-mbps <mbps>- Target CBR Mbps for processed encode (Default: 4)\n"
+    "\n"
     "    --screen-mode <mode>   - Override default screen mode. <width>x<heigth>@<fps> ex: 1920x1080@120\n"
     "\n"
     "    --video-plane-id       - Override default drm plane used for video by plane-id\n"
@@ -749,6 +792,9 @@ int main(int argc, char **argv)
 	bool dvr_filenames_with_sequence = false;
 	int video_framerate = -1;
 	int mp4_fragmentation_mode = 0;
+	bool dvr_colortrans = false;
+	int reencode_fps = 30;
+	int reencode_bitrate_kbps = 0;
 	uint16_t wfb_port = 8003;
 	const char *wfb_api_host = "127.0.0.1";
 	uint16_t mode_width = 0;
@@ -825,6 +871,21 @@ int main(int argc, char **argv)
 		continue;
 	}
 
+	__OnArgument("--dvr-colortrans") {
+		dvr_colortrans = true;
+		continue;
+	}
+
+	__OnArgument("--re-encode-fps") {
+		reencode_fps = atoi(__ArgValue);
+		continue;
+	}
+
+	__OnArgument("--re-encode-mbps") {
+		reencode_bitrate_kbps = static_cast<int>(atof(__ArgValue) * 1000.0f);
+		continue;
+	}
+
 	__OnArgument("--log-level") {
 		std::string log_l = std::string(__ArgValue);
 		if (log_l == "info") {
@@ -881,6 +942,18 @@ int main(int argc, char **argv)
 
 	__OnArgument("--osd-custom-message") {
 		osd_custom_message = true;
+		continue;
+	}
+	__OnArgument("--live-colortrans") {
+		enable_live_colortrans = true;
+		continue;
+	}
+	__OnArgument("--live-colortrans-offset") {
+		live_colortrans_offset = static_cast<float>(atof(__ArgValue));
+		continue;
+	}
+	__OnArgument("--live-colortrans-gain") {
+		live_colortrans_gain = static_cast<float>(atof(__ArgValue));
 		continue;
 	}
 
@@ -945,12 +1018,41 @@ int main(int argc, char **argv)
 	spdlog::set_level(log_level);
 	idr_set_enabled(!disable_gregidr);
 
-	if (dvr_template != NULL && video_framerate < 0 ) {
-		printf("--dvr-framerate must be provided when dvr is enabled.\n");
-		return 0;
+	processing_pipeline.set_codec(codec);
+	processing_opts.shader_enabled = dvr_colortrans;
+	processing_opts.shader_name = "colortrans";
+	processing_opts.shader_dir = "shaders";
+	processing_opts.shader_for_display = false;
+	processing_opts.shader_for_encode = dvr_colortrans;
+	processing_opts.encode_processed = dvr_colortrans;
+	processing_opts.encode_bitrate_kbps = reencode_bitrate_kbps;
+	if (dvr_colortrans) {
+		processing_opts.encode_use_mpp_buffer = true;
+		if (reencode_fps <= 0) {
+			reencode_fps = 30;
+			spdlog::warn("Re-encode fps invalid; defaulting to {}", reencode_fps);
+		}
+		if (video_framerate > 0 && video_framerate != reencode_fps) {
+			spdlog::info("Ignoring --dvr-framerate {} in processed mode; using re-encode fps {}.", video_framerate, reencode_fps);
+		}
+		processing_opts.encode_fps = reencode_fps;
+		video_framerate = reencode_fps;
+		if (video_framerate < 0) {
+			video_framerate = reencode_fps;
+		}
+		spdlog::info("Processed DVR enabled; using re-encode fps {} for timestamps.", reencode_fps);
+	} else {
+		processing_opts.encode_fps = reencode_fps;
+		if (dvr_template != NULL && video_framerate < 0 ) {
+			printf("--dvr-framerate must be provided when dvr is enabled.\n");
+			return 0;
+		}
 	}
 
 	printf("PixelPilot Rockchip %d.%d\n", APP_VERSION_MAJOR, APP_VERSION_MINOR);
+	if (dvr_colortrans && dvr_template == NULL) {
+		spdlog::warn("Processed DVR enabled but --dvr-template is not set; no recordings will be written.");
+	}
 
 	// Load yaml config
 	try {
@@ -1089,6 +1191,52 @@ int main(int argc, char **argv)
 				"cannot initialize display. Is display connected? Is --screen-mode correct?\n");
 		return -2;
 	}
+	if (enable_live_colortrans) {
+		uint64_t lut_size = get_property_value(drm_fd, output_list->crtc.props, "GAMMA_LUT_SIZE");
+		if (lut_size == (uint64_t)-1) {
+			lut_size = get_property_value(drm_fd, output_list->crtc.props, "gamma_lut_size");
+		}
+		if (lut_size == 0 || lut_size == (uint64_t)-1) {
+			spdlog::warn("GAMMA_LUT_SIZE not available; cannot apply live colortrans LUT.");
+		} else {
+			std::vector<drm_color_lut> lut;
+			lut.resize(lut_size);
+			for (uint64_t i = 0; i < lut_size; i++) {
+				float x = (lut_size > 1) ? (float)i / (float)(lut_size - 1) : 0.0f;
+				float y = (x + live_colortrans_offset) * live_colortrans_gain;
+				if (y < 0.0f) y = 0.0f;
+				if (y > 1.0f) y = 1.0f;
+				uint16_t v = (uint16_t)lrintf(y * 65535.0f);
+				lut[i].red = v;
+				lut[i].green = v;
+				lut[i].blue = v;
+				lut[i].reserved = 0;
+			}
+			if (drmModeCreatePropertyBlob(drm_fd, lut.data(), lut.size() * sizeof(drm_color_lut), &gamma_lut_blob_id) == 0) {
+				drmModeAtomicReq *req = drmModeAtomicAlloc();
+				int set_ret = set_drm_object_property(req, &output_list->crtc, "GAMMA_LUT", gamma_lut_blob_id);
+				if (set_ret < 0) {
+					set_ret = set_drm_object_property(req, &output_list->crtc, "gamma_lut", gamma_lut_blob_id);
+				}
+				if (set_ret < 0) {
+					spdlog::warn("Failed to set GAMMA_LUT on CRTC; live LUT not applied.");
+					drmModeAtomicFree(req);
+				} else {
+					int commit_ret = drmModeAtomicCommit(drm_fd, req, 0, NULL);
+					if (commit_ret) {
+						spdlog::warn("GAMMA_LUT atomic commit failed: {} ({})", commit_ret, strerror(errno));
+					} else {
+						spdlog::info("Applied live colortrans LUT (size {}) to CRTC", lut_size);
+					}
+					drmModeAtomicFree(req);
+				}
+			} else {
+				spdlog::warn("Failed to create GAMMA_LUT property blob.");
+			}
+		}
+	}
+	processing_pipeline.set_drm_fd(drm_fd);
+	processing_pipeline.configure(processing_opts);
 	
 	////////////////////////////////// MPI SETUP
 	MppPacket packet;
@@ -1137,6 +1285,7 @@ int main(int argc, char **argv)
 		args.video_p.video_frm_height = output_list->video_frm_height;
 		args.video_p.codec = codec;
 		dvr = new Dvr(args);
+		processing_pipeline.set_dvr(dvr, video_framerate);
 		ret = pthread_create(&tid_dvr, NULL, &Dvr::__THREAD__, dvr);
 		if (dvr_autostart) {
 			dvr->start_recording();
@@ -1178,6 +1327,10 @@ int main(int argc, char **argv)
     read_gstreamerpipe_stream((void**)packet, listen_port, unix_socket, codec);
 
 	////////////////////////////////////////////// MPI CLEANUP
+	processing_pipeline.shutdown();
+	if (dvr != NULL) {
+		dvr->shutdown();
+	}
 
 	ret = pthread_join(tid_frame, NULL);
 	assert(!ret);
@@ -1251,6 +1404,10 @@ int main(int argc, char **argv)
 	drmModeFreeCrtc(output_list->saved_crtc);
 	drmModeAtomicFree(output_list->video_request);
 	drmModeAtomicFree(output_list->osd_request);
+	if (gamma_lut_blob_id) {
+		drmModeDestroyPropertyBlob(drm_fd, gamma_lut_blob_id);
+		gamma_lut_blob_id = 0;
+	}
 	modeset_cleanup(drm_fd, output_list);
 	close(drm_fd);
 

@@ -1171,7 +1171,6 @@ void GstRtpReceiver::skip_duration(int64_t skip_ms) {
         spdlog::warn("Failed to send seek event for skipping.");
     }
 }
-
 void idr_set_enabled(bool enabled) {
     g_idr_enabled.store(enabled, std::memory_order_relaxed);
 }

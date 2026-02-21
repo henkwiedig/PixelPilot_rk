@@ -72,7 +72,7 @@ private:
     int m_port;
     // appsink
     GstElement *m_app_sink_element = nullptr;
-    bool m_pull_samples_run;
+    bool m_pull_samples_run = false;
     std::unique_ptr<std::thread> m_pull_samples_thread=nullptr;
     // appsrc
     const char* unix_socket = nullptr;

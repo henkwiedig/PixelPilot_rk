@@ -7,6 +7,8 @@
 #include <queue>
 #include <mutex>
 #include <condition_variable>
+#include <chrono>
+#include <vector>
 
 #include "gstrtpreceiver.h"
 
@@ -36,10 +38,8 @@ struct dvr_rpc {
         RPC_SHUTDOWN,
         RPC_SET_PARAMS
     } command;
-    /* union { */
-        std::shared_ptr<std::vector<uint8_t>> frame;
-    /*     video_params params; */
-    /* }; */
+    std::shared_ptr<std::vector<uint8_t>> frame;
+    video_params params{};
 };
 
 
@@ -70,6 +70,10 @@ private:
     int start();
     void stop();
     void init();
+    void clear_cached_params();
+    void cache_param_sets(const uint8_t* data, size_t size);
+    bool has_idr(const uint8_t* data, size_t size) const;
+    bool inject_param_sets();
 private:
     std::queue<dvr_rpc> dvrQueue;
     std::mutex mtx;
@@ -82,6 +86,15 @@ private:
     uint32_t video_frm_height;
     VideoCodec codec;
     int _ready_to_write = 0;
+    uint64_t last_flush_ms = 0;
+    int frames_since_flush = 0;
+    int flush_frame_interval = 30;
+    uint64_t flush_ms_interval = 1000;
+    bool headers_injected = false;
+    bool wait_for_idr = false;
+    std::vector<uint8_t> cached_vps;
+    std::vector<uint8_t> cached_sps;
+    std::vector<uint8_t> cached_pps;
 
     FILE *dvr_file;
     MP4E_mux_tag *mux;
