@@ -131,6 +131,7 @@ bool enable_live_colortrans = false;
 float live_colortrans_offset = -0.15f;
 float live_colortrans_gain = 2.5f;
 gamma_lut_controller lut_ctrl;
+bool dvr_colortrans = false;
 
 void init_buffer(MppFrame frame) {
 	output_list->video_frm_width = mpp_frame_get_width(frame);
@@ -792,7 +793,6 @@ int main(int argc, char **argv)
 	bool dvr_filenames_with_sequence = false;
 	int video_framerate = -1;
 	int mp4_fragmentation_mode = 0;
-	bool dvr_colortrans = false;
 	int reencode_fps = 30;
 	int reencode_bitrate_kbps = 0;
 	uint16_t wfb_port = 8003;

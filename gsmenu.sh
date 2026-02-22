@@ -874,6 +874,14 @@ case "$@" in
             : #noop
         fi
         ;;
+    "set gs system gs_dvr_colortrans"*)
+        if [ "$5" = "off" ]
+        then
+            : #noop
+        else
+            : #noop
+        fi
+        ;;
     "get gs system video_scale")
         grep "^video_scale =" /config/setup.txt | cut -d '=' -f2 | xargs
         ;;

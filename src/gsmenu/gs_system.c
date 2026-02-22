@@ -24,6 +24,7 @@ lv_obj_t * vsync_disabled;
 lv_obj_t * gs_request_idr;
 lv_obj_t * video_scale;
 lv_obj_t * gs_live_colortrans;
+lv_obj_t * gs_dvr_colortrans;
 
 extern lv_obj_t * ap_fpv_ssid;
 extern lv_obj_t * ap_fpv_password;
@@ -39,6 +40,7 @@ extern float live_colortrans_offset;
 extern float live_colortrans_gain;
 extern bool enable_live_colortrans;
 extern gamma_lut_controller lut_ctrl;
+extern bool dvr_colortrans;
 
 
 void gs_system_page_load_callback(lv_obj_t * page)
@@ -63,6 +65,9 @@ void gs_system_page_load_callback(lv_obj_t * page)
 
     if (enable_live_colortrans) lv_obj_add_state(lv_obj_get_child_by_type(gs_live_colortrans,0,&lv_switch_class), LV_STATE_CHECKED);
     else lv_obj_clear_state(lv_obj_get_child_by_type(gs_live_colortrans,0,&lv_switch_class), LV_STATE_CHECKED);
+
+    if (dvr_colortrans) lv_obj_add_state(lv_obj_get_child_by_type(gs_dvr_colortrans,0,&lv_switch_class), LV_STATE_CHECKED);
+    else lv_obj_clear_state(lv_obj_get_child_by_type(gs_dvr_colortrans,0,&lv_switch_class), LV_STATE_CHECKED);
 
 }
 
@@ -94,6 +99,17 @@ void rec_enabled_cb(lv_event_t *e) {
     }
 }
 
+void gs_dvr_colortrans_cb(lv_event_t *e) {
+    lv_event_code_t event = lv_event_get_code(e);
+    if (event == LV_EVENT_VALUE_CHANGED) {
+        lv_obj_t *ta = lv_event_get_target(e);
+        // if (lv_obj_has_state(ta, LV_STATE_CHECKED)) {
+        //     processing_pipeline_set_encode_processed(&processing_pipeline, 1, &processing_opts, -1, dvr_enabled);
+        // } else {
+        //     processing_pipeline_set_encode_processed(&processing_pipeline, 0, &processing_opts, -1, dvr_enabled);
+        // }
+    }
+}
 
 void disable_vsync_cb(lv_event_t *e) {
     lv_event_code_t event = lv_event_get_code(e);
@@ -205,6 +221,9 @@ void create_gs_system_menu(lv_obj_t * parent) {
 
     rec_enabled = create_switch(cont,LV_SYMBOL_SETTINGS,"Enabled","rec_enabled", menu_page_data, true);
     lv_obj_add_event_cb(lv_obj_get_child_by_type(rec_enabled,0,&lv_switch_class), rec_enabled_cb, LV_EVENT_VALUE_CHANGED,NULL);
+
+    gs_dvr_colortrans = create_switch(cont,LV_SYMBOL_SETTINGS,"Re-Encode Video (colortrans)","gs_dvr_colortrans", menu_page_data, true);
+    lv_obj_add_event_cb(lv_obj_get_child_by_type(gs_dvr_colortrans,0,&lv_switch_class), gs_dvr_colortrans_cb, LV_EVENT_VALUE_CHANGED,NULL);
 
     rec_fps = create_dropdown(section,LV_SYMBOL_SETTINGS, "Recording FPS", "","rec_fps",menu_page_data,false);
     lv_obj_add_event_cb(lv_obj_get_child_by_type(rec_fps,0,&lv_dropdown_class), rec_fps_cb, LV_EVENT_VALUE_CHANGED,NULL);
