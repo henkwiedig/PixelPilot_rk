@@ -209,7 +209,10 @@ else()
   pkg_search_module(gio REQUIRED IMPORTED_TARGET gio-2.0)
   
   add_executable(${PROJECT_NAME} ${SOURCE_FILES})
-  target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_RGA=${HAVE_RGA})
+  target_compile_definitions(${PROJECT_NAME} PRIVATE 
+    HAVE_RGA=${HAVE_RGA}
+    PIXELPILOT_DATA_DIR="${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_DATAROOTDIR}/${PROJECT_NAME}"
+  )
   
   # Add include directories for the main target
   target_include_directories(${PROJECT_NAME} PRIVATE
@@ -332,4 +335,8 @@ install(FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/gsmenu.sh
     DESTINATION ${CMAKE_INSTALL_BINDIR}
     PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE
+)
+# Install GLSL shaders
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/shaders/colortrans.glsl
+    DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/${PROJECT_NAME}
 )

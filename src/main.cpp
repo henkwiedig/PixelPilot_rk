@@ -1022,6 +1022,9 @@ int main(int argc, char **argv)
 	processing_opts.shader_enabled = dvr_colortrans;
 	processing_opts.shader_name = "colortrans";
 	processing_opts.shader_dir = "shaders";
+#ifdef PIXELPILOT_DATA_DIR
+	processing_opts.shader_dir = PIXELPILOT_DATA_DIR;
+#endif
 	processing_opts.shader_for_display = false;
 	processing_opts.shader_for_encode = dvr_colortrans;
 	processing_opts.encode_processed = dvr_colortrans;
