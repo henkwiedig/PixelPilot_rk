@@ -783,6 +783,9 @@ case "$@" in
     "set gs system rx_codec"*)
         : # noop
     ;;
+    "set gs system gs_live_colortrans"*)
+        : # noop
+    ;;
     "set gs system rx_mode"*)
             EXCLUDE_IFACE="wlan0"
             SSID="${6:-OpenIPC}"

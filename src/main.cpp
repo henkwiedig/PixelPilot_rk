@@ -130,7 +130,7 @@ ProcessingOptions processing_opts;
 bool enable_live_colortrans = false;
 float live_colortrans_offset = -0.15f;
 float live_colortrans_gain = 2.5f;
-uint32_t gamma_lut_blob_id = 0;
+gamma_lut_controller lut_ctrl;
 
 void init_buffer(MppFrame frame) {
 	output_list->video_frm_width = mpp_frame_get_width(frame);
@@ -1191,48 +1191,12 @@ int main(int argc, char **argv)
 				"cannot initialize display. Is display connected? Is --screen-mode correct?\n");
 		return -2;
 	}
+
+	gamma_lut_controller_init(&lut_ctrl, drm_fd, output_list);
+
 	if (enable_live_colortrans) {
-		uint64_t lut_size = get_property_value(drm_fd, output_list->crtc.props, "GAMMA_LUT_SIZE");
-		if (lut_size == (uint64_t)-1) {
-			lut_size = get_property_value(drm_fd, output_list->crtc.props, "gamma_lut_size");
-		}
-		if (lut_size == 0 || lut_size == (uint64_t)-1) {
-			spdlog::warn("GAMMA_LUT_SIZE not available; cannot apply live colortrans LUT.");
-		} else {
-			std::vector<drm_color_lut> lut;
-			lut.resize(lut_size);
-			for (uint64_t i = 0; i < lut_size; i++) {
-				float x = (lut_size > 1) ? (float)i / (float)(lut_size - 1) : 0.0f;
-				float y = (x + live_colortrans_offset) * live_colortrans_gain;
-				if (y < 0.0f) y = 0.0f;
-				if (y > 1.0f) y = 1.0f;
-				uint16_t v = (uint16_t)lrintf(y * 65535.0f);
-				lut[i].red = v;
-				lut[i].green = v;
-				lut[i].blue = v;
-				lut[i].reserved = 0;
-			}
-			if (drmModeCreatePropertyBlob(drm_fd, lut.data(), lut.size() * sizeof(drm_color_lut), &gamma_lut_blob_id) == 0) {
-				drmModeAtomicReq *req = drmModeAtomicAlloc();
-				int set_ret = set_drm_object_property(req, &output_list->crtc, "GAMMA_LUT", gamma_lut_blob_id);
-				if (set_ret < 0) {
-					set_ret = set_drm_object_property(req, &output_list->crtc, "gamma_lut", gamma_lut_blob_id);
-				}
-				if (set_ret < 0) {
-					spdlog::warn("Failed to set GAMMA_LUT on CRTC; live LUT not applied.");
-					drmModeAtomicFree(req);
-				} else {
-					int commit_ret = drmModeAtomicCommit(drm_fd, req, 0, NULL);
-					if (commit_ret) {
-						spdlog::warn("GAMMA_LUT atomic commit failed: {} ({})", commit_ret, strerror(errno));
-					} else {
-						spdlog::info("Applied live colortrans LUT (size {}) to CRTC", lut_size);
-					}
-					drmModeAtomicFree(req);
-				}
-			} else {
-				spdlog::warn("Failed to create GAMMA_LUT property blob.");
-			}
+		if (gamma_lut_enable(&lut_ctrl, live_colortrans_offset, live_colortrans_gain)) {
+			spdlog::info("Gamma LUT enabled with offset={}, gain={}", live_colortrans_offset, live_colortrans_gain);
 		}
 	}
 	processing_pipeline.set_drm_fd(drm_fd);
@@ -1404,10 +1368,7 @@ int main(int argc, char **argv)
 	drmModeFreeCrtc(output_list->saved_crtc);
 	drmModeAtomicFree(output_list->video_request);
 	drmModeAtomicFree(output_list->osd_request);
-	if (gamma_lut_blob_id) {
-		drmModeDestroyPropertyBlob(drm_fd, gamma_lut_blob_id);
-		gamma_lut_blob_id = 0;
-	}
+	gamma_lut_cleanup(&lut_ctrl);
 	modeset_cleanup(drm_fd, output_list);
 	close(drm_fd);
 
