@@ -1614,3 +1614,20 @@ std::string ProcessingPipeline::current_shader_path() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return shader_path_cache_;
 }
+
+extern "C" void processing_pipeline_set_dvr_colortrans(bool enabled) {
+    // These are the same globals set at startup in main.cpp
+    extern ProcessingOptions processing_opts;
+    extern ProcessingPipeline processing_pipeline;
+    extern bool dvr_colortrans;
+
+    dvr_colortrans = enabled;
+    processing_opts.shader_enabled   = enabled;
+    processing_opts.shader_for_encode = enabled;
+    processing_opts.encode_processed  = enabled;
+    if (enabled) {
+        processing_opts.encode_use_mpp_buffer = true;
+    }
+    processing_pipeline.configure(processing_opts);
+    spdlog::info("dvr_colortrans dynamically set to {}", enabled);
+}

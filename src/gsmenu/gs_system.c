@@ -41,7 +41,7 @@ extern float live_colortrans_gain;
 extern bool enable_live_colortrans;
 extern gamma_lut_controller lut_ctrl;
 extern bool dvr_colortrans;
-
+extern void processing_pipeline_set_dvr_colortrans(bool enabled);
 
 void gs_system_page_load_callback(lv_obj_t * page)
 {
@@ -103,11 +103,11 @@ void gs_dvr_colortrans_cb(lv_event_t *e) {
     lv_event_code_t event = lv_event_get_code(e);
     if (event == LV_EVENT_VALUE_CHANGED) {
         lv_obj_t *ta = lv_event_get_target(e);
-        // if (lv_obj_has_state(ta, LV_STATE_CHECKED)) {
-        //     processing_pipeline_set_encode_processed(&processing_pipeline, 1, &processing_opts, -1, dvr_enabled);
-        // } else {
-        //     processing_pipeline_set_encode_processed(&processing_pipeline, 0, &processing_opts, -1, dvr_enabled);
-        // }
+        if (lv_obj_has_state(ta, LV_STATE_CHECKED)) {
+            processing_pipeline_set_dvr_colortrans(true);
+        } else {
+            processing_pipeline_set_dvr_colortrans(false);
+        }
     }
 }
 
