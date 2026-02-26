@@ -439,262 +439,6 @@ static void destroy_dumb_buffer(int drm_fd, RgaDumbBuffer& buf) {
     buf.size = 0;
 }
 
-class RgaColorTrans {
-public:
-    bool init(int drm_fd,
-              uint32_t width,
-              uint32_t height,
-              uint32_t hor_stride,
-              uint32_t ver_stride,
-              MppFrameFormat fmt,
-              bool apply_cpu_lut,
-              int csc_mode) {
-        if (ready_) {
-            if (width_ == width &&
-                height_ == height &&
-                hor_stride_ == hor_stride &&
-                ver_stride_ == ver_stride &&
-                apply_cpu_lut_ == apply_cpu_lut &&
-                csc_mode_ == csc_mode) {
-                return true;
-            }
-            cleanup();
-        }
-        if (drm_fd < 0) return false;
-        if (fmt != MPP_FMT_YUV420SP) return false;
-
-        static std::atomic<bool> rga_inited{false};
-        if (!rga_inited.exchange(true)) {
-            if (c_RkRgaInit() != 0) {
-                spdlog::warn("RGA init failed; colortrans may not work.");
-            }
-        }
-
-        drm_fd_ = drm_fd;
-        width_ = width;
-        height_ = height;
-        hor_stride_ = hor_stride;
-        ver_stride_ = ver_stride;
-        apply_cpu_lut_ = apply_cpu_lut;
-        csc_mode_ = csc_mode;
-
-        if (mpp_buffer_group_get_external(&out_group_, MPP_BUFFER_TYPE_DRM) != MPP_OK) {
-            cleanup();
-            return false;
-        }
-
-        for (int i = 0; i < pool_size_; i++) {
-            RgaDumbBuffer buf;
-            if (!create_dumb_buffer(drm_fd_, hor_stride_, ver_stride_ * 2, 8, buf)) {
-                cleanup();
-                return false;
-            }
-            MppBufferInfo info{};
-            info.type = MPP_BUFFER_TYPE_DRM;
-            info.size = buf.size;
-            info.fd = buf.prime_fd;
-            if (mpp_buffer_commit(out_group_, &info) != MPP_OK) {
-                destroy_dumb_buffer(drm_fd_, buf);
-                cleanup();
-                return false;
-            }
-            MppBuffer mpp_buf = nullptr;
-            if (mpp_buffer_get(out_group_, &mpp_buf, info.size) != MPP_OK || !mpp_buf) {
-                destroy_dumb_buffer(drm_fd_, buf);
-                cleanup();
-                return false;
-            }
-            PoolBuf pool{};
-            pool.drm = buf;
-            pool.mpp = mpp_buf;
-            pool.rga = wrapbuffer_fd(buf.prime_fd, width_, height_, RK_FORMAT_YCbCr_420_SP,
-                                     static_cast<int>(hor_stride_), static_cast<int>(ver_stride_));
-            pool_.push_back(pool);
-            free_queue_.push(i);
-        }
-
-        ready_ = true;
-        return true;
-    }
-
-    bool ready() const { return ready_; }
-
-    bool process(MppBuffer src, MppBuffer& out, int& out_index) {
-        if (!ready_) return false;
-        if (!src) return false;
-        if (free_queue_.empty()) {
-            return false;
-        }
-
-        MppBufferInfo info{};
-        if (mpp_buffer_info_get(src, &info) != MPP_OK) {
-            return false;
-        }
-        const int src_fd = info.fd;
-        if (src_fd < 0) {
-            return false;
-        }
-
-        int index = free_queue_.front();
-        free_queue_.pop();
-        PoolBuf& pool = pool_[index];
-
-        rga_buffer_t src_wrap = wrapbuffer_fd(src_fd, width_, height_, RK_FORMAT_YCbCr_420_SP,
-                                              static_cast<int>(hor_stride_), static_cast<int>(ver_stride_));
-        bool copy_ok = false;
-        if (csc_mode_ != 0) {
-            src_wrap.color_space_mode = csc_mode_;
-            pool.rga.color_space_mode = csc_mode_;
-        }
-
-        IM_STATUS ret = imcopy(src_wrap, pool.rga);
-        if (ret == IM_STATUS_SUCCESS) {
-            copy_ok = true;
-        } else if (csc_mode_ != 0) {
-            IM_STATUS cvt_ret = imcvtcolor_t(src_wrap, pool.rga, RK_FORMAT_YCbCr_420_SP,
-                                             RK_FORMAT_YCbCr_420_SP, csc_mode_, 1);
-            if (cvt_ret == IM_STATUS_SUCCESS) {
-                copy_ok = true;
-            } else {
-                rga_info_t src_info{};
-                rga_info_t dst_info{};
-                src_info.fd = src_fd;
-                src_info.mmuFlag = 1;
-                src_info.sync_mode = 1;
-                src_info.format = RK_FORMAT_YCbCr_420_SP;
-                src_info.color_space_mode = csc_mode_;
-                src_info.rect.xoffset = 0;
-                src_info.rect.yoffset = 0;
-                src_info.rect.width = static_cast<int>(width_);
-                src_info.rect.height = static_cast<int>(height_);
-                src_info.rect.wstride = static_cast<int>(hor_stride_);
-                src_info.rect.hstride = static_cast<int>(ver_stride_);
-                src_info.rect.format = RK_FORMAT_YCbCr_420_SP;
-
-                dst_info.fd = pool.drm.prime_fd;
-                dst_info.mmuFlag = 1;
-                dst_info.sync_mode = 1;
-                dst_info.format = RK_FORMAT_YCbCr_420_SP;
-                dst_info.color_space_mode = csc_mode_;
-                dst_info.rect.xoffset = 0;
-                dst_info.rect.yoffset = 0;
-                dst_info.rect.width = static_cast<int>(width_);
-                dst_info.rect.height = static_cast<int>(height_);
-                dst_info.rect.wstride = static_cast<int>(hor_stride_);
-                dst_info.rect.hstride = static_cast<int>(ver_stride_);
-                dst_info.rect.format = RK_FORMAT_YCbCr_420_SP;
-
-                int blit_ret = c_RkRgaBlit(&src_info, &dst_info, nullptr);
-                if (blit_ret == 0) {
-                    copy_ok = true;
-                } else {
-                    spdlog::warn("RGA CSC failed: imcopy={}, imcvtcolor={}, RgaBlit={}", 
-                        static_cast<int>(ret), static_cast<int>(cvt_ret), static_cast<int>(blit_ret));
-                }
-            }
-        } else {
-            spdlog::warn("RGA imcopy failed: {}", static_cast<int>(ret));
-        }
-        if (!copy_ok) {
-            free_queue_.push(index);
-            return false;
-        }
-
-        if (apply_cpu_lut_) {
-            void* map = mmap(nullptr, pool.drm.size, PROT_READ | PROT_WRITE, MAP_SHARED, pool.drm.prime_fd, 0);
-            if (map == MAP_FAILED) {
-                spdlog::warn("Failed to mmap NV12 buffer for luma adjustment");
-                free_queue_.push(index);
-                return false;
-            }
-            static uint8_t y_lut[256];
-            static uint8_t uv_lut[256];
-            static bool lut_init = false;
-            if (!lut_init) {
-                const float offset = -0.15f;
-                const float gain = 2.5f;
-                for (int i = 0; i < 256; i++) {
-                    float v = (float)i / 255.0f;
-                    float y = (v + offset) * gain;
-                    if (y < 0.0f) y = 0.0f;
-                    if (y > 1.0f) y = 1.0f;
-                    y_lut[i] = (uint8_t)std::lround(y * 255.0f);
-
-                    float uv = ((float)i - 128.0f) * gain + 128.0f;
-                    if (uv < 0.0f) uv = 0.0f;
-                    if (uv > 255.0f) uv = 255.0f;
-                    uv_lut[i] = (uint8_t)std::lround(uv);
-                }
-                lut_init = true;
-            }
-            uint8_t* y_plane = static_cast<uint8_t*>(map);
-            const size_t y_size = static_cast<size_t>(hor_stride_) * static_cast<size_t>(ver_stride_);
-            for (size_t i = 0; i < y_size; i++) {
-                y_plane[i] = y_lut[y_plane[i]];
-            }
-            uint8_t* uv_plane = y_plane + y_size;
-            const size_t uv_size = y_size / 2;
-            for (size_t i = 0; i < uv_size; i++) {
-                uv_plane[i] = uv_lut[uv_plane[i]];
-            }
-            munmap(map, pool.drm.size);
-        }
-
-        mpp_buffer_inc_ref(pool.mpp);
-        out = pool.mpp;
-        out_index = index;
-        return true;
-    }
-
-    void release(int index) {
-        if (!ready_) return;
-        if (index < 0 || index >= static_cast<int>(pool_.size())) return;
-        free_queue_.push(index);
-    }
-
-    void cleanup() {
-        for (auto& pool : pool_) {
-            if (pool.mpp) {
-                mpp_buffer_put(pool.mpp);
-                pool.mpp = nullptr;
-            }
-            destroy_dumb_buffer(drm_fd_, pool.drm);
-        }
-        pool_.clear();
-        while (!free_queue_.empty()) free_queue_.pop();
-        if (out_group_) {
-            mpp_buffer_group_put(out_group_);
-            out_group_ = nullptr;
-        }
-        ready_ = false;
-    }
-
-private:
-    struct PoolBuf {
-        RgaDumbBuffer drm{};
-        MppBuffer mpp{nullptr};
-        rga_buffer_t rga{};
-    };
-
-    const int pool_size_{12};
-    int drm_fd_{-1};
-    uint32_t width_{0};
-    uint32_t height_{0};
-    uint32_t hor_stride_{0};
-    uint32_t ver_stride_{0};
-    bool apply_cpu_lut_{false};
-    int csc_mode_{0};
-    bool ready_{false};
-
-    MppBufferGroup out_group_{nullptr};
-    std::vector<PoolBuf> pool_;
-    std::queue<int> free_queue_;
-};
-
-void RgaColorTransDeleter::operator()(RgaColorTrans* ptr) const {
-    delete ptr;
-}
-
 class RgaRgbToNv12 {
 public:
     void set_mode(int mode) { rgb2yuv_mode_ = mode; }
@@ -1271,20 +1015,6 @@ void ProcessingPipeline::maybe_init_record_colortrans() {
         }
         return;
     }
-    if (!rga_colortrans_) {
-        rga_colortrans_ = std::unique_ptr<RgaColorTrans, RgaColorTransDeleter>(new RgaColorTrans());
-    }
-    if (rga_colortrans_->init(drm_fd_, video_width_, video_height_, hor_stride_, ver_stride_, format_, use_cpu_lut, csc_mode)) {
-        record_colortrans_ready_ = true;
-        if (use_cpu_lut) {
-            spdlog::info("Record colortrans enabled via RGA + CPU LUT (slow)");
-        } else {
-            spdlog::info("Record colortrans enabled via RGA CSC mode {}", opts_.record_colortrans_csc);
-        }
-    } else if (!record_colortrans_warned_) {
-        record_colortrans_warned_ = true;
-        spdlog::warn("Record colortrans requested but RGA init failed; bypassing.");
-    }
 #else
     if (!record_colortrans_warned_) {
         record_colortrans_warned_ = true;
@@ -1425,9 +1155,7 @@ void ProcessingPipeline::encoder_loop() {
 #endif
         } else if (opts_.record_colortrans && record_colortrans_ready_) {
 #if defined(HAVE_RGA) && HAVE_RGA
-            if (rga_colortrans_ && rga_colortrans_->process(job.buffer, encode_buffer, pool_index)) {
-                job.fmt = MPP_FMT_YUV420SP;
-            } else if (!record_colortrans_warned_) {
+            if (!record_colortrans_warned_) {
                 record_colortrans_warned_ = true;
                 spdlog::warn("Record colortrans failed; falling back to raw buffer.");
             }
@@ -1447,8 +1175,6 @@ void ProcessingPipeline::encoder_loop() {
                 if (pool_index >= 0) {
                     if (job.rgb_fd >= 0 && rga_rgb_to_nv12_) {
                         rga_rgb_to_nv12_->release(pool_index);
-                    } else if (rga_colortrans_) {
-                        rga_colortrans_->release(pool_index);
                     }
                 }
 #endif
@@ -1499,8 +1225,6 @@ void ProcessingPipeline::encoder_loop() {
                 if (pool_index >= 0) {
                     if (job.rgb_fd >= 0 && rga_rgb_to_nv12_) {
                         rga_rgb_to_nv12_->release(pool_index);
-                    } else if (rga_colortrans_) {
-                        rga_colortrans_->release(pool_index);
                     }
                 }
 #endif
@@ -1584,8 +1308,6 @@ void ProcessingPipeline::encoder_loop() {
         if (pool_index >= 0) {
             if (job.rgb_fd >= 0 && rga_rgb_to_nv12_) {
                 rga_rgb_to_nv12_->release(pool_index);
-            } else if (rga_colortrans_) {
-                rga_colortrans_->release(pool_index);
             }
         }
 #endif

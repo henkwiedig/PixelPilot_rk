@@ -14,11 +14,7 @@
 
 class Dvr;
 #if defined(HAVE_RGA) && HAVE_RGA
-class RgaColorTrans;
 class RgaRgbToNv12;
-struct RgaColorTransDeleter {
-    void operator()(RgaColorTrans* ptr) const;
-};
 struct RgaRgbToNv12Deleter {
     void operator()(RgaRgbToNv12* ptr) const;
 };
@@ -129,7 +125,6 @@ private:
     bool record_colortrans_ready_{false};
     bool record_colortrans_warned_{false};
 #if defined(HAVE_RGA) && HAVE_RGA
-    std::unique_ptr<RgaColorTrans, RgaColorTransDeleter> rga_colortrans_;
     std::unique_ptr<RgaRgbToNv12, RgaRgbToNv12Deleter> rga_rgb_to_nv12_;
 #endif
     struct PendingRgb {
