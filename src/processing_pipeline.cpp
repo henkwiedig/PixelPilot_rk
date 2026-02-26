@@ -700,8 +700,8 @@ void ProcessingPipeline::configure(const ProcessingOptions& opts) {
         shader_path_cache_.clear();
     }
 
-    spdlog::info("Processing options: shader_enabled={}, shader_name={}, shader_dir={}, shader_for_display={}, shader_for_encode={}, encode_processed={}, encode_bitrate_kbps={}, encode_fps={}, record_colortrans={}, record_colortrans_mode={}, record_colortrans_csc={}, record_rgb2yuv_mode={}, record_rgb_format={}",
-                 opts_.shader_enabled, opts_.shader_name, opts_.shader_dir, opts_.shader_for_display, opts_.shader_for_encode,
+    spdlog::info("Processing options: shader_enabled={}, shader_name={}, shader_dir={}, shader_for_encode={}, encode_processed={}, encode_bitrate_kbps={}, encode_fps={}, record_colortrans={}, record_colortrans_mode={}, record_colortrans_csc={}, record_rgb2yuv_mode={}, record_rgb_format={}",
+                 opts_.shader_enabled, opts_.shader_name, opts_.shader_dir, opts_.shader_for_encode,
                  opts_.encode_processed, opts_.encode_bitrate_kbps, opts_.encode_fps,
                  opts_.record_colortrans, opts_.record_colortrans_mode, opts_.record_colortrans_csc, opts_.record_rgb2yuv_mode, opts_.record_rgb_format);
 
@@ -725,21 +725,6 @@ void ProcessingPipeline::set_video_info(uint32_t width, uint32_t height, uint32_
     spdlog::info("Processing set_video_info: shader_enabled={}, drm_fd={}, gl_ready={}, encode_stride={}x{}",
                  opts_.shader_enabled, drm_fd_, gl_ready_.load(), encode_hor_stride_, encode_ver_stride_);
     refresh_shader_if_needed();
-    if (opts_.shader_enabled && opts_.shader_for_display && !gl_ready_.load() && drm_fd_ >= 0) {
-        spdlog::info("Attempting GL init for shader processing");
-        std::lock_guard<std::mutex> gl_lock(gl_mutex_);
-        if (!gl_ready_.load()) {
-            if (gl_.init(drm_fd_, video_width_, video_height_)) {
-                if (shader_available_.load()) {
-                    gl_.reload_shader(shader_path_cache_);
-                }
-                gl_ready_.store(true);
-                spdlog::info("GL processing enabled for {}x{}", video_width_, video_height_);
-            } else if (!gl_warned_.exchange(true)) {
-                spdlog::warn("GL processing init failed; shader will be bypassed.");
-            }
-        }
-    }
     maybe_init_record_colortrans();
 }
 
@@ -792,63 +777,6 @@ void ProcessingPipeline::refresh_shader_if_needed() {
     } else {
         spdlog::warn("Shader file not found at {}; running passthrough.", shader_path_cache_);
     }
-}
-
-MppFrame ProcessingPipeline::process_frame(MppFrame frame, uint32_t& out_fb_id, bool& out_is_processed) {
-    refresh_shader_if_needed();
-    out_is_processed = false;
-    out_fb_id = 0;
-    frame_total_++;
-    auto maybe_log_stats = [&]() {
-        uint64_t ts_now_ms = now_ms();
-        if (ts_now_ms - last_log_ms_ >= 1000) {
-            last_log_ms_ = ts_now_ms;
-            spdlog::info("Frame stats: total={}, gl_ok={}, gl_fail={}, last_render_ms={}",
-                         frame_total_, gl_ok_.load(), gl_fail_.load(), last_render_ms_.load());
-        }
-    };
-    if (pending_rgb_.valid) {
-        if (pending_rgb_.fd >= 0) {
-            close(pending_rgb_.fd);
-        }
-        pending_rgb_ = {};
-    }
-
-    const bool want_display_shader = opts_.shader_enabled && opts_.shader_for_display;
-    const bool want_encode_shader = opts_.shader_enabled && opts_.shader_for_encode && opts_.encode_processed;
-    if (want_display_shader && gl_ready_.load()) {
-        uint64_t start_ms = now_ms();
-        std::lock_guard<std::mutex> gl_lock(gl_mutex_);
-        auto pf = gl_.process(frame);
-        last_render_ms_.store(now_ms() - start_ms);
-        if (pf.has_value()) {
-            gl_ok_.fetch_add(1);
-            out_fb_id = pf->fb_id;
-            out_is_processed = true;
-            if (want_encode_shader && pf->bo) {
-                int fd = gbm_bo_get_fd(pf->bo);
-                if (fd >= 0) {
-                    pending_rgb_.fd = fd;
-                    pending_rgb_.width = gl_.target_width();
-                    pending_rgb_.height = gl_.target_height();
-                    pending_rgb_.stride = gbm_bo_get_stride(pf->bo);
-                    pending_rgb_.format = RK_FORMAT_XRGB_8888;
-                    pending_rgb_.valid = true;
-                }
-            }
-            if (!processed_logged_.exchange(true)) {
-                spdlog::info("First processed frame rendered via GL shader");
-            }
-            maybe_log_stats();
-            return frame; // framebuffer id will be used instead of mpp buffer mapping
-        }
-        gl_fail_.fetch_add(1);
-    } else if (want_display_shader && !gl_ready_.load() && !shader_warned_) {
-        shader_warned_ = true;
-        spdlog::warn("Shader requested but GL processing is not ready; running passthrough.");
-    }
-    maybe_log_stats();
-    return frame;
 }
 
 bool ProcessingPipeline::ensure_gl_ready_for_encode() {
@@ -1099,7 +1027,7 @@ void ProcessingPipeline::encoder_loop() {
         }
         MppBuffer encode_buffer = job.buffer;
         int pool_index = -1;
-        if (opts_.shader_enabled && opts_.shader_for_encode && !opts_.shader_for_display && job.rgb_fd < 0) {
+        if (opts_.shader_enabled && opts_.shader_for_encode && job.rgb_fd < 0) {
             if (ensure_gl_ready_for_encode()) {
                 uint64_t start_ms = now_ms();
                 auto pf = process_shader_frame(job.buffer, job.width, job.height, job.hor_stride, job.ver_stride, job.fmt, job.pts);

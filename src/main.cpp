@@ -312,19 +312,13 @@ void *__FRAME_THREAD__(void *param)
 					assert(i!=MAX_FRAMES);
 
 					ts = ats;
-					uint32_t processed_fb_id = 0;
-					bool processed = false;
-					processing_pipeline.process_frame(frame, processed_fb_id, processed);
+
 					processing_pipeline.submit_for_encoding(frame, feed_data_ts);
-					uint32_t fb_id_to_display = mpi.frame_to_drm[i].fb_id;
-					if (processed && processed_fb_id != 0) {
-						fb_id_to_display = processed_fb_id;
-					}
 
 					// send DRM FB to display thread
 					ret = pthread_mutex_lock(&video_mutex);
 					assert(!ret);
-					output_list->video_fb_id = fb_id_to_display;
+					output_list->video_fb_id = mpi.frame_to_drm[i].fb_id;
                     //output_list->video_fb_index=i;
                     output_list->decoding_pts=feed_data_ts;
 					ret = pthread_cond_signal(&video_cond);
@@ -1025,7 +1019,6 @@ int main(int argc, char **argv)
 #ifdef PIXELPILOT_DATA_DIR
 	processing_opts.shader_dir = PIXELPILOT_DATA_DIR;
 #endif
-	processing_opts.shader_for_display = false;
 	processing_opts.shader_for_encode = dvr_colortrans;
 	processing_opts.encode_processed = dvr_colortrans;
 	processing_opts.encode_bitrate_kbps = reencode_bitrate_kbps;

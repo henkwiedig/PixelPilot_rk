@@ -25,7 +25,6 @@ struct ProcessingOptions {
     bool shader_enabled{false};
     std::string shader_name{"none"};
     std::string shader_dir{"shaders"};
-    bool shader_for_display{true};
     bool shader_for_encode{true};
     bool encode_processed{false};
     int encode_bitrate_kbps{0}; // 0 means "use default"
@@ -60,10 +59,6 @@ public:
     void update_dvr_fps(int framerate);
     void set_codec(VideoCodec codec) { codec_ = codec; }
     void shutdown();
-
-    // Returns the frame that should be displayed. Today this is the same frame,
-    // but the signature allows swapping in a processed buffer later.
-    MppFrame process_frame(MppFrame frame, uint32_t& out_fb_id, bool& out_is_processed);
 
     // Entry point for the processed encode branch; no-op until encoder is wired.
     void submit_for_encoding(MppFrame frame, uint64_t pts_ms);
