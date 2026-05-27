@@ -731,7 +731,7 @@ extern "C" {
                                  if (dvr_enabled && dvr_reenc_inst) dvr_reenc_inst->frame(nal);
                              });
             pthread_create(&g_tid_enc, NULL, &MppEncoder::__THREAD__, reencoder);
-            frame_proc = new FrameProcessor(reencoder, reenc_params.fps, reenc_params.resolution);
+            frame_proc = new FrameProcessor(reencoder, reenc_params.fps, reenc_params.resolution, drm_fd);
             if (enable_live_colortrans)
                 frame_proc->set_color_correction(live_colortrans_gain,
                                                 live_colortrans_offset, drm_fd);
@@ -1654,7 +1654,7 @@ int main(int argc, char **argv)
 			});
 			ret = pthread_create(&g_tid_enc, NULL, &MppEncoder::__THREAD__, reencoder);
 			assert(!ret);
-			frame_proc = new FrameProcessor(reencoder, reenc_params.fps, reenc_params.resolution);
+			frame_proc = new FrameProcessor(reencoder, reenc_params.fps, reenc_params.resolution, drm_fd);
 			if (enable_live_colortrans) {
 				frame_proc->set_color_correction(live_colortrans_gain,
 				                                live_colortrans_offset, drm_fd);

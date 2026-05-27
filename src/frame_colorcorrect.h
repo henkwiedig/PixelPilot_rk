@@ -31,22 +31,29 @@ public:
     FrameColorCorrect() = default;
     ~FrameColorCorrect();
 
-    // Init EGL context, compile shader, create RGBA render targets.
+    // Init EGL context, compile shader, create RGBA render targets at OUTPUT size.
     // Must be called from the thread that will call process().
-    bool init(int drm_fd, uint32_t width, uint32_t height,
+    // gain/offset apply the DRM gamma formula y = clamp((x+offset)*gain, 0,1);
+    // pass gain=1 offset=0 when only OSD blend is needed.
+    bool init(int drm_fd, uint32_t out_w, uint32_t out_h,
               float gain, float offset);
 
     void deinit();
     bool ready() const { return ready_; }
 
-    // Apply color correction: read src NV12 DMA-buf, write corrected NV12
-    // into dst DMA-buf.  Both fds come from mpp_buffer_get_fd().
-    // dst dimensions may differ from src — RGA performs resize + CSC in one pass.
+    // Register the current OSD DMA-buf for compositing.  Called whenever the
+    // OSD double-buffer switches.  The EGLImage is cached and only re-imported
+    // when prime_fd changes.  Must be called from the processor thread.
+    void set_osd(int prime_fd, uint32_t w, uint32_t h, uint32_t stride_px);
+    void clear_osd();  // disable OSD compositing
+
+    // Apply color-correction + OSD blend: read src NV12 DMA-buf, render into
+    // the RGBA GBM BO at output size (resizing via texture sampling if needed),
+    // then RGA-CSC to the NV12 dst DMA-buf (no resize — sizes always match).
     // Returns false on failure — caller should fall back to plain copy.
     bool process(int src_fd, uint32_t src_w, uint32_t src_h,
                  uint32_t src_hs, uint32_t src_vs,
-                 int dst_fd, uint32_t dst_w, uint32_t dst_h,
-                 uint32_t dst_hs, uint32_t dst_vs);
+                 int dst_fd, uint32_t dst_hs, uint32_t dst_vs);
 
 private:
     bool build_shader();
@@ -69,6 +76,14 @@ private:
     GLint  loc_tex_{-1};
     GLint  loc_gain_{-1};
     GLint  loc_offset_{-1};
+    GLint  loc_osd_tex_{-1};
+    GLint  loc_has_osd_{-1};
+
+    // OSD compositing state (processor-thread only)
+    GLuint      osd_tex_gl_{0};           // 1×1 transparent fallback or live OSD
+    int         osd_prime_fd_{-1};        // DMA-buf fd of the current OSD buffer
+    EGLImageKHR osd_img_{EGL_NO_IMAGE_KHR};
+    uint32_t    osd_w_{0}, osd_h_{0}, osd_stride_px_{0};
 
     // Double-buffered RGBA render targets
     static constexpr int kTargets = 2;

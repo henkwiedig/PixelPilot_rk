@@ -245,12 +245,6 @@ void dvr_reenc_fps_cb(lv_event_t *e) {
         int fps = atoi(val);
         if (fps > 0) {
 #ifndef USE_SIMULATOR
-            // Hardware limit: OSD blend + re-encoding is capped at 30fps.
-            if (fps > 30 && dvr_reenc_get_osd()) {
-                fps = 30;
-                int32_t idx = lv_dropdown_get_option_index(ta, "30");
-                if (idx >= 0) lv_dropdown_set_selected(ta, (uint32_t)idx);
-            }
             dvr_reenc_set_fps(fps);
 #else
             printf("dvr_reenc_set_fps(%d);\n", fps);
@@ -266,18 +260,6 @@ void dvr_reenc_osd_cb(lv_event_t *e) {
         int osd_on = lv_obj_has_state(ta, LV_STATE_CHECKED) ? 1 : 0;
 #ifndef USE_SIMULATOR
         dvr_reenc_set_osd(osd_on);
-        // Hardware limit: OSD blend caps re-encoding at 30fps.
-        if (osd_on) {
-            lv_obj_t *fps_dd = lv_obj_get_child_by_type(dvr_reenc_fps, 0, &lv_dropdown_class);
-            char cur[32] = "";
-            lv_dropdown_get_selected_str(fps_dd, cur, sizeof(cur) - 1);
-            if (atoi(cur) > 30) {
-                int32_t idx = lv_dropdown_get_option_index(fps_dd, "30");
-                if (idx >= 0) lv_dropdown_set_selected(fps_dd, (uint32_t)idx);
-                dvr_reenc_set_fps(30);
-                lv_obj_send_event(fps_dd, LV_EVENT_VALUE_CHANGED, NULL);
-            }
-        }
 #else
         printf("dvr_reenc_set_osd(%d);\n", osd_on);
 #endif

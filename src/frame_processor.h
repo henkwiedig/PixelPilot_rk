@@ -40,7 +40,8 @@ struct FrameProcFrame {
 
 class FrameProcessor {
 public:
-    FrameProcessor(MppEncoder *enc, int fps, EncResolution res = EncResolution::Res1080p);
+    FrameProcessor(MppEncoder *enc, int fps, EncResolution res = EncResolution::Res1080p,
+                   int drm_fd = -1);
     ~FrameProcessor();
 
     // Called from decoder thread: update the latest available frame.
@@ -102,7 +103,7 @@ private:
     // Only accessed from the processor thread — no mutex needed:
     MppBufferGroup    hold_grp  = nullptr;  // our own DRM buffer pool
     MppBuffer         proc_copy_  = nullptr;  // processor's working buffer
-    MppBuffer         blend_rgba_ = nullptr;  // BGRA intermediate for OSD compositing
+    MppBuffer         blend_rgba_ = nullptr;  // BGRA intermediate for RGA OSD fallback
     FrameProcFrame     proc_meta_;              // metadata being built by processor
 
     // OSD blend — shared between OSD thread (writer) and processor thread (reader)
@@ -113,14 +114,15 @@ private:
     std::mutex  osd_mtx_;
     OsdInfo     osd_info_;      // latest OSD frame descriptor
 
-    // Color correction — lazy-initialized on the processor thread on first frame.
+    // GL pipeline — handles colour-correction and/or OSD blend in one GPU pass.
+    // Lazy-initialised on the processor thread on the first frame that needs it.
     // Written by UI thread (set_color_correction / set_color_correction_enabled),
-    // read by processor thread — must be atomic.
+    // read by processor thread — must be atomic where shared.
     std::atomic<bool>  color_correct_{false};
-    bool               cc_init_done_{false};   // only attempt init once
-    uint32_t           cc_width_{0}, cc_height_{0}; // dimensions at last init
+    bool               gl_init_done_{false};
+    uint32_t           gl_out_w_{0}, gl_out_h_{0};  // output dims at last GL init
     float              cc_gain_{1.f}, cc_offset_{0.f};
-    int                cc_drm_fd_{-1};
+    int                drm_fd_{-1};  // DRM fd for GBM/EGL (passed at construction)
     FrameColorCorrect  color_gl_;
 };
 

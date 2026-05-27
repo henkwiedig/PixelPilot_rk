@@ -25,8 +25,8 @@ static inline uint32_t align_up(uint32_t v, uint32_t a) {
     return (v + a - 1) & ~(a - 1);
 }
 
-FrameProcessor::FrameProcessor(MppEncoder *enc, int fps, EncResolution res)
-    : encoder(enc), interval_ns(1000000000L / fps), target_res_((int)res) {
+FrameProcessor::FrameProcessor(MppEncoder *enc, int fps, EncResolution res, int drm_fd)
+    : encoder(enc), interval_ns(1000000000L / fps), target_res_((int)res), drm_fd_(drm_fd) {
     mpp_buffer_group_get_internal(&hold_grp, MPP_BUFFER_TYPE_DRM);
 }
 
@@ -79,9 +79,9 @@ void FrameProcessor::set_osd_blend(int prime_fd, uint32_t w, uint32_t h, uint32_
 }
 
 void FrameProcessor::set_color_correction(float gain, float offset, int drm_fd) {
-    cc_gain_    = gain;
-    cc_offset_  = offset;
-    cc_drm_fd_  = drm_fd;
+    cc_gain_   = gain;
+    cc_offset_ = offset;
+    if (drm_fd >= 0) drm_fd_ = drm_fd;  // update if caller supplies one
     color_correct_.store(true, std::memory_order_relaxed);
     // Actual EGL/GL init happens lazily on the processor thread (first frame)
 }
@@ -136,7 +136,14 @@ void FrameProcessor::process_loop() {
 
         auto t_start = std::chrono::steady_clock::now();
 
-        // ── Copy / resize / color-correct ───────────────────────────────
+        // Read OSD state before the copy block so GL init can see it.
+        OsdInfo osd_snap;
+        {
+            std::lock_guard<std::mutex> lock(osd_mtx_);
+            osd_snap = osd_info_;
+        }
+
+        // ── Copy / resize / colour-correct / OSD blend ──────────────────
         // copy_mtx_ is held so drain_decoder_refs() can safely wait for us.
         {
             std::lock_guard<std::mutex> copy_lock(copy_mtx_);
@@ -158,33 +165,46 @@ void FrameProcessor::process_loop() {
                 mpp_buffer_get(hold_grp, &proc_copy_, dst_sz);
             }
             if (proc_copy_) {
-                // Re-init color correction if source dimensions changed.
-                if (cc_init_done_ &&
-                    (fresh.width != cc_width_ || fresh.height != cc_height_)) {
+                // ── GL path: colour-correct + OSD in one GPU pass ───────
+                // Activated when colour-correction is on OR OSD is active.
+                // The GL render target is at OUTPUT size (dst_w × dst_h);
+                // samplerExternalOES handles any input-to-output resize implicitly.
+                // Re-init when output dimensions change.
+                bool need_gl = drm_fd_ >= 0 &&
+                               (color_correct_.load(std::memory_order_relaxed) ||
+                                osd_snap.prime_fd >= 0);
+                if (gl_init_done_ && (dst_w != gl_out_w_ || dst_h != gl_out_h_)) {
                     color_gl_.deinit();
-                    cc_init_done_ = false;
+                    gl_init_done_ = false;
                 }
-                // Lazy GL init on first frame (must run on processor thread, try once)
-                if (color_correct_.load(std::memory_order_relaxed) && !cc_init_done_) {
-                    cc_init_done_ = true;
-                    cc_width_  = fresh.width;
-                    cc_height_ = fresh.height;
-                    color_gl_.init(cc_drm_fd_, fresh.width, fresh.height,
-                                   cc_gain_, cc_offset_);
+                if (need_gl && !gl_init_done_) {
+                    gl_init_done_ = true;
+                    gl_out_w_ = dst_w;
+                    gl_out_h_ = dst_h;
+                    color_gl_.init(drm_fd_, dst_w, dst_h, cc_gain_, cc_offset_);
                 }
 
                 bool copied = false;
-                if (color_correct_.load(std::memory_order_relaxed) && color_gl_.ready()) {
-                    // GPU path: NV12 → corrected RGBA (shader) → NV12+resize (RGA CSC)
+                if (need_gl && color_gl_.ready()) {
+                    // Register current OSD buffer with the GL shader.
+                    if (osd_snap.prime_fd >= 0)
+                        color_gl_.set_osd(osd_snap.prime_fd,
+                                          osd_snap.width, osd_snap.height,
+                                          osd_snap.stride_px);
+                    else
+                        color_gl_.clear_osd();
+
+                    // GPU: NV12 → RGBA (shader: colorcorrect + OSD blend)
+                    //      → NV12 (RGA CSC, no resize — GBM BO is at output size)
                     copied = color_gl_.process(
                         mpp_buffer_get_fd(fresh.buffer),
                         fresh.width, fresh.height,
                         fresh.hor_stride, fresh.ver_stride,
                         mpp_buffer_get_fd(proc_copy_),
-                        dst_w, dst_h, dst_hs, dst_vs);
+                        dst_hs, dst_vs);
                 }
                 if (!copied) {
-                    // Fallback: RGA resize (or copy if same size)
+                    // ── RGA fallback: resize/copy + RGA OSD blend ────────
                     int rga_fmt = mpp_fmt_to_rga(fresh.fmt);
                     rga_buffer_t src_rga = wrapbuffer_fd_t(
                         mpp_buffer_get_fd(fresh.buffer),
@@ -208,6 +228,33 @@ void FrameProcessor::process_loop() {
                                          fresh.width, fresh.height, dst_w, dst_h);
                         }
                     }
+
+                    // RGA OSD blend fallback (3 ops: NV12→BGRA, blend, BGRA→NV12)
+                    if (osd_snap.prime_fd >= 0 && osd_snap.width > 0 && osd_snap.height > 0) {
+                        size_t bgra_sz = (size_t)dst_hs * dst_vs * 4;
+                        if (!blend_rgba_ || mpp_buffer_get_size(blend_rgba_) < bgra_sz) {
+                            if (blend_rgba_) { mpp_buffer_put(blend_rgba_); blend_rgba_ = nullptr; }
+                            mpp_buffer_get(hold_grp, &blend_rgba_, bgra_sz);
+                        }
+                        if (blend_rgba_) {
+                            rga_buffer_t nv12 = wrapbuffer_fd_t(
+                                mpp_buffer_get_fd(proc_copy_),
+                                dst_w, dst_h, dst_hs, dst_vs,
+                                RK_FORMAT_YCbCr_420_SP);
+                            rga_buffer_t bgra = wrapbuffer_fd_t(
+                                mpp_buffer_get_fd(blend_rgba_),
+                                dst_w, dst_h, dst_hs, dst_vs,
+                                RK_FORMAT_BGRA_8888);
+                            rga_buffer_t osd_rga = wrapbuffer_fd_t(
+                                osd_snap.prime_fd,
+                                osd_snap.width, osd_snap.height,
+                                osd_snap.stride_px, osd_snap.height,
+                                RK_FORMAT_BGRA_8888);
+                            imcvtcolor(nv12, bgra, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_BGRA_8888);
+                            imblend(osd_rga, bgra, IM_ALPHA_BLEND_SRC_OVER);
+                            imcvtcolor(bgra, nv12, RK_FORMAT_BGRA_8888, RK_FORMAT_YCbCr_420_SP);
+                        }
+                    }
                 }
                 proc_meta_.width      = dst_w;
                 proc_meta_.height     = dst_h;
@@ -217,44 +264,6 @@ void FrameProcessor::process_loop() {
                 proc_meta_.buffer     = nullptr;
             }
             fresh.release();  // decoder buffer is free again
-        }
-
-        if (!proc_copy_) continue;
-
-        // ── OSD blend on proc_copy_ ─────────────────────────────────────
-        {
-            OsdInfo osd_snap;
-            {
-                std::lock_guard<std::mutex> lock(osd_mtx_);
-                osd_snap = osd_info_;
-            }
-            if (osd_snap.prime_fd >= 0 && osd_snap.width > 0 && osd_snap.height > 0) {
-                size_t bgra_sz = (size_t)proc_meta_.hor_stride * proc_meta_.ver_stride * 4;
-                if (!blend_rgba_ || mpp_buffer_get_size(blend_rgba_) < bgra_sz) {
-                    if (blend_rgba_) { mpp_buffer_put(blend_rgba_); blend_rgba_ = nullptr; }
-                    mpp_buffer_get(hold_grp, &blend_rgba_, bgra_sz);
-                }
-                if (blend_rgba_) {
-                    rga_buffer_t nv12 = wrapbuffer_fd_t(
-                        mpp_buffer_get_fd(proc_copy_),
-                        proc_meta_.width, proc_meta_.height,
-                        proc_meta_.hor_stride, proc_meta_.ver_stride,
-                        RK_FORMAT_YCbCr_420_SP);
-                    rga_buffer_t bgra = wrapbuffer_fd_t(
-                        mpp_buffer_get_fd(blend_rgba_),
-                        proc_meta_.width, proc_meta_.height,
-                        proc_meta_.hor_stride, proc_meta_.ver_stride,
-                        RK_FORMAT_BGRA_8888);
-                    rga_buffer_t osd = wrapbuffer_fd_t(
-                        osd_snap.prime_fd,
-                        osd_snap.width, osd_snap.height,
-                        osd_snap.stride_px, osd_snap.height,
-                        RK_FORMAT_BGRA_8888);
-                    imcvtcolor(nv12, bgra, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_BGRA_8888);
-                    imblend(osd, bgra, IM_ALPHA_BLEND_SRC_OVER);
-                    imcvtcolor(bgra, nv12, RK_FORMAT_BGRA_8888, RK_FORMAT_YCbCr_420_SP);
-                }
-            }
         }
 
         // ── Publish: swap proc buffer into last_copy for the timer ──────
