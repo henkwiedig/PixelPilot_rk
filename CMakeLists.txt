@@ -68,6 +68,8 @@ set(SIMULATOR_SOURCES
         src/gsmenu/gs_system.c
         src/gsmenu/gs_actions.h
         src/gsmenu/gs_actions.c
+        src/gsmenu/gs_scripts.h
+        src/gsmenu/gs_scripts.c
         src/gsmenu/gs_connection_checker.h
         src/gsmenu/gs_connection_checker.c
         src/gsmenu/air_wfbng.h
@@ -126,6 +128,8 @@ set(LIB_SOURCE_FILES
         src/gsmenu/air_aalink.c
         src/gsmenu/gs_actions.h
         src/gsmenu/gs_actions.c
+        src/gsmenu/gs_scripts.h
+        src/gsmenu/gs_scripts.c
         src/gsmenu/gs_connection_checker.h
         src/gsmenu/gs_connection_checker.c
         src/gsmenu/styles.h

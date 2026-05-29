@@ -10,6 +10,7 @@
 #include <stddef.h>
 #include "../menu.h"
 #include "gs_actions.h"
+#include "gs_scripts.h"
 
 #ifdef USE_SIMULATOR
 void sig_handler(int exit_code)
@@ -38,7 +39,7 @@ void create_gs_actions_menu(lv_obj_t * parent) {
     menu_page_data_t* menu_page_data = malloc(sizeof(menu_page_data_t));
     strcpy(menu_page_data->type, "gs");
     strcpy(menu_page_data->page, "actions");
-    menu_page_data->page_load_callback = NULL;
+    menu_page_data->page_load_callback = gs_scripts_page_refresh;
     menu_page_data->indev_group = lv_group_create();
     lv_group_set_default(menu_page_data->indev_group);
     lv_obj_set_user_data(parent,menu_page_data);    
@@ -60,6 +61,8 @@ void create_gs_actions_menu(lv_obj_t * parent) {
         gs_custom_action = create_button(section, gsactions[i].label);
         lv_obj_add_event_cb(lv_obj_get_child_by_type(gs_custom_action,0,&lv_button_class),custom_actions_cb,LV_EVENT_CLICKED,&gsactions[i]);
     }
+
+    gs_scripts_init_in_page(parent, menu_page_data);
 
     lv_group_set_default(default_group);
 }
