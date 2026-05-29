@@ -25,18 +25,25 @@ void main() {
 }
 )GLSL";
 
-// Forward colortrans: y = clamp((x + offset) * gain, 0, 1).
-// samplerExternalOES lets the driver convert NV12 → RGB transparently.
+// Color-correct + OSD composite.
+// samplerExternalOES converts NV12 → RGB implicitly during sampling.
+// osd_tex is a plain RGBA texture (DRM_FORMAT_ARGB8888 imported as EGLImage).
+// has_osd: 1.0 = composite OSD, 0.0 = pass through (transparent OSD fallback).
 static const char* kFrag = R"GLSL(
 #extension GL_OES_EGL_image_external : require
 precision mediump float;
 varying vec2 v_uv;
 uniform samplerExternalOES tex;
+uniform sampler2D osd_tex;
 uniform float gain;
 uniform float offset;
+uniform float has_osd;
 void main() {
     vec3 c = texture2D(tex, v_uv).rgb;
-    gl_FragColor = vec4(clamp((c + offset) * gain, 0.0, 1.0), 1.0);
+    vec4 video = vec4(clamp((c + offset) * gain, 0.0, 1.0), 1.0);
+    vec4 osd = texture2D(osd_tex, v_uv);
+    float alpha = has_osd * osd.a;
+    gl_FragColor = vec4(alpha * osd.rgb + (1.0 - alpha) * video.rgb, 1.0);
 }
 )GLSL";
 
@@ -166,13 +173,24 @@ bool FrameColorCorrect::build_shader() {
     glDeleteShader(vs); glDeleteShader(fs);
     if (!prog_) return false;
 
-    loc_tex_    = glGetUniformLocation(prog_, "tex");
-    loc_gain_   = glGetUniformLocation(prog_, "gain");
-    loc_offset_ = glGetUniformLocation(prog_, "offset");
+    loc_tex_     = glGetUniformLocation(prog_, "tex");
+    loc_gain_    = glGetUniformLocation(prog_, "gain");
+    loc_offset_  = glGetUniformLocation(prog_, "offset");
+    loc_osd_tex_ = glGetUniformLocation(prog_, "osd_tex");
+    loc_has_osd_ = glGetUniformLocation(prog_, "has_osd");
     return true;
 }
 
 bool FrameColorCorrect::create_targets() {
+    // 1×1 fully-transparent texture used when no OSD is active.
+    glGenTextures(1, &osd_tex_gl_);
+    glBindTexture(GL_TEXTURE_2D, osd_tex_gl_);
+    const uint8_t transparent[4] = {0, 0, 0, 0};
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, transparent);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
     for (int i = 0; i < kTargets; i++) {
         Target& t = targets_[i];
 
@@ -232,8 +250,7 @@ bool FrameColorCorrect::create_targets() {
 
 bool FrameColorCorrect::process(int src_fd, uint32_t src_w, uint32_t src_h,
                                  uint32_t src_hs, uint32_t src_vs,
-                                 int dst_fd, uint32_t dst_w, uint32_t dst_h,
-                                 uint32_t dst_hs, uint32_t dst_vs)
+                                 int dst_fd, uint32_t dst_hs, uint32_t dst_vs)
 {
     // --- Import NV12 source as EGLImage (two-plane) -------------------------
     EGLint uv_offset = (EGLint)((size_t)src_hs * src_vs);
@@ -274,10 +291,17 @@ bool FrameColorCorrect::process(int src_fd, uint32_t src_w, uint32_t src_h,
     glBindFramebuffer(GL_FRAMEBUFFER, tgt.fbo);
     glViewport(0, 0, (GLsizei)width_, (GLsizei)height_);
 
+    // Bind OSD on texture unit 1.
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, osd_tex_gl_);
+
+    glActiveTexture(GL_TEXTURE0);
     glUseProgram(prog_);
-    glUniform1i(loc_tex_,    0);
-    glUniform1f(loc_gain_,   gain_);
-    glUniform1f(loc_offset_, offset_);
+    glUniform1i(loc_tex_,     0);
+    glUniform1i(loc_osd_tex_, 1);
+    glUniform1f(loc_gain_,    gain_);
+    glUniform1f(loc_offset_,  offset_);
+    glUniform1f(loc_has_osd_, osd_prime_fd_ >= 0 ? 1.0f : 0.0f);
 
     // Flip V so that top-origin NV12 memory maps to the top of the GL FB.
     const GLfloat verts[] = {
@@ -302,9 +326,10 @@ bool FrameColorCorrect::process(int src_fd, uint32_t src_w, uint32_t src_h,
     glDeleteTextures(1, &src_tex);
     eglDestroyImageKHR_(dpy_, src_img);
 
-    // --- RGA: convert RGBA target → NV12 destination -----------------------
-    // DRM_FORMAT_ARGB8888 is BGRA in memory on little-endian → RK_FORMAT_BGRA_8888
-    // When dst dimensions differ from src, RGA performs resize + CSC in one pass.
+    // --- RGA: CSC RGBA target → NV12 destination ---------------------------
+    // GBM BO is at output size (width_ × height_), dst is the same size,
+    // so this is pure colour-space conversion with no resize.
+    // DRM_FORMAT_ARGB8888 is BGRA in memory on little-endian → RK_FORMAT_BGRA_8888.
     rga_buffer_t src_rga = wrapbuffer_fd_t(
         tgt.prime_fd,
         (int)width_, (int)height_,
@@ -312,7 +337,7 @@ bool FrameColorCorrect::process(int src_fd, uint32_t src_w, uint32_t src_h,
         RK_FORMAT_BGRA_8888);
     rga_buffer_t dst_rga = wrapbuffer_fd_t(
         dst_fd,
-        (int)dst_w, (int)dst_h,
+        (int)width_, (int)height_,
         (int)dst_hs, (int)dst_vs,
         RK_FORMAT_YCbCr_420_SP);
 
@@ -324,7 +349,70 @@ bool FrameColorCorrect::process(int src_fd, uint32_t src_w, uint32_t src_h,
     return true;
 }
 
+void FrameColorCorrect::set_osd(int prime_fd, uint32_t w, uint32_t h, uint32_t stride_px)
+{
+    if (prime_fd == osd_prime_fd_ && w == osd_w_ && h == osd_h_)
+        return;  // same buffer — EGLImage still valid
+
+    // Release old EGLImage if any.
+    if (osd_img_ != EGL_NO_IMAGE_KHR) {
+        eglDestroyImageKHR_(dpy_, osd_img_);
+        osd_img_ = EGL_NO_IMAGE_KHR;
+    }
+
+    osd_prime_fd_ = prime_fd;
+    osd_w_        = w;
+    osd_h_        = h;
+    osd_stride_px_ = stride_px;
+
+    const EGLint osd_attrs[] = {
+        EGL_WIDTH,                      (EGLint)w,
+        EGL_HEIGHT,                     (EGLint)h,
+        EGL_LINUX_DRM_FOURCC_EXT,       (EGLint)DRM_FORMAT_ARGB8888,
+        EGL_DMA_BUF_PLANE0_FD_EXT,      prime_fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT,  0,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT,   (EGLint)(stride_px * 4),
+        EGL_NONE
+    };
+    osd_img_ = eglCreateImageKHR_(dpy_, EGL_NO_CONTEXT,
+                                  EGL_LINUX_DMA_BUF_EXT, nullptr, osd_attrs);
+    if (osd_img_ == EGL_NO_IMAGE_KHR) {
+        spdlog::warn("FrameCC: eglCreateImageKHR for OSD failed (0x{:x})", eglGetError());
+        osd_prime_fd_ = -1;
+        return;
+    }
+
+    // Re-bind the osd texture object to the new EGLImage.
+    glBindTexture(GL_TEXTURE_2D, osd_tex_gl_);
+    glEGLImageTargetTexture2DOES_(GL_TEXTURE_2D, osd_img_);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+}
+
+void FrameColorCorrect::clear_osd()
+{
+    if (osd_prime_fd_ < 0) return;
+    if (osd_img_ != EGL_NO_IMAGE_KHR) {
+        eglDestroyImageKHR_(dpy_, osd_img_);
+        osd_img_ = EGL_NO_IMAGE_KHR;
+    }
+    osd_prime_fd_ = -1;
+    // Restore the 1×1 transparent fallback.
+    const uint8_t transparent[4] = {0, 0, 0, 0};
+    glBindTexture(GL_TEXTURE_2D, osd_tex_gl_);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, transparent);
+}
+
 void FrameColorCorrect::destroy_targets() {
+    if (osd_img_ != EGL_NO_IMAGE_KHR) {
+        eglDestroyImageKHR_(dpy_, osd_img_); osd_img_ = EGL_NO_IMAGE_KHR;
+    }
+    osd_prime_fd_ = -1;
+    if (osd_tex_gl_) { glDeleteTextures(1, &osd_tex_gl_); osd_tex_gl_ = 0; }
+
     for (int i = 0; i < kTargets; i++) {
         Target& t = targets_[i];
         if (t.fbo)  { glDeleteFramebuffers(1, &t.fbo); t.fbo = 0; }
