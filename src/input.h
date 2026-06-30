@@ -12,6 +12,12 @@ typedef enum {
     GSMENU_CONTROL_MODE_KEYBOARD
 } gsmenu_control_mode_t;
 
+// Button input backend: gpio (libgpiod polling) or evdev (kernel input events).
+typedef enum {
+    INPUT_BACKEND_GPIO = 0,
+    INPUT_BACKEND_EVDEV
+} input_backend_t;
+
 
 #ifdef __cplusplus
 extern "C" {
@@ -35,6 +41,8 @@ static void virtual_keyboard_read(lv_indev_t * indev, lv_indev_data_t * data);
 // Function to create the virtual keyboard
 lv_indev_t * create_virtual_keyboard();
 
+// Tear down the active button backend (gpio or evdev).
+void cleanup_input(void);
 void cleanup_gpio(void);
 
 #ifdef __cplusplus
