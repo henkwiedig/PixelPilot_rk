@@ -112,7 +112,6 @@ uint32_t refresh_frequency_ms = 1000;
 
 VideoCodec codec = VideoCodec::H265;
 uint16_t listen_port = 5600;
-const char* unix_socket = NULL;
 char* dvr_template = NULL;
 Dvr *dvr_raw = NULL;
 Dvr *dvr_reenc_inst = NULL;
@@ -973,13 +972,9 @@ void main_loop() {
 }
 
 uint64_t first_frame_ms=0;
-void read_gstreamerpipe_stream(MppPacket *packet, int gst_udp_port, const char *sock ,const VideoCodec& codec){
-	if (sock) {
-		receiver = std::make_unique<GstRtpReceiver>(sock, codec);
-	} else {
-		receiver = std::make_unique<GstRtpReceiver>(gst_udp_port, codec);
-	}
-	long long bytes_received = 0; 
+void read_gstreamerpipe_stream(MppPacket *packet, int gst_udp_port, const VideoCodec& codec){
+	receiver = std::make_unique<GstRtpReceiver>(gst_udp_port, codec);
+	long long bytes_received = 0;
 	uint64_t period_start=0;
     auto cb=[&packet,/*&decoder_stalled_count,*/ &bytes_received, &period_start](std::shared_ptr<std::vector<uint8_t>> frame){
         // Let the gst pull thread run at quite high priority
@@ -1078,8 +1073,6 @@ void printHelp() {
     "    --config <configfile>  - Load pixelpilot config from file      (Default: /etc/pixelpilot.yaml)\n"
     "\n"
     "    -p <port>              - UDP port for RTP video stream         (Default: 5600)\n"
-    "\n"
-    "    --socket <socket>      - read data from socket\n"
     "\n"
     "    --mavlink-port <port>  - UDP port for mavlink telemetry        (Default: 14550)\n"
     "\n"
@@ -1183,11 +1176,6 @@ int main(int argc, char **argv)
 		continue;
 	}
 	
-	__OnArgument("--socket") {
-		unix_socket = const_cast<char*>(__ArgValue);
-		continue;
-	}
-
 	__OnArgument("--config") {
 		// Already handled above, just skip
 		config_file_path = const_cast<char*>(__ArgValue);
@@ -1712,7 +1700,7 @@ int main(int argc, char **argv)
 	}
 
 	////////////////////////////////////////////// MAIN LOOP
-    read_gstreamerpipe_stream((void**)packet, listen_port, unix_socket, codec);
+    read_gstreamerpipe_stream((void**)packet, listen_port, codec);
 
 	////////////////////////////////////////////// MPI CLEANUP
 
