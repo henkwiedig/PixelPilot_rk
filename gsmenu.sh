@@ -1,118 +1,60 @@
 #!/bin/bash
+#
+# gsmenu.sh — PixelPilot settings interface (BOILERPLATE / integrator template)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# PixelPilot's on-screen menu drives ALL configuration through this single
+# script. The command *interface* (the "get/set/button ..." strings matched in
+# the case statement below) is fixed: the OSD menu invokes these exact commands.
+#
+# The *implementation* — how a value is actually read from or written to the
+# air unit / ground station — depends entirely on the integrator's OS, firmware
+# and tooling (ssh, yaml-cli, nmcli, sysfs, config files, ...). That logic is
+# intentionally NOT provided here.
+#
+# This template ships with:
+#   • dummy getters  — print a placeholder current value (+ the allowed values
+#                      that the menu widget should offer).
+#   • no-op setters  — accept the new value ($5) and do nothing.
+#   • no-op buttons  — accept the action and do nothing.
+#
+# Integrators: replace the bodies below with real logic for your platform.
+#
+# ── Protocol ──────────────────────────────────────────────────────────────────
+#   get <path> :
+#       Print the current value on stdout (may be multi-line). For dropdown /
+#       slider widgets, follow it with the record separator (\x1e) and the list
+#       of allowed values, using emit_values / emit_values_cmd.
+#         emit_values "20\n40"        – static list
+#         emit_values "0 100"         – numeric range "min max"
+#         emit_values_cmd <cmd...>    – dynamic values from a command's stdout
+#   set <path> <value> :
+#       Apply <value> (positional parameter $5) to the setting.
+#   button <path> :
+#       Perform a one-shot action (reboot, reset, ...).
+#
+#   Exit 0 on success. Exit 1 is treated as "handled, ignore".
+# ══════════════════════════════════════════════════════════════════════════════
+
 set -o pipefail
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Configuration
+# Configuration (integrator: define endpoints / credentials / paths here)
 # ══════════════════════════════════════════════════════════════════════════════
 
 REMOTE_IP="${REMOTE_IP:-10.5.0.10}"
 AIR_FIRMWARE_TYPE="${AIR_FIRMWARE_TYPE:-wfb}"
-SSH_PASS="12345"
-CACHE_DIR="/tmp/gsmenu_cache"
-CACHE_TTL=10 # seconds
-MAJESTIC_YAML="/etc/majestic.yaml"
-WFB_YAML="/etc/wfb.yaml"
-ALINK_CONF="/etc/alink.conf"
-AALINK_CONF="/etc/aalink.conf"
-TXPROFILES_CONF="/etc/txprofiles.conf"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SSH / SCP setup
+# Protocol helpers (do not remove — used by the menu widgets)
 # ══════════════════════════════════════════════════════════════════════════════
 
-SSH="timeout -k 1 11 sshpass -p $SSH_PASS ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ControlMaster=auto -o ControlPath=/run/ssh_control:%h:%p:%r -o ControlPersist=15s -o ServerAliveInterval=3 -o ServerAliveCountMax=2 root@$REMOTE_IP"
-SCP="timeout -k 1 11 sshpass -p $SSH_PASS scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ControlMaster=auto -o ControlPath=/run/ssh_control:%h:%p:%r -o ControlPersist=15s -o ServerAliveInterval=3 -o ServerAliveCountMax=2"
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Helper functions
-# ══════════════════════════════════════════════════════════════════════════════
-
-mkdir -p "$CACHE_DIR"
-
-# Emit the record separator followed by allowed values (for dropdowns/sliders).
+# Emit the record separator followed by the allowed values (for dropdowns/sliders).
 # Called after the current value has been printed.
 #   emit_values "1\n20\n25\n30"        – static list / range
 #   emit_values_cmd <command> [args]   – dynamic values from a command
 emit_values()     { printf '\x1e'"$1"; }
 emit_values_cmd() { printf '\x1e'; "$@"; }
-
-# Refresh cached config files from the air unit (10s TTL)
-refresh_cache() {
-    local current_time=$(date +%s)
-    local last_refresh=$((current_time - CACHE_TTL))
-
-    if [[ ! -f "$CACHE_DIR/last_refresh" ]] || [[ $(cat "$CACHE_DIR/last_refresh") -lt $last_refresh ]]; then
-        $SCP root@$REMOTE_IP:$MAJESTIC_YAML root@$REMOTE_IP:$WFB_YAML root@$REMOTE_IP:$ALINK_CONF root@$REMOTE_IP:$TXPROFILES_CONF root@$REMOTE_IP:$AALINK_CONF $CACHE_DIR 2>/dev/null
-        echo "$current_time" > "$CACHE_DIR/last_refresh"
-    fi
-}
-
-get_majestic_value() {
-    local key="$1"
-    yaml-cli -i "$CACHE_DIR/majestic.yaml" -g "$key" 2>/dev/null
-}
-
-get_wfb_value() {
-    local key="$1"
-    yaml-cli -i "$CACHE_DIR/wfb.yaml" -g "$key" 2>/dev/null
-}
-
-get_alink_value() {
-    local key="$1"
-    grep $key= "$CACHE_DIR/alink.conf" | cut -d "=" -f 2 2>/dev/null
-}
-
-get_aalink_value() {
-    local key="$1"
-    grep ^$key= "$CACHE_DIR/aalink.conf" | cut -d "=" -f 2 2>/dev/null
-}
-
-# Helper: list available wifi channels (used by air and gs)
-list_wifi_channels() {
-    iw list | grep MHz | grep -v disabled | grep -v "radar detection" | grep \* | tr -d '[]' | awk '{print $4 " (" $2 " " $3 ")"}' | grep '^[1-9]' | sort -n | uniq | sed -z '$ s/\n$//'
-}
-
-# Add or update a network stanza in wpa_supplicant.conf.
-# Usage: wpa_conf_update_network <ssid> <psk>  (psk may be empty for open networks)
-wpa_conf_update_network() {
-    local ssid="$1"
-    local psk="$2"
-    local conf="/etc/wpa_supplicant.conf"
-    local tmpfile
-    tmpfile=$(mktemp)
-
-    # Remove any existing stanza for this SSID, then append the updated one
-    if [ -f "$conf" ]; then
-        awk -v ssid="$ssid" '
-            /network=\{/ { in_block=1; block="" }
-            in_block { block = block $0 "\n" }
-            in_block && /\}/ {
-                if (index(block, "ssid=\"" ssid "\"") == 0)
-                    printf "%s", block
-                in_block=0; block=""
-                next
-            }
-            !in_block { print }
-        ' "$conf" > "$tmpfile"
-    fi
-
-    if [ -z "$psk" ]; then
-        printf 'network={\n    ssid="%s"\n    key_mgmt=NONE\n}\n' "$ssid" >> "$tmpfile"
-    else
-        printf 'network={\n    ssid="%s"\n    psk="%s"\n}\n' "$ssid" "$psk" >> "$tmpfile"
-    fi
-    mv "$tmpfile" "$conf"
-}
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Cache refresh (only for air get commands)
-# ══════════════════════════════════════════════════════════════════════════════
-
-case "$@" in
-  "get air"*)
-    refresh_cache
-    ;;
-esac
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Main command dispatch
@@ -123,526 +65,309 @@ case "$@" in
 # ── Air: WFB-NG ─────────────────────────────────────────────────────────────
 
     "get air wfbng power")
-        get_wfb_value '.wireless.txpower'
+        echo 20                     # integrator: return current value
         emit_values "1\n20\n25\n30\n35\n40\n45\n50\n55\n58"
         ;;
     "get air wfbng air_channel")
-        channel=$(get_wfb_value '.wireless.channel' | tr -d '\n')
-        iw list | grep "\[$channel\]" | tr -d '[]' | awk '{print $4 " (" $2 " " $3 ")"}' | sort -n | uniq | tr -d '\n'
-        emit_values_cmd list_wifi_channels
+        echo "161"                  # integrator: return current channel
+        emit_values "36\n40\n44\n48\n149\n153\n157\n161\n165"
         ;;
     "get air wfbng width")
-        get_wfb_value '.wireless.width'
+        echo 20
         emit_values "20\n40"
         ;;
     "get air wfbng mcs_index")
-        get_wfb_value '.broadcast.mcs_index'
+        echo 0
         emit_values "0 10"
         ;;
     "get air wfbng stbc")
-        get_wfb_value '.broadcast.stbc'
+        echo 0
         ;;
     "get air wfbng ldpc")
-        get_wfb_value '.broadcast.ldpc'
+        echo 0
         ;;
     "get air wfbng fec_k")
-        get_wfb_value '.broadcast.fec_k'
+        echo 8
         emit_values "0 15"
         ;;
     "get air wfbng fec_n")
-        get_wfb_value '.broadcast.fec_n'
+        echo 12
         emit_values "0 15"
         ;;
     "get air wfbng mlink")
-        get_wfb_value '.wireless.mlink'
+        echo 1500
         emit_values "1500\n1600\n1700\n1800\n1900\n2000\n2100\n2200\n2300\n2400\n2500\n2600\n2700\n2800\n2900\n3000\n3100\n3200\n3300\n3400\n3500\n3600\n3700\n3800\n3900\n4000"
         ;;
     "get air wfbng adaptivelink")
-        $SSH grep ^alink_drone /etc/rc.local | grep -q 'alink_drone' && echo 1 || echo 0
+        echo 0
         ;;
 
-    "set air wfbng power"*)
-        $SSH wifibroadcast cli -s .wireless.txpower $5
-        $SSH "(wifibroadcast stop ;wifibroadcast stop; sleep 1;  wifibroadcast start) >/dev/null 2>&1 &"
-        ;;
-    "set air wfbng air_channel"*)
-        channel=$(echo $5 | awk '{print $1}')
-        $SSH wifibroadcast cli -s .wireless.channel $channel
-        $SSH "(wifibroadcast stop ;wifibroadcast stop; sleep 1;  wifibroadcast start) >/dev/null 2>&1 &"
-        sed -i "s/^wifi_channel =.*/wifi_channel = $channel/" /etc/wifibroadcast.cfg
-        systemctl restart wifibroadcast.service
-        ;;
-    "set air wfbng width"*)
-        $SSH wifibroadcast cli -s .wireless.width $5
-        $SSH "(wifibroadcast stop ;wifibroadcast stop; sleep 1;  wifibroadcast start) >/dev/null 2>&1 &"
-        ;;
-    "set air wfbng mcs_index"*)
-        $SSH wifibroadcast cli -s .broadcast.mcs_index $5
-        $SSH "(wifibroadcast stop ;wifibroadcast stop; sleep 1;  wifibroadcast start) >/dev/null 2>&1 &"
-        ;;
-    "set air wfbng stbc"*)
-        if [ "$5" = "on" ]; then
-            $SSH wifibroadcast cli -s .broadcast.stbc 1
-        else
-            $SSH wifibroadcast cli -s .broadcast.stbc 0
-        fi
-        $SSH "(wifibroadcast stop ;wifibroadcast stop; sleep 1;  wifibroadcast start) >/dev/null 2>&1 &"
-        ;;
-    "set air wfbng ldpc"*)
-        if [ "$5" = "on" ]; then
-            $SSH wifibroadcast cli -s .broadcast.ldpc 1
-        else
-            $SSH wifibroadcast cli -s .broadcast.ldpc 0
-        fi
-        $SSH "(wifibroadcast stop ;wifibroadcast stop; sleep 1;  wifibroadcast start) >/dev/null 2>&1 &"
-        ;;
-    "set air wfbng fec_k"*)
-        $SSH wifibroadcast cli -s .broadcast.fec_k $5
-        $SSH "(wifibroadcast stop ;wifibroadcast stop; sleep 1;  wifibroadcast start) >/dev/null 2>&1 &"
-        ;;
-    "set air wfbng fec_n"*)
-        $SSH wifibroadcast cli -s .broadcast.fec_n $5
-        $SSH "(wifibroadcast stop ;wifibroadcast stop; sleep 1;  wifibroadcast start) >/dev/null 2>&1 &"
-        ;;
-    "set air wfbng mlink"*)
-        $SSH wifibroadcast cli -s .wireless.mlink $5
-        $SSH "(wifibroadcast stop ;wifibroadcast stop; sleep 1;  wifibroadcast start) >/dev/null 2>&1 &"
-        ;;
-    "set air wfbng adaptivelink"*)
-        if [ "$5" = "on" ]; then
-            $SSH 'sed -i "/alink_drone &/d" /etc/rc.local && sed -i -e "\$i alink_drone &" /etc/rc.local && cli -s .video0.qpDelta -12 && killall -1 majestic && (nohup alink_drone >/dev/null 2>&1 &)'
-        else
-            $SSH 'killall -q -9 alink_drone;  sed -i "/alink_drone &/d" /etc/rc.local  ; cli -d .video0.qpDelta && killall -1 majestic'
-        fi
-        ;;
+    "set air wfbng power"*)         : ;; # integrator: apply $5
+    "set air wfbng air_channel"*)   : ;;
+    "set air wfbng width"*)         : ;;
+    "set air wfbng mcs_index"*)     : ;;
+    "set air wfbng stbc"*)          : ;;
+    "set air wfbng ldpc"*)          : ;;
+    "set air wfbng fec_k"*)         : ;;
+    "set air wfbng fec_n"*)         : ;;
+    "set air wfbng mlink"*)         : ;;
+    "set air wfbng adaptivelink"*)  : ;;
 
 # ── Air: Camera ──────────────────────────────────────────────────────────────
 
     "get air camera mirror")
-        [ "$(get_majestic_value '.image.mirror')" = "true" ] && echo 1 || echo 0
+        echo 0
         ;;
     "get air camera flip")
-        [ "$(get_majestic_value '.image.flip')" = "true" ] && echo 1 || echo 0
+        echo 0
         ;;
     "get air camera contrast")
-        get_majestic_value '.image.contrast'
+        echo 50
         emit_values "0 100"
         ;;
     "get air camera hue")
-        get_majestic_value '.image.hue'
+        echo 50
         emit_values "0 100"
         ;;
     "get air camera saturation")
-        get_majestic_value '.image.saturation'
+        echo 50
         emit_values "0 100"
         ;;
     "get air camera luminace")
-        get_majestic_value '.image.luminance'
+        echo 50
         emit_values "0 100"
         ;;
     "get air camera size")
-        get_majestic_value '.video0.size'
+        echo "1920x1080"
         emit_values "1280x720\n1456x816\n1920x1080\n1440x1080\n1920x1440\n2104x1184\n2208x1248\n2240x1264\n2312x1304\n2436x1828\n2512x1416\n2560x1440\n2560x1920\n2720x1528\n2944x1656\n3200x1800\n3840x2160"
         ;;
     "get air camera video_mode")
-        echo get_current_video_mode | nc -w 11 $REMOTE_IP 12355
+        echo "16:9 1080p 60"
         emit_values "16:9 720p 30\n\n16:9 720p 30 50HzAC\n16:9 1080p 30\n16:9 1080p 30 50HzAC\n16:9 1440p 30\n16:9 1440p 30 50HzAC\n16:9 4k 2160p 30\n16:9 4k 2160p 30 50HzAC\n16:9 540p 60\n16:9 540p 60 50HzAC\n16:9 720p 60\n16:9 720p 60 50HzAC\n16:9 1080p 60\n16:9 1080p 60 50HzAC\n16:9 1440p 60\n16:9 1440p 60 50HzAC\n16:9 1688p 60\n16:9 1688p 60 50HzAC\n16:9 540p 90\n16:9 540p 90 50HzAC\n16:9 720p 90\n16:9 720p 90 50HzAC\n16:9 1080p 90\n16:9 1080p 90 50HzAC\n16:9 540p 120\n16:9 720p 120\n16:9 816p 120\n4:3 720p 30\n4:3 720p 30 50HzAC\n4:3 960p 30\n4:3 960p 30 50HzAC\n4:3 1080p 30\n4:3 1080p 30 50HzAC\n4:3 1440p 30\n4:3 1440p 30 50HzAC\n4:3 2160p 30\n4:3 2160p 30 50HzAC\n4:3 720p 60\n4:3 720p 60 50HzAC\n4:3 960p 60\n4:3 960p 60 50HzAC\n4:3 1080p 60\n4:3 1080p 60 50HzAC\n4:3 1440p 60\n4:3 1440p 60 50HzAC\n4:3 1688p 60\n4:3 1688p 60 50HzAC\n4:3 720p 90\n4:3 720p 90 50HzAC\n4:3 960p 90\n4:3 960p 90 50HzAC\n4:3 1080p 90\n4:3 1080p 90 50HzAC\n4:3 540p 120\n4:3 720p 120\n4:3 816p 120"
         ;;
     "get air camera fps")
-        get_majestic_value '.video0.fps'
+        echo 60
         emit_values "60\n90\n120"
         ;;
     "get air camera bitrate")
-        get_majestic_value '.video0.bitrate'
+        echo 8192
         emit_values "1024\n2048\n3072\n4096\n5120\n6144\n7168\n8192\n9216\n10240\n11264\n12288\n13312\n14336\n15360\n16384\n17408\n18432\n19456\n20480\n21504\n22528\n23552\n24576\n25600\n26624\n27648\n28672\n29692\n30720"
         ;;
     "get air camera codec")
-        get_majestic_value '.video0.codec'
+        echo h265
         emit_values "h264\nh265"
         ;;
     "get air camera gopsize")
-        get_majestic_value '.video0.gopSize'
+        echo 1
         emit_values "0 10"
         ;;
     "get air camera rc_mode")
-        get_majestic_value '.video0.rcMode'
+        echo cbr
         emit_values "vbr\navbr\ncbr"
         ;;
     "get air camera rec_enable")
-        [ "$(get_majestic_value '.records.enabled')" = "true" ] && echo 1 || echo 0
+        echo 0
         ;;
     "get air camera rec_split")
-        get_majestic_value '.records.split'
+        echo 5
         emit_values "0 60"
         ;;
     "get air camera rec_maxusage")
-        get_majestic_value '.records.maxUsage'
+        echo 90
         emit_values "0 100"
         ;;
     "get air camera exposure")
-        get_majestic_value '.isp.exposure'
+        echo 12
         emit_values "5 50"
         ;;
     "get air camera antiflicker")
-        get_majestic_value '.isp.antiFlicker'
+        echo disabled
         emit_values "disabled\n50\n60"
         ;;
     "get air camera sensor_file")
-        basename -s .bin $(basename $(get_majestic_value '.isp.sensorConfig'))
+        echo imx415_fpv
         emit_values "imx307\nimx335\nimx335_fpv\nimx415_fpv\nimx415_fpv\nimx415_milos10\nimx415_milos15\nimx335_milos12tweak\nimx335_greg15\nimx335_spike5\ngregspike05"
         ;;
     "get air camera fpv_enable")
-        get_majestic_value '.fpv.enabled' | grep -q true && echo 1 || echo 0
+        echo 0
         ;;
     "get air camera noiselevel")
-        get_majestic_value '.fpv.noiseLevel'
+        echo 0
         emit_values "0 1"
         ;;
 
-    "set air camera mirror"*)
-        if [ "$5" = "on" ]; then
-            $SSH 'cli -s .image.mirror true && killall -1 majestic'
-        else
-            $SSH 'cli -s .image.mirror false && killall -1 majestic'
-        fi
-        ;;
-    "set air camera flip"*)
-        if [ "$5" = "on" ]; then
-            $SSH 'cli -s .image.flip true && killall -1 majestic'
-        else
-            $SSH 'cli -s .image.flip false && killall -1 majestic'
-        fi
-        ;;
-    "set air camera contrast"*)
-        $SSH "cli -s .image.contrast $5 && killall -1 majestic"
-        ;;
-    "set air camera hue"*)
-        $SSH "cli -s .image.hue $5 && killall -1 majestic"
-        ;;
-    "set air camera saturation"*)
-        $SSH "cli -s .image.saturation $5 && killall -1 majestic"
-        ;;
-    "set air camera luminace"*)
-        $SSH "cli -s .image.luminance $5 && killall -1 majestic"
-        ;;
-    "set air camera size"*)
-        $SSH "cli -s .video0.size $5 && killall -1 majestic"
-        ;;
-    "set air camera video_mode"*)
-        echo set_simple_video_mode "$5" | nc -w 11 $REMOTE_IP 12355
-        ;;
-    "set air camera fps"*)
-        $SSH "cli -s .video0.fps $5 && killall -1 majestic"
-        ;;
-    "set air camera bitrate"*)
-        $SSH "cli -s .video0.bitrate $5 && killall -1 majestic"
-        ;;
-    "set air camera codec"*)
-        $SSH "cli -s .video0.codec $5 && killall -1 majestic"
-        ;;
-    "set air camera gopsize"*)
-        $SSH "cli -s .video0.gopSize $5 && killall -1 majestic"
-        ;;
-    "set air camera rc_mode"*)
-        $SSH "cli -s .video0.rcMode $5 && killall -1 majestic"
-        ;;
-    "set air camera rec_enable"*)
-        if [ "$5" = "on" ]; then
-            $SSH 'cli -s .records.enable true && killall -1 majestic'
-        else
-            $SSH 'cli -s .records.enable false && killall -1 majestic'
-        fi
-        ;;
-    "set air camera rec_split"*)
-        $SSH "cli -s .records.split $5 && killall -1 majestic"
-        ;;
-    "set air camera rec_maxusage"*)
-        $SSH "cli -s .records.maxUsage $5 && killall -1 majestic"
-        ;;
-    "set air camera exposure"*)
-        $SSH "cli -s .isp.exposure $5 && killall -1 majestic"
-        ;;
-    "set air camera antiflicker"*)
-        $SSH "cli -s .isp.antiFlicker $5 && killall -1 majestic"
-        ;;
-    "set air camera sensor_file"*)
-        $SSH "cli -s .isp.sensorConfig /etc/sensors/${5}.bin && killall -1 majestic"
-        ;;
-    "set air camera fpv_enable"*)
-        if [ "$5" = "on" ]; then
-            $SSH 'cli -s .fpv.enabled true && killall -1 majestic'
-        else
-            $SSH 'cli -s .fpv.enabled false && killall -1 majestic'
-        fi
-        ;;
-    "set air camera noiselevel"*)
-        $SSH "cli -s .fpv.noiseLevel $5 && killall -1 majestic"
-        ;;
+    "set air camera mirror"*)       : ;;
+    "set air camera flip"*)         : ;;
+    "set air camera contrast"*)     : ;;
+    "set air camera hue"*)          : ;;
+    "set air camera saturation"*)   : ;;
+    "set air camera luminace"*)     : ;;
+    "set air camera size"*)         : ;;
+    "set air camera video_mode"*)   : ;;
+    "set air camera fps"*)          : ;;
+    "set air camera bitrate"*)      : ;;
+    "set air camera codec"*)        : ;;
+    "set air camera gopsize"*)      : ;;
+    "set air camera rc_mode"*)      : ;;
+    "set air camera rec_enable"*)   : ;;
+    "set air camera rec_split"*)    : ;;
+    "set air camera rec_maxusage"*) : ;;
+    "set air camera exposure"*)     : ;;
+    "set air camera antiflicker"*)  : ;;
+    "set air camera sensor_file"*)  : ;;
+    "set air camera fpv_enable"*)   : ;;
+    "set air camera noiselevel"*)   : ;;
 
 # ── Air: Telemetry ───────────────────────────────────────────────────────────
 
     "get air telemetry serial")
-        if [ $AIR_FIRMWARE_TYPE = "wfb" ]; then
-            $SSH wifibroadcast cli -g .telemetry.serial
-        elif [ $AIR_FIRMWARE_TYPE = "apfpv" ]; then
-            tty=$($SSH "fw_printenv -n msposd_tty")
-            if [ ! -z $tty ]; then
-                basename "$tty"
-            else
-                echo ttyS2
-            fi
-        fi
+        echo ttyS2
         emit_values "ttyS0\nttyS1\nttyS2\nttyS3"
         ;;
     "get air telemetry router")
-        $SSH wifibroadcast cli -g .telemetry.router
+        echo msposd
         emit_values "mavfwd\nmsposd"
         ;;
     "get air telemetry osd_fps")
-        $SSH wifibroadcast cli -g .telemetry.osd_fps
+        echo 30
         emit_values "0 60"
         ;;
     "get air telemetry gs_rendering")
-        $SSH 'grep "\-z \"\$size\"" /usr/bin/wifibroadcast' | grep -q size && echo 0 || echo 1
+        echo 0
         ;;
 
-    "set air telemetry serial"*)
-        if [ "$5" = "ttyS0" ]; then
-          $SSH "sed -i 's/^console::respawn:\/sbin\/getty -L console 0 vt100/#console::respawn:\/sbin\/getty -L console 0 vt100/' /etc/inittab ; kill -HUP 1"
-        else
-          $SSH "sed -i 's/^#console::respawn:\/sbin\/getty -L console 0 vt100/console::respawn:\/sbin\/getty -L console 0 vt100/' /etc/inittab ; kill -HUP 1"
-        fi
-        if [ $AIR_FIRMWARE_TYPE = "wfb" ]; then
-            $SSH wifibroadcast cli -s .telemetry.serial $5
-            $SSH "(wifibroadcast stop ;wifibroadcast stop; sleep 1;  wifibroadcast start) >/dev/null 2>&1 &"
-        elif [ $AIR_FIRMWARE_TYPE = "apfpv" ]; then
-            $SSH "fw_setenv msposd_tty /dev/$5; /etc/init.d/S99msposd stop ; /etc/init.d/S99msposd stop ; sleep 1; /etc/init.d/S99msposd start"
-        fi
-        ;;
-    "set air telemetry router"*)
-        $SSH wifibroadcast cli -s .telemetry.router $5
-        $SSH "(wifibroadcast stop ;wifibroadcast stop; sleep 1;  wifibroadcast start) >/dev/null 2>&1 &"
-        ;;
-    "set air telemetry osd_fps"*)
-        $SSH wifibroadcast cli -s .telemetry.osd_fps $5
-        $SSH "(wifibroadcast stop ;wifibroadcast stop; sleep 1;  wifibroadcast start) >/dev/null 2>&1 &"
-        ;;
-    "set air telemetry gs_rendering"*)
-        if [ "$5" = "on" ]; then
-            $SSH 'sed -i "s/-o 127\.0\.0\.1:\"\$port_tx\" -z \"\$size\"/-o 10\.5\.0\.1:\"\$port_tx\"/" /usr/bin/wifibroadcast'
-            $SSH "(wifibroadcast stop ;wifibroadcast stop; sleep 1;  wifibroadcast start) >/dev/null 2>&1 &"
-        else
-            $SSH 'sed -i "s/-o 10\.5\.0\.1:\"\$port_tx\"/-o 127\.0\.0\.1:\"\$port_tx\" -z \"\$size\"/" /usr/bin/wifibroadcast'
-            $SSH "(wifibroadcast stop ;wifibroadcast stop; sleep 1;  wifibroadcast start) >/dev/null 2>&1 &"
-        fi
-        ;;
+    "set air telemetry serial"*)        : ;;
+    "set air telemetry router"*)        : ;;
+    "set air telemetry osd_fps"*)       : ;;
+    "set air telemetry gs_rendering"*)  : ;;
 
 # ── Air: Alink ───────────────────────────────────────────────────────────────
 
     "get air alink power_level_0_to_4")
-        get_alink_value power_level_0_to_4
+        echo 1
         emit_values "0\n1\n2\n3\n4"
         ;;
     "get air alink fallback_ms")
-        get_alink_value fallback_ms
+        echo 1000
         emit_values "1 2000"
         ;;
     "get air alink hold_fallback_mode_s")
-        get_alink_value hold_fallback_mode_s
+        echo 2
         emit_values "1 10"
         ;;
     "get air alink min_between_changes_ms")
-        get_alink_value min_between_changes_ms
+        echo 100
         emit_values "1 10000"
         ;;
     "get air alink hold_modes_down_s")
-        get_alink_value hold_modes_down_s
+        echo 2
         emit_values "1 10"
         ;;
     "get air alink hysteresis_percent")
-        get_alink_value hysteresis_percent
+        echo 10
         emit_values "0 100"
         ;;
     "get air alink hysteresis_percent_down")
-        get_alink_value hysteresis_percent_down
+        echo 10
         emit_values "0 100"
         ;;
     "get air alink exp_smoothing_factor")
-        get_alink_value exp_smoothing_factor
+        echo 0.8
         emit_values "0 1.6"
         ;;
     "get air alink exp_smoothing_factor_down")
-        get_alink_value exp_smoothing_factor_down
+        echo 0.8
         emit_values "0 1.6"
         ;;
     "get air alink check_xtx_period_ms")
-        get_alink_value check_xtx_period_ms
+        echo 100
         emit_values "1 5000"
         ;;
     "get air alink request_keyframe_interval_ms")
-        get_alink_value request_keyframe_interval_ms
+        echo 1000
         emit_values "1 5000"
         ;;
     "get air alink osd_level")
-        get_alink_value osd_level
+        echo 2
         emit_values "0\n1\n2\n3\n4\n5\n6"
         ;;
     "get air alink multiply_font_size_by")
-        get_alink_value multiply_font_size_by
+        echo 1.0
         emit_values "0 1.5"
         ;;
     "get air alink"*)
-        get_alink_value $4
+        echo ""                     # integrator: return current value for $4
         ;;
 
-    "set air alink"*)
-        if [ "$5" = "off" ]; then
-            $SSH 'sed -i "s/'$4'=.*/'$4'=0/" /etc/alink.conf; killall -9 alink_drone ; alink_drone &'
-        elif [ "$5" = "on" ]; then
-            $SSH 'sed -i "s/'$4'=.*/'$4'=1/" /etc/alink.conf; killall -9 alink_drone ; alink_drone &'
-        elif [ "$4" = "txprofiles" ]; then
-            $SCP $CACHE_DIR/txprofiles.conf root@$REMOTE_IP:$TXPROFILES_CONF
-            $SSH 'killall -9 alink_drone ; alink_drone &'
-        else
-            $SSH 'sed -i "s/'$4'=.*/'$4'='$5'/" /etc/alink.conf; killall -9 alink_drone ; alink_drone &'
-        fi
-        ;;
+    "set air alink"*)               : ;;
 
 # ── Air: Aalink ──────────────────────────────────────────────────────────────
 
     "get air aalink SHOW_SIGNAL_BARS")
-        [ "$(get_aalink_value 'SHOW_SIGNAL_BARS')" = "true" ] && echo 1 || echo 0
+        echo 0
         ;;
     "get air aalink channel")
-        $SSH "fw_printenv -n wlanchan || echo 157"
+        echo 157
         emit_values "36\n40\n44\n48\n52\n56\n60\n64\n100\n104\n108\n112\n116\n120\n124\n128\n132\n136\n140\n144\n149\n153\n157\n161\n165\n36_40\n44_48\n52_56\n60_64\n100_104\n108_112\n116_120\n124_128\n132_136\n140_144\n149_153\n157_161"
         ;;
     "get air aalink SCALE_TX_POWER")
-        get_aalink_value SCALE_TX_POWER
+        echo 1.0
         emit_values "0.2 1.2"
         ;;
     "get air aalink THRESH_SHIFT")
-        get_aalink_value THRESH_SHIFT
+        echo 0
         emit_values "-50 50"
         ;;
     "get air aalink OSD_SCALE")
-        get_aalink_value OSD_SCALE
+        echo 1.0
         emit_values "0.2 2"
         ;;
     "get air aalink OSD_LEVEL")
-        get_aalink_value OSD_LEVEL
+        echo 1
         emit_values "0\n1\n2\n3"
         ;;
     "get air aalink THROUGHPUT_PCT")
-        get_aalink_value THROUGHPUT_PCT
+        echo 100
         emit_values "0 100"
         ;;
     "get air aalink HIGH_TEMP")
-        get_aalink_value HIGH_TEMP
+        echo 85
         emit_values "70 100"
         ;;
     "get air aalink MCS_SOURCE")
-        get_aalink_value MCS_SOURCE
+        echo downlink
         emit_values "lowest\ndownlink"
         ;;
     "get air aalink"*)
-        get_aalink_value $4
+        echo ""                     # integrator: return current value for $4
         ;;
 
-    "set air aalink channel"*)
-        echo "set_ap_channel $5" | nc -w 11 $REMOTE_IP 12355
-        ;;
-    "set air aalink SHOW_SIGNAL_BARS"*)
-        case "$5" in
-        on|true|1|yes)  val=true  ;;
-        *)              val=false ;;
-        esac
-        $SSH "sed -i 's/^SHOW_SIGNAL_BARS=.*/SHOW_SIGNAL_BARS=$val/' /etc/aalink.conf && kill -SIGHUP \$(pidof aalink)"
-        ;;
-    "set air aalink"*)
-        $SSH 'sed -i "s/'$4'=.*/'$4'='$5'/" /etc/aalink.conf; kill -SIGHUP $(pidof aalink)'
-        ;;
+    "set air aalink channel"*)          : ;;
+    "set air aalink SHOW_SIGNAL_BARS"*) : ;;
+    "set air aalink"*)                  : ;;
 
 # ── GS: WFB-NG ──────────────────────────────────────────────────────────────
 
     "get gs wfbng gs_channel")
-        channel=$(grep wifi_channel /etc/wifibroadcast.cfg | cut -d ' ' -f 3)
-        iw list | grep "\[$channel\]" | tr -d '[]' | awk '{print $4 " (" $2 " " $3 ")"}' | sort -n | uniq
-        emit_values_cmd list_wifi_channels
+        echo "161"                  # integrator: return current channel
+        emit_values "36\n40\n44\n48\n149\n153\n157\n161\n165"
         ;;
     "get gs wfbng bandwidth")
-        grep ^bandwidth /etc/wifibroadcast.cfg | cut -d ' ' -f 3
+        echo 20
         emit_values "20\n40"
         ;;
     "get gs wfbng txpower")
-        wifi_txpower=$(grep ^wifi_txpower /etc/wifibroadcast.cfg)
-        if [ -z "$wifi_txpower" ]; then
-            echo "50"
-        else
-            read first_card first_card_power < <(
-                echo "$wifi_txpower" | cut -d = -f 2 | jq -r '"\(to_entries[0].key) \(to_entries[0].value)"'
-            )
-            first_card_type=$(udevadm info /sys/class/net/${first_card}/ | grep -E 'ID_NET_DRIVER=(rtl88xxau_wfb|rtl88x2eu)'| cut -d = -f2)
-            case "$first_card_type" in
-            "rtl88xxau_wfb") min_phy_txpower=-1000; max_phy_txpower=-3000 ;;
-            "rtl88x2eu")     min_phy_txpower=1000;  max_phy_txpower=2900  ;;
-            esac
-            range=$((max_phy_txpower - min_phy_txpower))
-            position=$((first_card_power - min_phy_txpower))
-            percentage=$(( (position * 100) / range ))
-            echo $percentage
-        fi
+        echo 50
         emit_values "1\n100"
         ;;
     "get gs wfbng adaptivelink")
-        systemctl is-active --quiet alink_gs.service && echo 1 || echo 0
+        echo 0
         ;;
 
-    "set gs wfbng gs_channel"*)
-        channel=$(echo $5 | awk '{print $1}')
-        if [ "$GSMENU_VTX_DETECTED" -eq "1" ]; then
-            $SSH wifibroadcast cli -s .wireless.channel $channel
-            $SSH "(wifibroadcast stop ;wifibroadcast stop; sleep 1;  wifibroadcast start) >/dev/null 2>&1 &"
-        fi
-        sed -i "s/^wifi_channel =.*/wifi_channel = $channel/" /etc/wifibroadcast.cfg
-        systemctl restart wifibroadcast.service
-        ;;
-    "set gs wfbng bandwidth"*)
-        sed -i "s/^bandwidth = .*/bandwidth = $5/" /etc/wifibroadcast.cfg
-        systemctl restart wifibroadcast.service
-        ;;
-    "set gs wfbng txpower"*)
-        .  /etc/default/wifibroadcast
-        wifi_txpower=""
-        for nic in $WFB_NICS
-        do
-            card_type=$(udevadm info /sys/class/net/${nic}/ | grep -E 'ID_NET_DRIVER=(rtl88xxau_wfb|rtl88x2eu)'| cut -d = -f2)
-            case "$card_type" in
-            "rtl88xxau_wfb") min_phy_txpower=-1000; max_phy_txpower=-3000 ;;
-            "rtl88x2eu")     min_phy_txpower=1000;  max_phy_txpower=2900  ;;
-            esac
-            range=$((max_phy_txpower - min_phy_txpower))
-            percentage=$5
-            power_value=$(( min_phy_txpower + (percentage * range) / 100 ))
-            [ ! -z "$wifi_txpower" ] && wifi_txpower=$wifi_txpower,
-            wifi_txpower=$wifi_txpower" \"$nic\": $power_value"
-        done
-        if ! grep -A 20 "\[common\]" /etc/wifibroadcast.cfg | grep -q "^wifi_txpower = "; then
-            sed -i "/^\[common\]/a\wifi_txpower = {$wifi_txpower}" /etc/wifibroadcast.cfg
-        else
-            sed -i "s/^wifi_txpower = .*/wifi_txpower = {$wifi_txpower}/" /etc/wifibroadcast.cfg
-        fi
-        systemctl restart wifibroadcast.service
-        ;;
-    "set gs wfbng adaptivelink"*)
-        if [ "$5" = "on" ]; then
-            systemctl start alink_gs.service
-            systemctl enable alink_gs.service
-        else
-            systemctl stop alink_gs.service
-            systemctl disable alink_gs.service
-        fi
-        ;;
+    "set gs wfbng gs_channel"*)     : ;;
+    "set gs wfbng bandwidth"*)      : ;;
+    "set gs wfbng txpower"*)        : ;;
+    "set gs wfbng adaptivelink"*)   : ;;
 
 # ── GS: System ──────────────────────────────────────────────────────────────
 
@@ -651,398 +376,150 @@ case "$@" in
         emit_values "h265"
         ;;
     "get gs system rx_mode")
-        systemctl is-enabled --quiet wifibroadcast && echo wfb || echo apfpv
+        echo wfb
         emit_values "wfb\napfpv"
         ;;
     "get gs system gs_rendering")
-        [ "$(grep ^render /config/setup.txt | cut -d ' ' -f 3)" = "ground" ] && echo 1 || echo 0
+        echo 0
         ;;
     "get gs system connector")
         echo HDMI
         emit_values "HDMI"
         ;;
     "get gs system resolution")
-        drm_info -j /dev/dri/card0 2>/dev/null | jq -r '."/dev/dri/card0".crtcs[0].mode| .name + "@" + (.vrefresh|tostring)'
-        printf '\x1e'
-        drm_info -j /dev/dri/card0 2>/dev/null | jq -r '."/dev/dri/card0".connectors[1].modes[] | select(.name | contains("i") | not) | .name + "@" + (.vrefresh|tostring)' | sort | uniq | sed -z '$ s/\n$//'
+        echo "1920x1080@60"
+        emit_values "1280x720@60\n1920x1080@60\n2560x1440@60\n3840x2160@60"
         ;;
     "get gs system video_scale")
-        grep "^video_scale =" /config/setup.txt | cut -d '=' -f2 | xargs
+        echo 1.0
         emit_values "0.5 1.0"
         ;;
     "get gs system rec_fps")
-        grep ^rec_fps /config/setup.txt | cut -d ' ' -f 3
+        echo 60
         emit_values "60\n90\n120"
-        ;;
-
-    "set gs system rx_codec"*)
-        : # noop
-        ;;
-    "set gs system rx_mode"*)
-        EXCLUDE_IFACE="wlan0"
-        SSID="${6:-OpenIPC}"
-        PASSWORD="${7:-12345678}"
-        if [ "$5" = "apfpv" ]; then
-            systemctl stop alink_gs.service
-            systemctl stop wifibroadcast.service
-            systemctl stop wifibroadcast@gs.service
-            systemctl disable wifibroadcast.service
-            systemctl disable wifibroadcast@gs.service
-            systemctl disable alink_gs.service
-            rmmod 8812eu
-            rmmod 88XXau_wfb
-            modprobe 8812eu
-            modprobe 88XXau_wfb
-            WIFI_IFACES=$(ip -o link show | awk -F': ' '{print $2}' | grep '^wlx' | grep -v "^$EXCLUDE_IFACE$")
-            INDEX=0
-            for IFACE in $WIFI_IFACES; do
-                nmcli device set $IFACE managed yes
-                CONN_NAME="apfpv$INDEX"
-                if nmcli connection show "$CONN_NAME" &>/dev/null; then
-                    nmcli connection modify "$CONN_NAME" connection.autoconnect $([ "$INDEX" -eq 0 ] && echo "yes" || echo "no")
-                else
-                    nmcli device wifi rescan ifname "$IFACE"
-                    sleep 2
-                    nmcli connection add type wifi ifname "$IFACE" con-name "$CONN_NAME" ssid "$SSID" \
-                        wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$PASSWORD" \
-                        ipv4.method auto connection.autoconnect $([ "$INDEX" -eq 0 ] && echo "yes" || echo "no")
-                fi
-                nmcli connection modify "$CONN_NAME" ipv4.route-metric $((100 * (INDEX + 1)))
-                INDEX=$((INDEX + 1))
-            done
-            ln -s /usr/local/bin/gsmenu.sh /etc/NetworkManager/dispatcher.d/
-            nmcli -w 0 connection up apfpv0
-        elif [ "$5" = "wfb" ]; then
-            rm /etc/NetworkManager/dispatcher.d/gsmenu.sh
-            WIFI_IFACES=$(ip -o link show | awk -F': ' '{print $2}' | grep -E '^wlx' | grep -v "^$EXCLUDE_IFACE$")
-            INDEX=0
-            for IFACE in $WIFI_IFACES; do
-                CONN_NAME="apfpv$INDEX"
-                if nmcli connection show "$CONN_NAME" &>/dev/null; then
-                    nmcli connection modify "$CONN_NAME" connection.autoconnect no
-                    nmcli connection down "$IFACE"
-                fi
-                INDEX=$((INDEX + 1))
-            done
-            rmmod 8812eu
-            rmmod 88XXau_wfb
-            modprobe 8812eu
-            modprobe 88XXau_wfb
-            systemctl start wifibroadcast.service
-            systemctl start wifibroadcast@gs.service
-            systemctl start alink_gs.service
-            systemctl enable wifibroadcast.service
-            systemctl enable wifibroadcast@gs.service
-            systemctl enable alink_gs.service
-        fi
-        ;;
-    "set gs system gs_rendering"*)
-        if [ "$5" = "off" ]; then
-            sed -i 's/^render =.*/render = air/' /config/setup.txt
-            kill -9 $(pidof msposd_rockchip)
-        else
-            sed -i 's/^render =.*/render = ground/' /config/setup.txt
-            msposd_rockchip --osd --ahi 0 --matrix 11 -v -r 5 --master 0.0.0.0:14551 &
-        fi
-        ;;
-    "set gs system connector"*)
-        : # noop
-        ;;
-    "set gs system resolution"*)
-        sed -i "s/^screen_mode =.*/screen_mode = $5/" /config/setup.txt
-        ;;
-    "set gs system video_scale"*)
-        sed -i "s/^video_scale =.*/video_scale = $5/" /config/setup.txt
-        ;;
-    "set gs system rec_fps"*)
-        sed -i "s/^rec_fps =.*/rec_fps = $5/" /config/setup.txt
-        ;;
-    "set gs system rec_enabled"*)
-        if [ "$5" = "off" ]; then
-            : #noop
-        else
-            : #noop
-        fi
         ;;
     "get gs system dvr_mode"*)
         echo "raw"
         emit_values "raw\nreencode\nboth"
         ;;
-    "set gs system dvr_mode"*)
-        : # noop
-        ;;
     "get gs system dvr_max_size"*)
-        echo -n "40" # will be multiplied by 100
+        echo -n "40"                # will be multiplied by 100
         emit_values "1 40"
-        ;;
-    "set gs system dvr_max_size"*)
-        : # noop needs division by 100
         ;;
     "get gs system dvr_reenc_codec"*)
         echo -n "h264"
         emit_values "h264\nh265"
         ;;
-    "set gs system dvr_reenc_codec"*)
-        : # noop
-        ;;
     "get gs system dvr_reenc_resolution"*)
         echo -n "1080p"
         emit_values "720p\n1080p"
-        ;;
-    "set gs system dvr_reenc_resolution"*)
-        : # noop
         ;;
     "get gs system dvr_reenc_fps"*)
         echo -n "60"
         emit_values "30\n60"
         ;;
-    "set gs system dvr_reenc_fps"*)
-        : # noop
-        ;;
     "get gs system dvr_reenc_bitrate"*)
         echo -n "10000"
         emit_values "5000\n10000\n15000\n20000\n25000\n30000\n35000\n40000\n45000\n50000"
         ;;
-    "set gs system dvr_reenc_bitrate"*)
-        : # noop
-        ;;
-    "set gs system dvr_osd"*)
-        : # noop
-        ;;
+
+    "set gs system rx_codec"*)              : ;;
+    "set gs system rx_mode"*)               : ;;
+    "set gs system gs_rendering"*)          : ;;
+    "set gs system connector"*)             : ;;
+    "set gs system resolution"*)            : ;;
+    "set gs system video_scale"*)           : ;;
+    "set gs system rec_fps"*)               : ;;
+    "set gs system rec_enabled"*)           : ;;
+    "set gs system dvr_mode"*)              : ;;
+    "set gs system dvr_max_size"*)          : ;; # needs division by 100
+    "set gs system dvr_reenc_codec"*)       : ;;
+    "set gs system dvr_reenc_resolution"*)  : ;;
+    "set gs system dvr_reenc_fps"*)         : ;;
+    "set gs system dvr_reenc_bitrate"*)     : ;;
+    "set gs system dvr_osd"*)               : ;;
 
 # ── GS: APFPV ───────────────────────────────────────────────────────────────
 
     "get gs apfpv ssid")
-        nmcli  c show apfpv0 | grep "802-11-wireless.ssid" | cut -d : -f2 | awk ' {print $1}'
+        echo "OpenIPC"
         ;;
     "get gs apfpv password")
-        nmcli -t connection show apfpv0 --show-secrets | grep 802-11-wireless-security.psk: | cut -d : -f2
+        echo "12345678"
         ;;
     "get gs apfpv wlx"*)
-        grep -q autoconnect=false $(grep -l $4 /etc/NetworkManager/system-connections/apfpv*.nmconnection) && echo 0 || echo 1
+        echo 0
         ;;
     "get gs apfpv status wlx"*)
-        nmcli -t device status | grep $5 | grep -q :connected: && echo Connected || echo Disconnected
+        echo Disconnected
         ;;
 
-    "set gs apfpv ssid"*)
-        if [ "$GSMENU_VTX_DETECTED" -eq "1" ]; then
-            $SSH 'fw_setenv wlanssid "'$5'"'
-            $SSH '(hostapd_cli -i wlan0 set ssid "'$5'"; hostapd_cli -i wlan0 reload)  >/dev/null 2>&1 &'
-        fi
-        WIFI_IFACES=$(ip -o link show | awk -F': ' '{print $2}' | grep '^wlx' | grep -v "^$EXCLUDE_IFACE$")
-        INDEX=0
-        for IFACE in $WIFI_IFACES; do
-            CONN_NAME="apfpv$INDEX"
-            if nmcli connection show "$CONN_NAME" &>/dev/null; then
-                nmcli connection modify "$CONN_NAME" ssid "$5"
-                if [ $($0 get gs apfpv $IFACE) = 1 ]; then
-                    nmcli -w 0 connection up "$CONN_NAME"
-                fi
-            fi
-            INDEX=$((INDEX + 1))
-        done
-        ;;
-    "set gs apfpv password"*)
-        if [ "$GSMENU_VTX_DETECTED" -eq "1" ]; then
-            $SSH 'fw_setenv wlanpass "'$5'"'
-            $SSH '(hostapd_cli -i wlan0 set wpa_passphrase "'$5'"; hostapd_cli -i wlan0 reload)  >/dev/null 2>&1 &'
-        fi
-        WIFI_IFACES=$(ip -o link show | awk -F': ' '{print $2}' | grep '^wlx' | grep -v "^$EXCLUDE_IFACE$")
-        INDEX=0
-        for IFACE in $WIFI_IFACES; do
-            CONN_NAME="apfpv$INDEX"
-            if nmcli connection show "$CONN_NAME" &>/dev/null; then
-                nmcli connection modify "$CONN_NAME" wifi-sec.psk "$5"
-                if [ $($0 get gs apfpv $IFACE) = 1 ]; then
-                    nmcli -w 0 connection up "$CONN_NAME"
-                fi
-            fi
-            INDEX=$((INDEX + 1))
-        done
-        ;;
-    "set gs apfpv wlx"*)
-        conn=$(basename -s .nmconnection $(grep -l $4 /etc/NetworkManager/system-connections/apfpv*.nmconnection))
-        if [ $5 = "on" ]; then
-            nmcli connection modify "$conn" connection.autoconnect yes
-            nmcli connection up "$conn"
-        else
-            nmcli connection modify "$conn" connection.autoconnect no
-            nmcli connection down "$conn"
-            DRV_PATH=$(readlink -f /sys/class/net/$4/device/driver 2>/dev/null || true)
-            DEV_PATH=$(readlink -f /sys/class/net/$4/device 2>/dev/null || true)
-            DRV_NAME=$(basename "$DRV_PATH")
-            DEV_NAME=$(basename "$DEV_PATH")
-            echo -n "$DEV_NAME" | sudo tee /sys/bus/usb/drivers/$DRV_NAME/unbind >/dev/null
-            sleep 1
-            echo -n "$DEV_NAME" | sudo tee /sys/bus/usb/drivers/$DRV_NAME/bind >/dev/null
-            sleep 1
-        fi
-        ;;
-    "set gs apfpv reset")
-        CONNECTIONS=$(nmcli -t c show  | grep ^apfpv | cut -d : -f1)
-        for CONN_NAME in $CONNECTIONS; do
-            if nmcli connection show "$CONN_NAME" &>/dev/null; then
-                nmcli connection down "$CONN_NAME"
-                nmcli connection delete "$CONN_NAME"
-            fi
-        done
-        ;;
+    "set gs apfpv ssid"*)       : ;;
+    "set gs apfpv password"*)   : ;;
+    "set gs apfpv wlx"*)        : ;;
+    "set gs apfpv reset")       : ;;
 
 # ── GS: WiFi ────────────────────────────────────────────────────────────────
 
     "get gs wifi hotspot")
-        nmcli connection show --active | grep -q "Hotspot" && echo 1 || echo 0
+        echo 0
         ;;
     "get gs wifi wlan")
-        connection=$(nmcli -t connection show --active | grep wlan0 | grep -v Hotspot | cut -d : -f1)
-        [ -z "${connection}" ] && echo 0 || echo 1
+        echo 0
         ;;
     "get gs wifi ssid")
-        if [ -d /sys/class/net/wlan0 ]; then
-            nmcli -t connection show --active | grep wlan0 | grep -v Hotspot | cut -d : -f1
-        else
-            echo -n ""
-        fi
+        echo -n ""
         ;;
     "get gs wifi password")
-        if [ -d /sys/class/net/wlan0 ]; then
-            connection=$(nmcli -t connection show --active | grep wlan0 | cut -d : -f1)
-            nmcli -t connection show $connection --show-secrets | grep 802-11-wireless-security.psk: | cut -d : -f2
-        else
-            echo -n ""
-        fi
+        echo -n ""
         ;;
     "get gs wifi IP")
-        ip -4 addr show  | grep -oP '(?<=inet\s)\d+(\.\d+){3}'
+        echo ""
         ;;
     "get gs wifi savednetworks")
-        # Enumerate saved WiFi connection profiles and output ESCAPED_SSID:password
-        nmcli -t -f NAME,TYPE connection show 2>/dev/null | grep ":802-11-wireless$" | \
-        sed 's/:802-11-wireless$//' | \
-        while IFS= read -r name; do
-            ssid=$(nmcli -s -t -f 802-11-wireless.ssid connection show "$name" 2>/dev/null | cut -d: -f2-)
-            psk=$(nmcli -s -t -f 802-11-wireless-security.psk connection show "$name" 2>/dev/null | cut -d: -f2-)
-            [ -z "$ssid" ] && continue
-            escaped=$(printf '%s' "$ssid" | sed 's/:/\\:/g')
-            printf '%s:%s\n' "$escaped" "$psk"
-        done
-        ;;
+        # integrator: print ESCAPED_SSID:password per saved network
+        : ;;
     "get gs wifi networks")
-        [ ! -d /sys/class/net/wlan0 ] && exit 0
-        # Output ESCAPED_SSID:SECURITY:SIGNAL per line (nmcli already escapes ':' in SSIDs)
-        # Use NF-based split so SSIDs with colons are reconstructed correctly
-        nmcli -t -f SSID,SECURITY,SIGNAL device wifi list 2>/dev/null | \
-        awk -F: '
-            {
-                signal = $NF
-                security = $(NF-1)
-                ssid = ""
-                for (i = 1; i <= NF-2; i++) {
-                    if (i > 1) ssid = ssid ":"
-                    ssid = ssid $i
-                }
-                if (ssid == "") next
-                sec = (security == "--") ? "--" : "WPA"
-                print ssid ":" sec ":" signal
-            }
-        '
-        ;;
-    "set gs wifi connect"*)
-        [ ! -d /sys/class/net/wlan0 ] && exit 0
-        if nmcli connection show | grep -q "$5"; then
-            nmcli con up "$5"
-        else
-            nmcli device wifi connect "$5" $( [ -n "$6" ] && printf 'password "%s"' "$6" ) ifname wlan0
-        fi
-        ;;
-    "set gs wifi disconnect"*)
-        [ ! -d /sys/class/net/wlan0 ] && exit 0
-        connection=$(nmcli -t connection show --active | grep wlan0 | grep -v Hotspot | cut -d : -f1)
-        [ -n "$connection" ] && nmcli con down "$connection" || true
-        ;;
+        # integrator: print ESCAPED_SSID:SECURITY:SIGNAL per visible network
+        : ;;
 
-    "set gs wifi wlan"*)
-        [ ! -d /sys/class/net/wlan0 ] && exit 0
-        if [ "$5" = "on" ]; then
-            if nmcli connection show | grep -q "$6"; then
-                echo "$6 connection exists. Starting it..."
-                nmcli con up "$6"
-            else
-                echo "Creating new "$6" connection..."
-                nmcli device wifi connect "$6" password "$7" ifname wlan0
-                echo "Starting Wlan..."
-                nmcli con up "$6"
-            fi
-        else
-            nmcli con down "$6"
-        fi
-        ;;
-    "set gs wifi hotspot"*)
-        [ ! -d /sys/class/net/wlan0 ] && exit 0
-        if [ "$5" = "on" ]; then
-            nmcli connection show --active | grep -q "Hotspot" && exit 0  # already on
-            if nmcli connection show | grep -q "Hotspot"; then
-                echo "Hotspot connection exists. Starting it..."
-                nmcli con up Hotspot
-            else
-                echo "Creating new Hotspot connection..."
-                nmcli con add type wifi ifname wlan0 con-name Hotspot autoconnect no ssid "OpenIPC GS"
-                nmcli con modify Hotspot 802-11-wireless.mode ap 802-11-wireless.band bg ipv4.method shared
-                nmcli con modify Hotspot wifi-sec.key-mgmt wpa-psk
-                nmcli con modify Hotspot wifi-sec.psk "openipcgs"
-                nmcli con modify Hotspot ipv4.addresses 192.168.4.1/24
-                echo "Starting Hotspot..."
-                nmcli con up Hotspot
-            fi
-        else
-            nmcli connection show --active | grep -q "Hotspot" || exit 0  # already off
-            nmcli con down Hotspot
-        fi
-        ;;
+    "set gs wifi connect"*)     : ;;
+    "set gs wifi disconnect"*)  : ;;
+    "set gs wifi wlan"*)        : ;;
+    "set gs wifi hotspot"*)     : ;;
 
 # ── GS: Main page (info labels) ─────────────────────────────────────────────
 
     "get gs main Channel")
-        gsmenu.sh get gs wfbng gs_channel
+        echo "161"
         ;;
     "get gs main HDMI-OUT")
-        gsmenu.sh get gs system resolution
+        echo "1920x1080@60"
         ;;
     "get gs main Version")
-        cat /config/version.md
+        echo "ddeeaaddbbeeff"
         ;;
     "get gs main Disk")
-        read -r size avail pcent <<< $(df -h / | awk 'NR==2 {print $2, $4, $5}')
-        echo -e "\n   Size: $size\n   Available: $avail\n   Pct: $pcent\c"
+        echo -e "   Size: 914G\n   Available: 20G\n   Pct: 98%"
         ;;
     "get gs main WFB_NICS")
-        grep ^WFB_NICS /etc/default/wifibroadcast | cut -d \" -f 2
+        echo "wlx1122334566"
         ;;
 
 # ── Buttons / Actions ───────────────────────────────────────────────────────
 
-    "button air actions Reboot")
-        $SSH 'reboot &'
-        ;;
-    "button gs actions Reboot")
-        reboot
-        ;;
+    "button air actions Reboot")    : ;; # integrator: reboot air unit
+    "button gs actions Reboot")     : ;; # integrator: reboot ground station
     "search channel")
-        echo "Not implmented"
-        echo "Not implmented" >&2
+        echo "Not implemented"
+        echo "Not implemented" >&2
         exit 1
         ;;
 
 # ── NetworkManager Dispatcher ────────────────────────────────────────────────
 
     "wlx"*"dhcp4-change")
-        eval $(udevadm info -x --query=property --path=/sys/class/net/$DEVICE_IFACE)
-        case "$ID_NET_DRIVER" in
-        "rtl88xxau_wfb") iw dev "$DEVICE_IFACE" set txpower fixed -4000 ;;
-        "rtl88x2eu")     iw dev "$DEVICE_IFACE" set txpower fixed 2500  ;;
-        esac
-        ;;
+        : ;; # integrator: per-NIC txpower / dispatcher hook
 
 # ── Unknown command ──────────────────────────────────────────────────────────
 
@@ -1052,8 +529,4 @@ case "$@" in
         ;;
 esac
 
-case $? in
-    0) ;;
-    1) exit 0 ;;
-    *) exit $? ;;
-esac
+exit 0
