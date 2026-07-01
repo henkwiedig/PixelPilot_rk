@@ -1703,10 +1703,11 @@ int main(int argc, char **argv)
 			assert(!ret);
 		}
 
-		osd_thread_params *args = (osd_thread_params *)malloc(sizeof *args);
+		osd_thread_params *args = new osd_thread_params();
         args->fd = drm_fd;
         args->out = output_list;
 		args->config = osd_config;
+		args->config_path = osd_config_path;
 		ret = pthread_create(&tid_osd, NULL, __OSD_THREAD__, args);
 		assert(!ret);
 	}

@@ -13,6 +13,7 @@
 #include "main.h"
 #include "lvgl/lvgl.h"
 #include "input.h"
+#include "osd_editor.h"
 #include "gsmenu/gs_system.h"
 
 extern YAML::Node config;
@@ -54,11 +55,43 @@ gpio_button_t gpio_buttons[MAX_GPIO_BUTTONS] = {0};
 #endif
 
 extern lv_obj_t * pp_menu_screen;
+extern lv_obj_t * pp_osd_screen;
 
 // Global or static variable to store the next key state
 static lv_key_t next_key = LV_KEY_END;  // Default to no key
 static bool next_key_pressed = false;    // Indicates if the next key should be pressed or released
 gsmenu_control_mode_t control_mode = GSMENU_CONTROL_MODE_NAV;
+
+// ---- OSD editor on-screen position mode ----
+// While active, directional input nudges the targeted OSD widget instead of
+// driving the (hidden) menu. Step is in OSD pixels per press; holding a GPIO
+// button repeats the press, giving continuous movement.
+#define OSD_POSITION_STEP 2
+static bool osd_position_mode = false;
+static lv_group_t *osd_position_return_group = NULL;
+static void (*osd_position_on_done)(void) = NULL;
+
+bool osd_position_active(void) { return osd_position_mode; }
+
+void osd_position_enter(lv_group_t *return_group, void (*on_done)(void)) {
+    osd_position_return_group = return_group;
+    osd_position_on_done = on_done;
+    osd_position_mode = true;
+    // Show the live OSD (menu_active=false lets the OSD thread repaint it) so
+    // the user sees the widget move in real time.
+    lv_scr_load(pp_osd_screen);
+    menu_active = false;
+}
+
+static void osd_position_exit(void) {
+    osd_position_mode = false;
+    lv_scr_load(pp_menu_screen);
+    lv_indev_set_group(indev_drv,
+                       osd_position_return_group ? osd_position_return_group : main_group);
+    lv_obj_invalidate(pp_menu_screen);
+    menu_active = true;
+    if (osd_position_on_done) osd_position_on_done();
+}
 
 extern uint64_t gtotal_tunnel_data;
 void simulate_traffic(lv_timer_t *t)
@@ -225,6 +258,17 @@ void send_long_press_event(size_t button_index) {
 
 void send_button_event(size_t button_index) {
     if (gpio_buttons[button_index].name == NULL) return;
+
+    // In OSD position mode the d-pad nudges the targeted widget; center commits.
+    if (osd_position_mode) {
+        const char *bn = gpio_buttons[button_index].name;
+        if (strcmp(bn, "up") == 0)         osd_ed_nudge(0, -OSD_POSITION_STEP);
+        else if (strcmp(bn, "down") == 0)  osd_ed_nudge(0,  OSD_POSITION_STEP);
+        else if (strcmp(bn, "left") == 0)  osd_ed_nudge(-OSD_POSITION_STEP, 0);
+        else if (strcmp(bn, "right") == 0) osd_ed_nudge( OSD_POSITION_STEP, 0);
+        else if (strcmp(bn, "center") == 0) osd_position_exit();
+        return;
+    }
 
     // Adjust for control_mode
     switch (control_mode) {
@@ -437,6 +481,20 @@ void toggle_screen(void) {
 void handle_keyboard_input(void) {
     char c;
     if (read(STDIN_FILENO, &c, 1) > 0) {
+        // In OSD position mode the d-pad nudges the targeted widget; Enter
+        // commits and returns to the menu. The menu keeps these keys away.
+        if (osd_position_mode) {
+            switch (c) {
+                case 'w': case 'W': osd_ed_nudge(0, -OSD_POSITION_STEP); break;
+                case 's': case 'S': osd_ed_nudge(0,  OSD_POSITION_STEP); break;
+                case 'a': case 'A': osd_ed_nudge(-OSD_POSITION_STEP, 0); break;
+                case 'd': case 'D': osd_ed_nudge( OSD_POSITION_STEP, 0); break;
+                case '\n': osd_position_exit(); break;
+                case 'q': case 'Q': raise(SIGINT); break;
+                default: break;
+            }
+            return;
+        }
         switch(c) {
             case 'w':
             case 'W':

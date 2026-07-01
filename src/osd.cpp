@@ -21,9 +21,13 @@ extern "C" {
 }
 #include "osd.h"
 #include "osd.hpp"
+#include "osd_editor.h"
 
 #include <pthread.h>
 #include <map>
+#include <set>
+#include <fstream>
+#include <algorithm>
 #include <vector>
 #include <ranges>
 #include <memory>
@@ -797,6 +801,12 @@ public:
 		int h = cairo_image_surface_get_height(target);
 		return std::pair((w + pos_x) % w, (h + pos_y) % h);
 	}
+
+	// Used by the on-device OSD editor to reposition a widget live, without
+	// rebuilding it from the config.
+	void setPos(int x, int y) { pos_x = x; pos_y = y; }
+	int getPosX() const { return pos_x; }
+	int getPosY() const { return pos_y; }
 
 protected:
 	int pos_x, pos_y;
@@ -1654,7 +1664,6 @@ private:
 class Osd {
 public:
 	void loadConfig(json cfg) {
-		json obj;
 		if (cfg.contains("format")) {
 			auto cfg_format = cfg.at("format").template get<std::string>();
 			if (cfg_format != "0.0.1" && cfg_format != "0.0.2") {
@@ -1669,12 +1678,40 @@ public:
 			spdlog::error("OSD config doesn't have 'widgets' key");
 			return;
 		}
-		std::filesystem::path assets_dir(".");
-		if (cfg.contains("assets_dir")) {
-			assets_dir = cfg.at("assets_dir").template get<std::filesystem::path>();
+		config_ = cfg;
+		if (!config_["widgets"].is_array()) {
+			config_["widgets"] = json::array();
 		}
-		json widgets_j = cfg.at("widgets");
+		buildWidgets();
+	}
+
+	// (Re)create all live widget objects from the in-memory config (config_).
+	// The OSD editor mutates config_ and calls this to apply changes. The
+	// widgets vector is kept index-aligned with config_["widgets"] so the
+	// editor can address widgets by their config position; entries that fail
+	// to build (unknown type, bad fields) become a nullptr placeholder.
+	void buildWidgets() {
+		std::filesystem::path assets_dir(".");
+		if (config_.contains("assets_dir")) {
+			assets_dir = config_.at("assets_dir").template get<std::filesystem::path>();
+		}
+		json widgets_j = config_.at("widgets");
 		for (json widget_j : widgets_j) {
+			size_t before = widgets.size();
+			try {
+				buildOneWidget(widget_j, assets_dir);
+			} catch (const std::exception& e) {
+				spdlog::error("Failed to build OSD widget: {}", e.what());
+			}
+			// Keep widgets[] index-aligned with config_["widgets"].
+			if (widgets.size() == before) {
+				widgets.push_back(nullptr);
+			}
+		}
+	}
+
+	void buildOneWidget(json widget_j, std::filesystem::path assets_dir) {
+		{
 			if(!(widget_j.contains("name") || widget_j.contains("type") || widget_j.contains("x") ||
 				 widget_j.contains("y") || widget_j.contains("facts"))) {
 				spdlog::error("Missing required key name/type/x/y/facts");
@@ -1727,13 +1764,13 @@ public:
 				auto tpl = widget_j.at("template").template get<std::string>();
 				auto icon_path = widget_j.at("icon_path").template get<std::filesystem::path>();
 				cairo_surface_t *icon = openIcon(name, assets_dir, icon_path);
-				if (icon == NULL) break;
+				if (icon == NULL) return;
 				addWidget(new IconTplTextWidget(x, y, icon, tpl, (uint)matchers.size()), matchers);
 			} else if(type == "DvrStatusWidget") {
 				auto text = widget_j.at("text").template get<std::string>();
 				auto icon_path = widget_j.at("icon_path").template get<std::filesystem::path>();
 				cairo_surface_t *icon = openIcon(name, assets_dir, icon_path);
-				if (icon == NULL) break;
+				if (icon == NULL) return;
 				addWidget(new DvrStatusWidget(x, y, icon, text), matchers);
 			} else if(type == "VideoWidget") {
 				auto tpl = widget_j.at("template").template get<std::string>();
@@ -1741,7 +1778,7 @@ public:
 				uint window_size_s = widget_j.at("per_second_window_s").template get<uint>();
 				uint bucket_size_ms = widget_j.at("per_second_bucket_ms").template get<uint>();;
 				cairo_surface_t *icon = openIcon(name, assets_dir, icon_path);
-				if (icon == NULL) break;
+				if (icon == NULL) return;
 				addWidget(new VideoWidget(x, y, window_size_s * 1000, bucket_size_ms,
 										  icon, tpl, (uint)matchers.size()),
 						  matchers);
@@ -1751,7 +1788,7 @@ public:
 				uint window_size_s = widget_j.at("per_second_window_s").template get<uint>();
 				uint bucket_size_ms = widget_j.at("per_second_bucket_ms").template get<uint>();;
 				cairo_surface_t *icon = openIcon(name, assets_dir, icon_path);
-				if (icon == NULL) break;
+				if (icon == NULL) return;
 				addWidget(new VideoBitrateWidget(x, y, window_size_s * 1000, bucket_size_ms,
 												 icon, tpl, (uint)matchers.size()),
 						  matchers);
@@ -1761,7 +1798,7 @@ public:
 				uint window_size_s = widget_j.at("per_second_window_s").template get<uint>();
 				uint bucket_size_ms = widget_j.at("per_second_bucket_ms").template get<uint>();;
 				cairo_surface_t *icon = openIcon(name, assets_dir, icon_path);
-				if (icon == NULL) break;
+				if (icon == NULL) return;
 				addWidget(new VideoDecodeLatencyWidget(x, y, window_size_s * 1000, bucket_size_ms,
 													   icon, tpl, 1),
 						  matchers);
@@ -1793,7 +1830,7 @@ public:
 					stats_kind = BarChartWidget::STATS_AVG;
 				} else {
 					SPDLOG_WARN("{}: invalid stats_kind {}", name, stats_kind_str);
-					break;
+					return;
 				}
 				addWidget(new BarChartWidget(x, y, width, height, window_s, num_buckets, stats_kind),
 						  matchers);
@@ -1848,10 +1885,11 @@ public:
 
 	void draw(cairo_t *cr) {
 		for(auto &widget : widgets)
-			widget->draw(cr);
+			if (widget) widget->draw(cr);
 	};
 
 	void setFact(Fact fact) {
+		registerFact(fact);
 		for (auto& [matcher, widget, arg_idx] : matchers) {
 			if (matcher.matches(fact)) {
 				try {
@@ -1864,6 +1902,381 @@ public:
 			}
 		}
 	};
+
+	//
+	// ---- OSD editor support ------------------------------------------------
+	// All of the following run in the OSD thread (same thread as draw()/the
+	// gsmenu lv_task_handler), so no extra locking is required.
+	//
+
+	// Record every distinct fact name and the tag keys/values seen for it, so
+	// the editor can offer them as dropdowns instead of free text.
+	void registerFact(const Fact &fact) {
+		auto &keys = fact_registry_[fact.getName()];   // creates the name entry
+		for (const auto &[k, v] : fact.getTags()) {
+			keys[k].insert(v);
+		}
+	}
+
+	void clearWidgets() {
+		for (auto w : widgets) delete w;   // delete nullptr is a no-op
+		widgets.clear();
+		matchers.clear();
+	}
+
+	// Rebuild all widgets from config_ (used after structural edits).
+	void reloadFromConfig() {
+		clearWidgets();
+		buildWidgets();
+	}
+
+	json &configWidgets() { return config_["widgets"]; }
+	bool validIdx(int i) {
+		return config_.contains("widgets") && i >= 0 && i < (int)config_["widgets"].size();
+	}
+
+public:
+	void setConfigPath(const std::string &path) { config_path_ = path; }
+
+	int editorCount() {
+		return config_.contains("widgets") ? (int)config_["widgets"].size() : 0;
+	}
+
+	std::string editorType(int i) {
+		if (!validIdx(i)) return "";
+		return configWidgets()[i].value("type", std::string(""));
+	}
+	std::string editorName(int i) {
+		if (!validIdx(i)) return "";
+		return configWidgets()[i].value("name", std::string(""));
+	}
+
+	void editorGetXY(int i, int *x, int *y) {
+		if (!validIdx(i)) { *x = 0; *y = 0; return; }
+		*x = configWidgets()[i].value("x", 0);
+		*y = configWidgets()[i].value("y", 0);
+	}
+	// Cheap, no rebuild: keep config and the live widget object in sync.
+	void editorSetXY(int i, int x, int y) {
+		if (!validIdx(i)) return;
+		configWidgets()[i]["x"] = x;
+		configWidgets()[i]["y"] = y;
+		if (i < (int)widgets.size() && widgets[i]) widgets[i]->setPos(x, y);
+	}
+
+	// Integer scalar fields other than x/y (width/height/timeout_ms/...).
+	std::vector<std::string> editorNumFields(int i) {
+		std::vector<std::string> out;
+		if (!validIdx(i)) return out;
+		for (auto &[k, v] : configWidgets()[i].items()) {
+			if (k == "x" || k == "y") continue;
+			if (v.is_number_integer() || v.is_number_unsigned()) out.push_back(k);
+		}
+		return out;
+	}
+	long editorGetNum(int i, const std::string &key) {
+		if (!validIdx(i)) return 0;
+		return configWidgets()[i].value(key, (long)0);
+	}
+	void editorSetNum(int i, const std::string &key, long val) {
+		if (!validIdx(i)) return;
+		configWidgets()[i][key] = val;
+		reloadFromConfig();
+	}
+
+	// Read-only string fields (text/template/icon_path/...), shown for info.
+	std::vector<std::pair<std::string, std::string>> editorStrFields(int i) {
+		std::vector<std::pair<std::string, std::string>> out;
+		if (!validIdx(i)) return out;
+		for (auto &[k, v] : configWidgets()[i].items()) {
+			if (k == "name" || k == "type") continue;
+			if (v.is_string()) out.push_back({k, v.get<std::string>()});
+		}
+		return out;
+	}
+
+	std::string editorGetString(int i, const std::string &key) {
+		if (!validIdx(i)) return "";
+		return configWidgets()[i].value(key, std::string(""));
+	}
+	void editorSetString(int i, const std::string &key, const std::string &val) {
+		if (!validIdx(i)) return;
+		configWidgets()[i][key] = val;
+		reloadFromConfig();
+	}
+
+	// List of *.png files in the configured assets_dir (for icon dropdowns).
+	std::string editorRegIcons() {
+		std::string out;
+		std::filesystem::path dir(".");
+		if (config_.contains("assets_dir"))
+			dir = config_.value("assets_dir", std::string("."));
+		std::error_code ec;
+		if (!std::filesystem::is_directory(dir, ec)) return out;
+		std::vector<std::string> names;
+		for (auto &entry : std::filesystem::directory_iterator(dir, ec)) {
+			if (!entry.is_regular_file()) continue;
+			auto p = entry.path();
+			if (p.extension() == ".png") names.push_back(p.filename().string());
+		}
+		std::sort(names.begin(), names.end());
+		for (auto &n : names) { if (!out.empty()) out += "\n"; out += n; }
+		return out;
+	}
+
+	bool editorHasColor(int i) {
+		return validIdx(i) && configWidgets()[i].contains("color") &&
+			   configWidgets()[i]["color"].is_object();
+	}
+	void editorGetColor(int i, int *r, int *g, int *b, int *a) {
+		*r = *g = *b = 0; *a = 100;
+		if (!editorHasColor(i)) return;
+		json &c = configWidgets()[i]["color"];
+		*r = (int)lround(c.value("r", 0.0) * 100.0);
+		*g = (int)lround(c.value("g", 0.0) * 100.0);
+		*b = (int)lround(c.value("b", 0.0) * 100.0);
+		*a = (int)lround(c.value("alpha", 1.0) * 100.0);
+	}
+	void editorSetColor(int i, int r, int g, int b, int a) {
+		if (!validIdx(i)) return;
+		json c;
+		c["r"] = r / 100.0; c["g"] = g / 100.0;
+		c["b"] = b / 100.0; c["alpha"] = a / 100.0;
+		configWidgets()[i]["color"] = c;
+		reloadFromConfig();
+	}
+
+	// ---- ranges_and_icons (IconSelectorWidget) ----
+	json *rangesArr(int i) {
+		if (!validIdx(i)) return nullptr;
+		json &w = configWidgets()[i];
+		if (!w.contains("ranges_and_icons") || !w["ranges_and_icons"].is_array()) return nullptr;
+		return &w["ranges_and_icons"];
+	}
+	bool editorHasRanges(int i) { return rangesArr(i) != nullptr; }
+	int editorRangeCount(int i) {
+		json *a = rangesArr(i);
+		return a ? (int)a->size() : 0;
+	}
+	// which: 0 = min, 1 = max
+	long editorRangeBound(int i, int r, int which) {
+		json *a = rangesArr(i);
+		if (!a || r < 0 || r >= (int)a->size()) return 0;
+		json &rg = (*a)[r]["range"];
+		if (!rg.is_array() || rg.size() < 2) return 0;
+		return rg[which].get<long>();
+	}
+	void editorSetRangeBound(int i, int r, int which, long v) {
+		json *a = rangesArr(i);
+		if (!a || r < 0 || r >= (int)a->size()) return;
+		if (!(*a)[r].contains("range") || !(*a)[r]["range"].is_array() || (*a)[r]["range"].size() < 2)
+			(*a)[r]["range"] = json::array({0, 0});
+		(*a)[r]["range"][which] = v;
+		reloadFromConfig();
+	}
+	std::string editorRangeIcon(int i, int r) {
+		json *a = rangesArr(i);
+		if (!a || r < 0 || r >= (int)a->size()) return "";
+		return (*a)[r].value("icon_path", std::string(""));
+	}
+	void editorSetRangeIcon(int i, int r, const std::string &icon) {
+		json *a = rangesArr(i);
+		if (!a || r < 0 || r >= (int)a->size()) return;
+		(*a)[r]["icon_path"] = icon;
+		reloadFromConfig();
+	}
+	void editorAddRange(int i) {
+		if (!validIdx(i)) return;
+		json &w = configWidgets()[i];
+		if (!w.contains("ranges_and_icons") || !w["ranges_and_icons"].is_array())
+			w["ranges_and_icons"] = json::array();
+		json e;
+		e["range"] = json::array({0, 0});
+		e["icon_path"] = "";
+		w["ranges_and_icons"].push_back(e);
+		reloadFromConfig();
+	}
+	void editorDelRange(int i, int r) {
+		json *a = rangesArr(i);
+		if (!a || r < 0 || r >= (int)a->size()) return;
+		a->erase(r);
+		reloadFromConfig();
+	}
+
+	// ---- facts (the dropdown-driven part) ----
+	int editorFactCount(int i) {
+		if (!validIdx(i) || !configWidgets()[i].contains("facts")) return 0;
+		return (int)configWidgets()[i]["facts"].size();
+	}
+	std::string editorFactName(int i, int f) {
+		if (!validIdx(i) || f < 0 || f >= editorFactCount(i)) return "";
+		return configWidgets()[i]["facts"][f].value("name", std::string(""));
+	}
+	void editorSetFactName(int i, int f, const std::string &name) {
+		if (!validIdx(i) || f < 0 || f >= editorFactCount(i)) return;
+		configWidgets()[i]["facts"][f]["name"] = name;
+		// Drop tags that the newly chosen fact doesn't expose.
+		if (configWidgets()[i]["facts"][f].contains("tags")) {
+			json kept = json::object();
+			auto it = fact_registry_.find(name);
+			if (it != fact_registry_.end()) {
+				for (auto &[k, v] : configWidgets()[i]["facts"][f]["tags"].items()) {
+					if (it->second.count(k)) kept[k] = v;
+				}
+			}
+			configWidgets()[i]["facts"][f]["tags"] = kept;
+		}
+		reloadFromConfig();
+	}
+	std::vector<std::pair<std::string, std::string>> editorFactTags(int i, int f) {
+		std::vector<std::pair<std::string, std::string>> out;
+		if (!validIdx(i) || f < 0 || f >= editorFactCount(i)) return out;
+		json &fj = configWidgets()[i]["facts"][f];
+		if (fj.contains("tags")) {
+			for (auto &[k, v] : fj["tags"].items())
+				out.push_back({k, v.get<std::string>()});
+		}
+		return out;
+	}
+	void editorSetFactTag(int i, int f, const std::string &key, const std::string &val) {
+		if (!validIdx(i) || f < 0 || f >= editorFactCount(i)) return;
+		configWidgets()[i]["facts"][f]["tags"][key] = val;
+		reloadFromConfig();
+	}
+	void editorAddFact(int i) {
+		if (!validIdx(i)) return;
+		if (!configWidgets()[i].contains("facts") || !configWidgets()[i]["facts"].is_array())
+			configWidgets()[i]["facts"] = json::array();
+		json nf; nf["name"] = "";
+		configWidgets()[i]["facts"].push_back(nf);
+		reloadFromConfig();
+	}
+	void editorDelFact(int i, int f) {
+		if (!validIdx(i) || f < 0 || f >= editorFactCount(i)) return;
+		configWidgets()[i]["facts"].erase(f);
+		reloadFromConfig();
+	}
+	void editorAddFactTag(int i, int f, const std::string &key) {
+		if (!validIdx(i) || f < 0 || f >= editorFactCount(i) || key.empty()) return;
+		json &fj = configWidgets()[i]["facts"][f];
+		if (!fj.contains("tags") || !fj["tags"].is_object()) fj["tags"] = json::object();
+		if (fj["tags"].contains(key)) return;
+		// Default to the first observed value for this tag, if any.
+		std::string def;
+		auto it = fact_registry_.find(fj.value("name", std::string("")));
+		if (it != fact_registry_.end()) {
+			auto kit = it->second.find(key);
+			if (kit != it->second.end() && !kit->second.empty()) def = *kit->second.begin();
+		}
+		fj["tags"][key] = def;
+		reloadFromConfig();
+	}
+	void editorDelFactTag(int i, int f, const std::string &key) {
+		if (!validIdx(i) || f < 0 || f >= editorFactCount(i)) return;
+		json &fj = configWidgets()[i]["facts"][f];
+		if (fj.contains("tags") && fj["tags"].is_object()) fj["tags"].erase(key);
+		reloadFromConfig();
+	}
+	std::string editorFactConvert(int i, int f) {
+		if (!validIdx(i) || f < 0 || f >= editorFactCount(i)) return "";
+		return configWidgets()[i]["facts"][f].value("convert", std::string(""));
+	}
+	void editorSetFactConvert(int i, int f, const std::string &expr) {
+		if (!validIdx(i) || f < 0 || f >= editorFactCount(i)) return;
+		json &fj = configWidgets()[i]["facts"][f];
+		if (expr.empty()) fj.erase("convert");
+		else fj["convert"] = expr;
+		reloadFromConfig();
+	}
+	// Tag keys known for a fact but not yet set on this matcher (for "Add tag").
+	std::string editorAvailTagKeys(int i, int f) {
+		std::string out;
+		if (!validIdx(i) || f < 0 || f >= editorFactCount(i)) return out;
+		json &fj = configWidgets()[i]["facts"][f];
+		auto it = fact_registry_.find(fj.value("name", std::string("")));
+		if (it == fact_registry_.end()) return out;
+		for (auto &[k, _] : it->second) {
+			if (fj.contains("tags") && fj["tags"].contains(k)) continue;
+			if (!out.empty()) out += "\n";
+			out += k;
+		}
+		return out;
+	}
+
+	// ---- registry queries (newline-joined option lists for dropdowns) ----
+	std::string regFactNames() {
+		std::string out;
+		for (auto &[name, _] : fact_registry_) {
+			if (name.empty()) continue;
+			if (!out.empty()) out += "\n";
+			out += name;
+		}
+		return out;
+	}
+	std::string regTagKeys(const std::string &fact) {
+		std::string out;
+		auto it = fact_registry_.find(fact);
+		if (it == fact_registry_.end()) return out;
+		for (auto &[k, _] : it->second) {
+			if (!out.empty()) out += "\n";
+			out += k;
+		}
+		return out;
+	}
+	std::string regTagValues(const std::string &fact, const std::string &key) {
+		std::string out;
+		auto it = fact_registry_.find(fact);
+		if (it == fact_registry_.end()) return out;
+		auto kit = it->second.find(key);
+		if (kit == it->second.end()) return out;
+		for (auto &v : kit->second) {
+			if (!out.empty()) out += "\n";
+			out += v;
+		}
+		return out;
+	}
+
+	// ---- structural edits ----
+	int editorAddJson(const std::string &widget_json) {
+		try {
+			json wj = json::parse(widget_json);
+			if (!config_.contains("widgets") || !config_["widgets"].is_array())
+				config_["widgets"] = json::array();
+			config_["widgets"].push_back(wj);
+			reloadFromConfig();
+			return (int)config_["widgets"].size() - 1;
+		} catch (const std::exception &e) {
+			spdlog::error("OSD editor: bad preset json: {}", e.what());
+			return -1;
+		}
+	}
+	void editorDelete(int i) {
+		if (!validIdx(i)) return;
+		configWidgets().erase(i);
+		reloadFromConfig();
+	}
+	// Move a widget in z-order (and config order). Returns its new index.
+	int editorMove(int i, int dir) {
+		if (!validIdx(i)) return i;
+		int j = i + dir;
+		if (j < 0 || j >= (int)configWidgets().size()) return i;
+		std::swap(configWidgets()[i], configWidgets()[j]);
+		reloadFromConfig();
+		return j;
+	}
+	void editorSave() {
+		if (config_path_.empty()) {
+			spdlog::error("OSD editor: no config path set, cannot save");
+			return;
+		}
+		try {
+			std::ofstream o(config_path_);
+			o << config_.dump(4) << std::endl;
+			spdlog::info("OSD editor: saved config to {}", config_path_);
+		} catch (const std::exception &e) {
+			spdlog::error("OSD editor: failed to save: {}", e.what());
+		}
+	}
 
 private:
 
@@ -1904,7 +2317,21 @@ private:
 
 	std::vector<Widget *> widgets;
 	std::vector<std::tuple<FactMatcher, Widget *, uint>> matchers;
+
+	// OSD editor state
+	json config_;                 // in-memory copy of the loaded config (source of truth for edits)
+	std::string config_path_;     // file to save edits to
+	// fact name -> (tag key -> set of observed tag values)
+	std::map<std::string, std::map<std::string, std::set<std::string>>> fact_registry_;
 };
+
+// The live OSD instance, owned by __OSD_THREAD__. Used by the OSD editor C
+// bridge below. Only touched from the OSD thread (editor callbacks run there
+// via the gsmenu lv_task_handler), so it needs no locking.
+static Osd *g_osd = nullptr;
+
+// Index of the widget currently being repositioned in on-screen position mode.
+static int g_osd_position_target = -1;
 
 
 std::queue<Fact> fact_queue;
@@ -2055,6 +2482,8 @@ void *__OSD_THREAD__(void *param) {
 	Osd *osd = new Osd;
 	pthread_setname_np(pthread_self(), "__OSD");
 
+	osd->setConfigPath(p->config_path);
+	g_osd = osd;
 	osd->loadConfig(p->config);
 	auto last_display_at = std::chrono::steady_clock::now();
 
@@ -2262,6 +2691,202 @@ void osd_publish_str_fact(char const *name, osd_tag *tags, int n_tags, const cha
 uint32_t osd_gl_process(struct modeset_buf* buf, bool premultiplied){
 	return osd_gl.process(buf, premultiplied);
 }
+
+//
+// ---- OSD editor C bridge (see osd_editor.h) ----------------------------
+//
+
+// Return a stable-enough C string for the menu to consume. Rotates through a
+// few static buffers so several results can be alive at once within one
+// menu-building statement.
+static const char *ed_cstr(const std::string &s) {
+	static std::string bufs[8];
+	static unsigned idx = 0;
+	idx = (idx + 1) % 8;
+	bufs[idx] = s;
+	return bufs[idx].c_str();
+}
+
+// "Add widget" presets. Each carries a working template/icon/color so the user
+// never has to type anything; only facts (via dropdowns) and position need
+// tweaking afterwards. Positions default to a visible on-screen spot.
+struct OsdPreset { const char *label; const char *json; };
+static const OsdPreset g_osd_presets[] = {
+	{ "Text label", R"json({"name":"Text","type":"TextWidget","x":50,"y":50,"text":"Label","facts":[]})json" },
+	{ "Box / background", R"json({"name":"Box","type":"BoxWidget","x":50,"y":50,"width":200,"height":80,"color":{"r":0.0,"g":0.0,"b":0.0,"alpha":0.4},"facts":[]})json" },
+	{ "Templated text", R"json({"name":"Value","type":"TplTextWidget","x":50,"y":50,"template":"%d","facts":[{"name":""}]})json" },
+	{ "Icon + templated text", R"json({"name":"Icon value","type":"IconTplTextWidget","x":50,"y":50,"icon_path":"memory.png","template":"%d","facts":[{"name":""}]})json" },
+	{ "Icon selector (RSSI/value)", R"json({"name":"RSSI","type":"IconSelectorWidget","x":50,"y":50,"facts":[{"name":"wfbcli.rx.ant_stats.rssi_avg","tags":{"ant_id":"0","id":"video rx"}}],"ranges_and_icons":[{"range":[-40,1],"icon_path":"signal1.png"},{"range":[-48,-41],"icon_path":"signal2.png"},{"range":[-56,-49],"icon_path":"signal3.png"},{"range":[-64,-57],"icon_path":"signal4.png"},{"range":[-72,-65],"icon_path":"signal5.png"},{"range":[-80,-73],"icon_path":"signal6.png"},{"range":[-90,-81],"icon_path":"signal7.png"},{"range":[-130,-91],"icon_path":"signal8.png"}]})json" },
+	{ "Video FPS / resolution", R"json({"name":"Video FPS","type":"VideoWidget","x":50,"y":50,"icon_path":"framerate.png","template":"%u fps | %ux%u","per_second_window_s":2,"per_second_bucket_ms":200,"facts":[{"name":"video.displayed_frame"},{"name":"video.width"},{"name":"video.height"}]})json" },
+	{ "Video bitrate", R"json({"name":"Bitrate","type":"VideoBitrateWidget","x":50,"y":50,"icon_path":"network.png","template":"%f Mbps","per_second_window_s":2,"per_second_bucket_ms":100,"facts":[{"name":"gstreamer.received_bytes"}]})json" },
+	{ "Decode latency", R"json({"name":"Decode latency","type":"VideoDecodeLatencyWidget","x":50,"y":50,"icon_path":"latency.png","template":"%u/%u/%u ms","per_second_window_s":2,"per_second_bucket_ms":100,"facts":[{"name":"video.decode_latency"}]})json" },
+	{ "Battery cell voltage", R"json({"name":"Battery cell","type":"BatteryCellWidget","x":50,"y":50,"template":"(cell: %.2fV)","critical_voltage":3.5,"max_voltage":4.2,"num_cells":"even","facts":[{"name":"os_mon.power.voltage"}]})json" },
+	{ "DVR status", R"json({"name":"DVR status","type":"DvrStatusWidget","x":50,"y":50,"icon_path":"sdcard-white.png","text":"Recording","facts":[{"name":"dvr.recording"}]})json" },
+	{ "Fading popup message", R"json({"name":"Popup","type":"PopupWidget","x":50,"y":50,"timeout_ms":10000,"facts":[{"name":"osd.custom_message"}]})json" },
+};
+static const int g_osd_preset_count = (int)(sizeof(g_osd_presets) / sizeof(g_osd_presets[0]));
+
+int osd_ed_count(void) { return g_osd ? g_osd->editorCount() : 0; }
+const char *osd_ed_type(int idx) { return g_osd ? ed_cstr(g_osd->editorType(idx)) : ""; }
+const char *osd_ed_name(int idx) { return g_osd ? ed_cstr(g_osd->editorName(idx)) : ""; }
+const char *osd_ed_label(int idx) {
+	if (!g_osd) return "";
+	std::string name = g_osd->editorName(idx);
+	std::string type = g_osd->editorType(idx);
+	if (name.empty()) name = "(unnamed)";
+	return ed_cstr(name + "  (" + type + ")");
+}
+
+void osd_ed_get_xy(int idx, int *x, int *y) {
+	int lx = 0, ly = 0;
+	if (g_osd) g_osd->editorGetXY(idx, &lx, &ly);
+	if (x) *x = lx;
+	if (y) *y = ly;
+}
+void osd_ed_set_xy(int idx, int x, int y) { if (g_osd) g_osd->editorSetXY(idx, x, y); }
+
+void osd_ed_position_set_target(int idx) { g_osd_position_target = idx; }
+int  osd_ed_position_target(void) { return g_osd_position_target; }
+void osd_ed_nudge(int dx, int dy) {
+	if (!g_osd || g_osd_position_target < 0) return;
+	int x = 0, y = 0;
+	g_osd->editorGetXY(g_osd_position_target, &x, &y);
+	g_osd->editorSetXY(g_osd_position_target, x + dx, y + dy);
+}
+
+int osd_ed_num_count(int idx) {
+	return g_osd ? (int)g_osd->editorNumFields(idx).size() : 0;
+}
+const char *osd_ed_num_key(int idx, int f) {
+	if (!g_osd) return "";
+	auto v = g_osd->editorNumFields(idx);
+	if (f < 0 || f >= (int)v.size()) return "";
+	return ed_cstr(v[f]);
+}
+long osd_ed_num_value(int idx, int f) {
+	if (!g_osd) return 0;
+	auto v = g_osd->editorNumFields(idx);
+	if (f < 0 || f >= (int)v.size()) return 0;
+	return g_osd->editorGetNum(idx, v[f]);
+}
+void osd_ed_set_num(int idx, const char *key, long val) {
+	if (g_osd && key) g_osd->editorSetNum(idx, key, val);
+}
+
+int osd_ed_has_color(int idx) { return (g_osd && g_osd->editorHasColor(idx)) ? 1 : 0; }
+void osd_ed_get_color(int idx, int *r, int *g, int *b, int *a) {
+	int lr = 0, lg = 0, lb = 0, la = 100;
+	if (g_osd) g_osd->editorGetColor(idx, &lr, &lg, &lb, &la);
+	if (r) *r = lr; if (g) *g = lg; if (b) *b = lb; if (a) *a = la;
+}
+void osd_ed_set_color(int idx, int r, int g, int b, int a) {
+	if (g_osd) g_osd->editorSetColor(idx, r, g, b, a);
+}
+
+int osd_ed_has_ranges(int idx) { return (g_osd && g_osd->editorHasRanges(idx)) ? 1 : 0; }
+int osd_ed_range_count(int idx) { return g_osd ? g_osd->editorRangeCount(idx) : 0; }
+long osd_ed_range_min(int idx, int r) { return g_osd ? g_osd->editorRangeBound(idx, r, 0) : 0; }
+long osd_ed_range_max(int idx, int r) { return g_osd ? g_osd->editorRangeBound(idx, r, 1) : 0; }
+void osd_ed_set_range_min(int idx, int r, long v) { if (g_osd) g_osd->editorSetRangeBound(idx, r, 0, v); }
+void osd_ed_set_range_max(int idx, int r, long v) { if (g_osd) g_osd->editorSetRangeBound(idx, r, 1, v); }
+const char *osd_ed_range_icon(int idx, int r) { return g_osd ? ed_cstr(g_osd->editorRangeIcon(idx, r)) : ""; }
+void osd_ed_set_range_icon(int idx, int r, const char *icon) {
+	if (g_osd && icon) g_osd->editorSetRangeIcon(idx, r, icon);
+}
+void osd_ed_add_range(int idx) { if (g_osd) g_osd->editorAddRange(idx); }
+void osd_ed_del_range(int idx, int r) { if (g_osd) g_osd->editorDelRange(idx, r); }
+
+int osd_ed_str_count(int idx) {
+	return g_osd ? (int)g_osd->editorStrFields(idx).size() : 0;
+}
+const char *osd_ed_str_key(int idx, int f) {
+	if (!g_osd) return "";
+	auto v = g_osd->editorStrFields(idx);
+	if (f < 0 || f >= (int)v.size()) return "";
+	return ed_cstr(v[f].first);
+}
+const char *osd_ed_str_value(int idx, int f) {
+	if (!g_osd) return "";
+	auto v = g_osd->editorStrFields(idx);
+	if (f < 0 || f >= (int)v.size()) return "";
+	return ed_cstr(v[f].second);
+}
+const char *osd_ed_get_string(int idx, const char *key) {
+	return (g_osd && key) ? ed_cstr(g_osd->editorGetString(idx, key)) : "";
+}
+void osd_ed_set_string(int idx, const char *key, const char *val) {
+	if (g_osd && key && val) g_osd->editorSetString(idx, key, val);
+}
+const char *osd_ed_reg_icons(void) {
+	return g_osd ? ed_cstr(g_osd->editorRegIcons()) : "";
+}
+
+int osd_ed_fact_count(int idx) { return g_osd ? g_osd->editorFactCount(idx) : 0; }
+const char *osd_ed_fact_name(int idx, int f) {
+	return g_osd ? ed_cstr(g_osd->editorFactName(idx, f)) : "";
+}
+void osd_ed_set_fact_name(int idx, int f, const char *name) {
+	if (g_osd && name) g_osd->editorSetFactName(idx, f, name);
+}
+int osd_ed_fact_tag_count(int idx, int f) {
+	return g_osd ? (int)g_osd->editorFactTags(idx, f).size() : 0;
+}
+const char *osd_ed_fact_tag_key(int idx, int f, int t) {
+	if (!g_osd) return "";
+	auto v = g_osd->editorFactTags(idx, f);
+	if (t < 0 || t >= (int)v.size()) return "";
+	return ed_cstr(v[t].first);
+}
+const char *osd_ed_fact_tag_value(int idx, int f, int t) {
+	if (!g_osd) return "";
+	auto v = g_osd->editorFactTags(idx, f);
+	if (t < 0 || t >= (int)v.size()) return "";
+	return ed_cstr(v[t].second);
+}
+void osd_ed_set_fact_tag(int idx, int f, const char *key, const char *val) {
+	if (g_osd && key && val) g_osd->editorSetFactTag(idx, f, key, val);
+}
+void osd_ed_add_fact(int idx) { if (g_osd) g_osd->editorAddFact(idx); }
+void osd_ed_del_fact(int idx, int f) { if (g_osd) g_osd->editorDelFact(idx, f); }
+void osd_ed_add_fact_tag(int idx, int f, const char *key) {
+	if (g_osd && key) g_osd->editorAddFactTag(idx, f, key);
+}
+void osd_ed_del_fact_tag(int idx, int f, const char *key) {
+	if (g_osd && key) g_osd->editorDelFactTag(idx, f, key);
+}
+const char *osd_ed_avail_tag_keys(int idx, int f) {
+	return g_osd ? ed_cstr(g_osd->editorAvailTagKeys(idx, f)) : "";
+}
+const char *osd_ed_fact_convert(int idx, int f) {
+	return g_osd ? ed_cstr(g_osd->editorFactConvert(idx, f)) : "";
+}
+void osd_ed_set_fact_convert(int idx, int f, const char *expr) {
+	if (g_osd && expr) g_osd->editorSetFactConvert(idx, f, expr);
+}
+
+const char *osd_ed_reg_fact_names(void) {
+	return g_osd ? ed_cstr(g_osd->regFactNames()) : "";
+}
+const char *osd_ed_reg_tag_keys(const char *fact) {
+	return (g_osd && fact) ? ed_cstr(g_osd->regTagKeys(fact)) : "";
+}
+const char *osd_ed_reg_tag_values(const char *fact, const char *key) {
+	return (g_osd && fact && key) ? ed_cstr(g_osd->regTagValues(fact, key)) : "";
+}
+
+int osd_ed_preset_count(void) { return g_osd_preset_count; }
+const char *osd_ed_preset_label(int i) {
+	if (i < 0 || i >= g_osd_preset_count) return "";
+	return g_osd_presets[i].label;
+}
+int osd_ed_add_preset(int i) {
+	if (!g_osd || i < 0 || i >= g_osd_preset_count) return -1;
+	return g_osd->editorAddJson(g_osd_presets[i].json);
+}
+
+int osd_ed_move(int idx, int dir) { return g_osd ? g_osd->editorMove(idx, dir) : idx; }
+void osd_ed_delete(int idx) { if (g_osd) g_osd->editorDelete(idx); }
+void osd_ed_save(void) { if (g_osd) g_osd->editorSave(); }
 
 #ifdef __cplusplus
 }

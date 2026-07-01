@@ -3,6 +3,7 @@
 #define INPUT_H
 
 #include <stdint.h>
+#include <stdbool.h>
 #include "lvgl/lvgl.h"
 
 typedef enum {
@@ -26,6 +27,13 @@ void restore_stdin(void);
 
 // Handle WASD input and convert to LVGL key codes
 void handle_keyboard_input(void);
+
+// ---- OSD editor on-screen "position mode" ----
+// Hide the menu, show the live OSD, and let the d-pad nudge the OSD widget
+// currently targeted via osd_ed_position_set_target(). On commit the menu is
+// restored and input refocused on return_group.
+void osd_position_enter(lv_group_t *return_group, void (*on_done)(void));
+bool osd_position_active(void);
 
 void toggle_rec_enabled(void);
 

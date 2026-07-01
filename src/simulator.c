@@ -25,6 +25,14 @@ size_t airactions_count = 0;
 MenuAction gsactions[MAX_ACTIONS];
 size_t gsactions_count = 0;
 
+// Stubs for restream_* (defined in gstrtpreceiver.cpp, not built for the sim)
+void restream_set_enabled(bool enabled) { (void)enabled; }
+bool restream_get_enabled(void) { return false; }
+void restream_scan_clients(char* buf, size_t buf_len) { if (buf && buf_len) buf[0] = 0; }
+void restream_set_manual_ip(const char* ip) { (void)ip; }
+const char* restream_get_manual_ip(void) { return ""; }
+void restream_set_pinned_ip(const char* ip) { (void)ip; }
+
 int dvr_get_mode(void)          { return 0; }
 int dvr_reenc_get_osd(void)     { return 0; }
 int dvr_reenc_get_fps(void)     { return 30; }

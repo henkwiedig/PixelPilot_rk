@@ -566,7 +566,7 @@ void create_gs_system_dvr_menu(lv_obj_t * parent) {
     lv_group_set_default(default_group);
 }
 
-void create_gs_system_menu(lv_obj_t * parent, lv_obj_t * receiver_page, lv_obj_t * display_page, lv_obj_t * dvr_page) {
+void create_gs_system_menu(lv_obj_t * parent, lv_obj_t * receiver_page, lv_obj_t * display_page, lv_obj_t * dvr_page, lv_obj_t * osd_page) {
     menu_page_data_t* menu_page_data = malloc(sizeof(menu_page_data_t));
     strcpy(menu_page_data->type, "gs");
     strcpy(menu_page_data->page, "system");
@@ -597,6 +597,11 @@ void create_gs_system_menu(lv_obj_t * parent, lv_obj_t * receiver_page, lv_obj_t
     lv_group_add_obj(menu_page_data->indev_group, dvr_item);
     lv_menu_set_load_page_event(menu, dvr_item, dvr_page);
     lv_obj_add_event_cb(dvr_item, generic_back_event_handler, LV_EVENT_KEY, NULL);
+
+    lv_obj_t * osd_item = create_text(section, LV_SYMBOL_EDIT, "OSD Editor", NULL, NULL, false, LV_MENU_ITEM_BUILDER_VARIANT_1);
+    lv_group_add_obj(menu_page_data->indev_group, osd_item);
+    lv_menu_set_load_page_event(menu, osd_item, osd_page);
+    lv_obj_add_event_cb(osd_item, generic_back_event_handler, LV_EVENT_KEY, NULL);
 
     lv_group_set_default(default_group);
 }

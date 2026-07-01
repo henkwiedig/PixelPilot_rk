@@ -653,8 +653,8 @@ lv_obj_t * find_first_focusable_obj(lv_obj_t * parent) {
     for (int i = 0; i < lv_obj_get_child_cnt(parent); i++) {
         lv_obj_t * child = lv_obj_get_child(parent, i);
 
-        // Check if the child is focusable
-        if ((lv_obj_has_flag(child, LV_OBJ_FLAG_CHECKABLE) || lv_obj_has_flag(child, LV_OBJ_FLAG_CLICKABLE)) && ! lv_obj_has_state(child, LV_STATE_DISABLED)) {
+        // Check if the child is focusable (hidden objects can't receive focus)
+        if ((lv_obj_has_flag(child, LV_OBJ_FLAG_CHECKABLE) || lv_obj_has_flag(child, LV_OBJ_FLAG_CLICKABLE)) && ! lv_obj_has_state(child, LV_STATE_DISABLED) && ! lv_obj_has_flag(child, LV_OBJ_FLAG_HIDDEN)) {
             lv_group_t * group = lv_obj_get_group(child);
             if (group != NULL) {
                 return child; // Return the first focusable object

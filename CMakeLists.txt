@@ -70,6 +70,8 @@ set(SIMULATOR_SOURCES
         src/gsmenu/gs_actions.c
         src/gsmenu/gs_scripts.h
         src/gsmenu/gs_scripts.c
+        src/gsmenu/gs_osd.h
+        src/gsmenu/gs_osd.c
         src/gsmenu/gs_connection_checker.h
         src/gsmenu/gs_connection_checker.c
         src/gsmenu/air_wfbng.h
@@ -81,6 +83,8 @@ set(SIMULATOR_SOURCES
         src/gsmenu/ui.c
         src/gsmenu/styles.h
         src/gsmenu/styles.c
+        src/osd_editor.h
+        src/osd_editor_sim.c
         src/lvosd.h
         src/lvosd.c
         src/menu.h
@@ -130,11 +134,13 @@ set(LIB_SOURCE_FILES
         src/gsmenu/gs_actions.c
         src/gsmenu/gs_scripts.h
         src/gsmenu/gs_scripts.c
+        src/gsmenu/gs_osd.h
+        src/gsmenu/gs_osd.c
         src/gsmenu/gs_connection_checker.h
         src/gsmenu/gs_connection_checker.c
         src/gsmenu/styles.h
         src/gsmenu/styles.c
-        src/gsmenu/ui.c 
+        src/gsmenu/ui.c
         src/lvosd.h
         src/lvosd.c
         src/menu.h
@@ -143,6 +149,7 @@ set(LIB_SOURCE_FILES
         src/input.cpp
         src/osd.h
         src/osd.hpp
+        src/osd_editor.h
         src/osd.cpp
         src/os_mon.hpp
         src/os_mon.cpp

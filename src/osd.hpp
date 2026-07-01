@@ -5,11 +5,13 @@ extern "C" {
 #include "drm.h"
 }
 #include <nlohmann/json.hpp>
+#include <string>
 
 typedef struct {
 	struct modeset_output *out;
 	int fd;
 	nlohmann::json config;
+	std::string config_path;   // path the OSD editor saves edits back to
 } osd_thread_params;
 
 extern int osd_thread_signal;
