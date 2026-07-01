@@ -26,8 +26,10 @@ unsigned long long get_rx_bytes(const char *interface_name) {
     int found = 0;
 
     // Skip the first two header lines
-    fgets(line, sizeof(line), file);
-    fgets(line, sizeof(line), file);
+    if (!fgets(line, sizeof(line), file) || !fgets(line, sizeof(line), file)) {
+        fclose(file);
+        return 0;
+    }
 
     while (fgets(line, sizeof(line), file)) {
         char iface[64];
