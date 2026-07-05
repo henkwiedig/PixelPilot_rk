@@ -348,7 +348,7 @@ void *__FRAME_THREAD__(void *param)
 				}
 
 				MppBuffer buffer = mpp_frame_get_buffer(frame);
-				if (buffer) {
+				if (buffer && !discard) {
 					output_list->video_poc = mpp_frame_get_poc(frame);
 					uint64_t feed_data_ts =  mpp_frame_get_pts(frame);
 
@@ -382,6 +382,8 @@ void *__FRAME_THREAD__(void *param)
 						                       decoded_hor_stride,
 						                       decoded_ver_stride, fmt);
 					}
+				} else {
+					spdlog::warn("dropping frame (buffer={}, discard={})", buffer ? "ok" : "null", discard);
 				}
 			}
 			
