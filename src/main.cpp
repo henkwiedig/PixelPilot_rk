@@ -975,12 +975,33 @@ void main_loop() {
 }
 
 uint64_t first_frame_ms=0;
+// Publish the active video codec as OSD facts: a human-readable string
+// ("video.codec" = "h264"/"h265") for text widgets, and a numeric id
+// ("video.codec_id" = 0/1) for IconSelectorWidget, which selects by number.
+static void publish_codec_fact(VideoCodec c) {
+	osd_publish_str_fact("video.codec", NULL, 0,
+	                     (c == VideoCodec::H265) ? "h265" : "h264");
+	osd_publish_uint_fact("video.codec_id", NULL, 0,
+	                      (c == VideoCodec::H265) ? 1u : 0u);
+}
+
 void read_gstreamerpipe_stream(MppPacket *packet, int gst_udp_port, const char *sock ,const VideoCodec& codec){
 	if (sock) {
 		receiver = std::make_unique<GstRtpReceiver>(sock, codec);
 	} else {
 		receiver = std::make_unique<GstRtpReceiver>(gst_udp_port, codec);
 	}
+	// Realign the MPP decoder whenever the receiver detects a mid-stream codec
+	// switch and rebuilds its pipeline.
+	receiver->set_codec_changed_callback([](VideoCodec c) {
+		MppCodingType t = (c == VideoCodec::H265) ? MPP_VIDEO_CodingHEVC : MPP_VIDEO_CodingAVC;
+		stream_mpp_type = t;
+		// Keep the global codec in sync so the decoder info-change handler
+		// (init_buffer) hands the raw DVR the right codec and rolls its file.
+		::codec = c;
+		reinit_mpp_decoder(t);
+		publish_codec_fact(c);
+	});
 	long long bytes_received = 0; 
 	uint64_t period_start=0;
     auto cb=[&packet,/*&decoder_stalled_count,*/ &bytes_received, &period_start](std::shared_ptr<std::vector<uint8_t>> frame){
@@ -1011,6 +1032,14 @@ void read_gstreamerpipe_stream(MppPacket *packet, int gst_udp_port, const char *
         }
     };
     receiver->start_receiving(cb);
+    // In auto mode the global codec stays UNKNOWN through receiver construction
+    // (that sentinel is how the receiver knows to auto-detect). Now that the
+    // pipeline has resolved a codec, reflect it globally so DVR setup
+    // (init_buffer) and the OSD use it. The MPP decoder was already initialized
+    // for this codec in main(); a genuine mid-stream change is handled by the
+    // codec-changed callback above.
+    ::codec = receiver->get_active_codec();
+    publish_codec_fact(::codec);
     main_loop();
     receiver->stop_receiving();
     spdlog::info("Feeding eos");
@@ -1087,7 +1116,7 @@ void printHelp() {
     "\n"
     "    --mavlink-dvr-on-arm   - Start recording when armed\n"
     "\n"
-    "    --codec <codec>        - Video codec, should be the same as on VTX  (Default: h265 <h264|h265>)\n"
+    "    --codec <codec>        - Video codec, should be the same as on VTX  (Default: h265 <h264|h265|auto>)\n"
     "\n"
     "    --log-level <level>    - Log verbosity level, debug|info|warn|error (Default: info)\n"
     "\n"
@@ -1198,6 +1227,12 @@ int main(int argc, char **argv)
 
 	__OnArgument("--codec") {
 		char * codec_str = const_cast<char*>(__ArgValue);
+		if (!strcmp(codec_str, "auto")) {
+			// Sentinel: build for H.265 and let the receiver flip codec from the
+			// RTP ingress if the stream turns out to be H.264.
+			codec = VideoCodec::UNKNOWN;
+			continue;
+		}
 		codec = video_codec(codec_str);
 		if (codec == VideoCodec::UNKNOWN ) {
 			fprintf(stderr, "unsupported video codec");

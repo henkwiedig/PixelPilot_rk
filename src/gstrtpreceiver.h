@@ -16,6 +16,7 @@
 #include <memory>
 #include <vector>
 #include <functional>
+#include <mutex>
 
 #define MAX_PACKET_SIZE 4096
 #define RTP_HEADER_LEN 12
@@ -62,7 +63,17 @@ public:
     void normal_playback();
     void pause();
     void resume();
+    // The codec the live pipeline is currently built for. When constructed with
+    // VideoCodec::UNKNOWN ("auto") this defaults to H.265 in switch_to_stream()
+    // and is updated if mid-stream detection flips it; valid only after
+    // start_receiving()/switch_to_stream().
+    VideoCodec get_active_codec() const { return m_video_codec; }
+    // Invoked (on an internal thread) after a mid-stream codec switch has been
+    // detected and the pipeline rebuilt, so the host can realign its decoder.
+    void set_codec_changed_callback(std::function<void(VideoCodec)> cb);
 private:
+    // Rebuild the pipeline for new_codec after a mid-stream switch is detected.
+    void request_codec_switch(VideoCodec new_codec);
     std::string construct_gstreamer_pipeline();
     std::string construct_file_playback_pipeline(const char * file_path);
     void loop_pull_samples();
@@ -71,7 +82,14 @@ private:
     GstElement * m_gst_pipeline=nullptr;
     NEW_FRAME_CALLBACK m_cb;
     VideoCodec m_video_codec;
+    // True when constructed with VideoCodec::UNKNOWN ("auto"): the pipeline
+    // builds for H.265 and mid-stream codec-switch detection is enabled. False
+    // when the user pinned a codec, in which case we never override their choice.
+    bool m_auto_codec = false;
     VideoCodec m_playback_codec = VideoCodec::UNKNOWN;
+    // Notified after a detected mid-stream codec switch + pipeline rebuild.
+    std::function<void(VideoCodec)> m_on_codec_changed;
+    std::mutex m_codec_changed_mutex;
     int m_port;
     // appsink
     GstElement *m_app_sink_element = nullptr;
