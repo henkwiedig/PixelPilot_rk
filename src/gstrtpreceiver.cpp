@@ -77,6 +77,7 @@ namespace pipeline {
             return ss.str();
         }
         assert(false);
+        return "";
     }
 }
 
