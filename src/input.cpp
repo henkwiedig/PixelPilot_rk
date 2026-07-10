@@ -13,7 +13,7 @@
 #include "main.h"
 #include "lvgl/lvgl.h"
 #include "input.h"
-#include "gsmenu/gs_system.h"
+#include "menu.h"
 
 extern YAML::Node config;
 extern lv_group_t *main_group;
@@ -539,6 +539,12 @@ void handle_keyboard_input(void) {
                 }
                 else
                     timer = lv_timer_create(simulate_traffic, 50, NULL);
+                break;
+#endif
+#ifdef USE_SIMULATOR
+            case 'r':
+            case 'R':
+                toggle_rec_enabled();   /* simulate the hardware record button (sim only) */
                 break;
 #endif
             case 'q':

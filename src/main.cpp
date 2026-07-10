@@ -59,9 +59,6 @@ extern "C" {
 #include "pixelpilot_config.h"
 #include <iostream>
 #include "WiFiRSSIMonitor.hpp"
-#include "gsmenu/gs_system.h"
-#include "gsmenu/air_actions.h"
-#include "gsmenu/gs_actions.h"
 #include "menu.h"
 
 
@@ -642,6 +639,13 @@ extern "C" {
         if (dvr_reenc_inst) dvr_reenc_inst->stop_recording();
         dvr_enabled = 0;
         osd_publish_bool_fact("dvr.recording", NULL, 0, false);
+    }
+
+    /* C-callable wrapper so the menu (C) can set the raw DVR framerate without
+     * touching the C++ Dvr* directly. */
+    void dvr_set_video_framerate(Dvr* dvr, int f);   /* defined in dvr.cpp */
+    void dvr_set_raw_fps(int fps) {
+        if (dvr_raw) dvr_set_video_framerate(dvr_raw, fps);
     }
 
     // Switch DVR mode at runtime. Stops any active recording.

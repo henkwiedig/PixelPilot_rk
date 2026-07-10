@@ -394,6 +394,9 @@ case "$@" in
         echo 1.0
         emit_values "0.5 1.0"
         ;;
+    "get gs system gs_live_colortrans")
+        echo 0
+        ;;
     "get gs system rec_fps")
         echo 60
         emit_values "60\n90\n120"
@@ -422,6 +425,12 @@ case "$@" in
         echo -n "10000"
         emit_values "5000\n10000\n15000\n20000\n25000\n30000\n35000\n40000\n45000\n50000"
         ;;
+    "get gs system rec_enabled"*)
+        echo 0
+        ;;
+    "get gs system dvr_osd"*)
+        echo 0
+        ;;
 
     "set gs system rx_codec"*)              : ;;
     "set gs system rx_mode"*)               : ;;
@@ -429,6 +438,7 @@ case "$@" in
     "set gs system connector"*)             : ;;
     "set gs system resolution"*)            : ;;
     "set gs system video_scale"*)           : ;;
+    "set gs system gs_live_colortrans"*)    : ;;
     "set gs system rec_fps"*)               : ;;
     "set gs system rec_enabled"*)           : ;;
     "set gs system dvr_mode"*)              : ;;
@@ -485,6 +495,7 @@ case "$@" in
 
     "set gs wifi connect"*)     : ;;
     "set gs wifi disconnect"*)  : ;;
+    "set gs wifi forget"*)      : ;;   # integrator: forget/remove the saved network ($4 = SSID)
     "set gs wifi wlan"*)        : ;;
     "set gs wifi hotspot"*)     : ;;
 

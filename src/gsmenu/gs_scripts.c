@@ -40,18 +40,19 @@ typedef struct {
     char *output;
     size_t output_len;
     lv_group_t *group;
+    uint32_t term_tick;   /* tick when SIGTERM was sent (0 = not stopping); used
+                             to escalate to SIGKILL if the script ignores it   */
 } script_runner_t;
 
-static lv_obj_t *g_parent_page;
-static lv_obj_t *g_scripts_section;
-static menu_page_data_t *g_menu_page_data;
 static char *g_script_names[MAX_SCRIPT_COUNT];
 static int g_script_count;
 static lv_obj_t *g_confirm_msgbox;
 static lv_group_t *g_confirm_group;
 static char g_pending_script[256];
+/* group to restore the keypad to after the confirm/runner closes; captured at
+ * run time so the feature works from colmenu (no menu_page_data there). */
+static lv_group_t *g_return_group;
 
-static void build_script_list(void);
 static script_runner_t g_runner = {
     .pid = -1,
     .fd = -1,
@@ -114,6 +115,11 @@ static int collect_scripts(char **scripts, int max_scripts)
     return count;
 }
 
+int gs_scripts_collect(char **names, int max)
+{
+    return collect_scripts(names, max);
+}
+
 static void clear_script_names(void)
 {
     for (int i = 0; i < g_script_count; i++) {
@@ -158,8 +164,15 @@ static void runner_append(const char *text)
     g_runner.output[g_runner.output_len] = '\0';
 
     if (g_runner.output_ta && lv_obj_is_valid(g_runner.output_ta)) {
-        lv_textarea_set_text(g_runner.output_ta, g_runner.output);
-        lv_textarea_set_cursor_pos(g_runner.output_ta, LV_TEXTAREA_CURSOR_LAST);
+        lv_obj_t *ta = g_runner.output_ta;
+        lv_textarea_set_text(ta, g_runner.output);
+        lv_textarea_set_cursor_pos(ta, LV_TEXTAREA_CURSOR_LAST);
+        /* scroll the newest output into view */
+        lv_obj_update_layout(ta);
+        int32_t sb = lv_obj_get_scroll_bottom(ta);
+        if (sb > 0) {
+            lv_obj_scroll_by(ta, 0, -sb, LV_ANIM_OFF);
+        }
     }
 }
 
@@ -190,10 +203,17 @@ static void script_poll_timer_cb(lv_timer_t *timer)
     }
 
     if (g_runner.running && g_runner.pid > 0) {
+        /* Escalate to SIGKILL if the script ignored SIGTERM for over a second. */
+        if (g_runner.term_tick &&
+            lv_tick_elaps(g_runner.term_tick) > 1000) {
+            kill(-g_runner.pid, SIGKILL);
+            g_runner.term_tick = 0;
+        }
         int status = 0;
         pid_t ret = waitpid(g_runner.pid, &status, WNOHANG);
         if (ret == g_runner.pid) {
             g_runner.running = false;
+            g_runner.term_tick = 0;
             runner_finish_message(status);
             if (g_runner.fd >= 0) {
                 close(g_runner.fd);
@@ -219,12 +239,15 @@ static void close_runner_ui(void)
     }
 
     if (g_runner.running && g_runner.pid > 0) {
-        kill(g_runner.pid, SIGTERM);
+        /* Tearing down — force-kill the whole process group (SIGKILL can't be
+         * ignored) so nothing is left running when the dialog closes. */
+        kill(-g_runner.pid, SIGKILL);
         waitpid(g_runner.pid, NULL, 0);
     }
 
     g_runner.running = false;
     g_runner.pid = -1;
+    g_runner.term_tick = 0;
 
     if (g_runner.msgbox && lv_obj_is_valid(g_runner.msgbox)) {
         lv_msgbox_close(g_runner.msgbox);
@@ -243,9 +266,9 @@ static void close_runner_ui(void)
         g_runner.group = NULL;
     }
 
-    /* Restore focus to the scripts page. */
-    if (g_menu_page_data && g_menu_page_data->indev_group) {
-        lv_indev_set_group(indev_drv, g_menu_page_data->indev_group);
+    /* Restore focus to wherever the run was launched from. */
+    if (g_return_group) {
+        lv_indev_set_group(indev_drv, g_return_group);
     }
 }
 
@@ -259,7 +282,12 @@ static void script_stop_cb(lv_event_t *e)
 {
     (void)e;
     if (g_runner.running && g_runner.pid > 0) {
-        kill(g_runner.pid, SIGTERM);
+        /* The child did setsid(), so it leads its own process group. Signal the
+         * whole GROUP (negative pid) — otherwise a foreground child of the shell
+         * (a loop, a sleep, a spawned tool) keeps running and the script never
+         * actually stops. */
+        kill(-g_runner.pid, SIGTERM);
+        g_runner.term_tick = lv_tick_get() ? lv_tick_get() : 1;
         runner_append("\nStopping script...\n");
     }
 }
@@ -394,6 +422,8 @@ static void start_script_runner(const char *script_name)
     lv_obj_add_style(g_runner.close_btn, &style_openipc, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_add_style(g_runner.close_btn, &style_openipc_outline, LV_PART_MAIN | LV_STATE_FOCUS_KEY);
 
+    theme_msgbox(g_runner.msgbox);
+
     /* Fixed size: triggers msgbox_size_changed_event_cb which sets flex_grow=1
      * on the content area, making the textarea fill the available height. */
     lv_obj_set_size(g_runner.msgbox, lv_pct(98), lv_pct(92));
@@ -423,9 +453,9 @@ static void confirm_cancel_cb(lv_event_t *e)
         lv_group_del(g_confirm_group);
         g_confirm_group = NULL;
     }
-    /* Restore focus to the scripts page. */
-    if (g_menu_page_data && g_menu_page_data->indev_group) {
-        lv_indev_set_group(indev_drv, g_menu_page_data->indev_group);
+    /* Restore focus to wherever the run was launched from. */
+    if (g_return_group) {
+        lv_indev_set_group(indev_drv, g_return_group);
     }
 }
 
@@ -443,19 +473,16 @@ static void confirm_execute_cb(lv_event_t *e)
     start_script_runner(g_pending_script);
 }
 
-static void run_script_cb(lv_event_t *e)
+/* Build the confirm dialog for g_pending_script. Deferred via lv_async_call from
+ * gs_scripts_run so the key press that launched it has released first (colmenu
+ * actions fire on the key press, and the release would otherwise click a button). */
+static void show_confirm_dialog(void *unused)
 {
-    const char *script_name = (const char *)lv_event_get_user_data(e);
-    if (!script_name || strchr(script_name, '/')) {
-        return;
-    }
-
+    (void)unused;
     if (g_confirm_msgbox && lv_obj_is_valid(g_confirm_msgbox)) {
         lv_msgbox_close(g_confirm_msgbox);
         g_confirm_msgbox = NULL;
     }
-
-    snprintf(g_pending_script, sizeof(g_pending_script), "%s", script_name);
 
     g_confirm_msgbox = lv_msgbox_create(NULL);
     lv_obj_add_style(g_confirm_msgbox, &style_openipc_lightdark_background, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -480,6 +507,8 @@ static void run_script_cb(lv_event_t *e)
     lv_obj_add_event_cb(cancel_btn, confirm_cancel_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(exec_btn, confirm_execute_cb, LV_EVENT_CLICKED, NULL);
 
+    theme_msgbox(g_confirm_msgbox);
+
     lv_obj_set_width(g_confirm_msgbox, lv_pct(75));
 
     /* Create a dedicated input group so key navigation reaches Cancel/Execute
@@ -487,68 +516,21 @@ static void run_script_cb(lv_event_t *e)
     g_confirm_group = lv_group_create();
     lv_group_add_obj(g_confirm_group, cancel_btn);
     lv_group_add_obj(g_confirm_group, exec_btn);
+    lv_group_focus_obj(cancel_btn);   /* default to the safe choice */
     lv_indev_set_group(indev_drv, g_confirm_group);
+    /* the key press that opened this (colmenu actions fire on press) is still
+     * down — without this its release would immediately click a button. */
+    lv_indev_wait_release(indev_drv);
 }
 
-static void build_script_list(void)
+void gs_scripts_run(const char *name)
 {
-    if (!g_parent_page || !g_menu_page_data) {
+    if (!name || strchr(name, '/')) {
         return;
     }
-
-    if (g_scripts_section && lv_obj_is_valid(g_scripts_section)) {
-        lv_obj_del(g_scripts_section);
-        g_scripts_section = NULL;
-    }
-
-    /* Set the page group as default so every new focusable widget (the inner
-     * lv_btn created by create_button) auto-registers into the correct group.
-     * This also ensures generic_back_event_handler receives key events so
-     * HOME / back navigation works. */
-    lv_group_set_default(g_menu_page_data->indev_group);
-
-    g_scripts_section = lv_menu_section_create(g_parent_page);
-    lv_obj_add_style(g_scripts_section, &style_openipc_section, 0);
-
-    g_script_count = collect_scripts(g_script_names, MAX_SCRIPT_COUNT);
-
-    if (g_script_count == 0) {
-        create_text(g_scripts_section, LV_SYMBOL_WARNING, "No scripts found", NULL, NULL, false, LV_MENU_ITEM_BUILDER_VARIANT_1);
-        create_text(g_scripts_section, NULL, "Place .sh files in " SCRIPT_DIR, NULL, NULL, false, LV_MENU_ITEM_BUILDER_VARIANT_1);
-    }
-
-    for (int i = 0; i < g_script_count; i++) {
-        /* Build a display label with a play icon; user_data keeps the raw name
-         * so the execute path is not affected. */
-        char display[300];
-        snprintf(display, sizeof(display), LV_SYMBOL_PLAY "  %s", g_script_names[i]);
-        lv_obj_t *row = create_button(g_scripts_section, display);
-        lv_obj_t *btn = lv_obj_get_child_by_type(row, 0, &lv_button_class);
-        lv_obj_add_event_cb(btn, run_script_cb, LV_EVENT_CLICKED, g_script_names[i]);
-    }
-
-    /* Restore the global default group. */
-    lv_group_set_default(default_group);
+    /* remember where to hand the keypad back (the column the run started from) */
+    g_return_group = lv_indev_get_group(indev_drv);
+    snprintf(g_pending_script, sizeof(g_pending_script), "%s", name);
+    show_confirm_dialog(NULL);
 }
 
-void gs_scripts_page_refresh(lv_obj_t *page)
-{
-    (void)page;
-    clear_script_names();
-    if (g_scripts_section && lv_obj_is_valid(g_scripts_section)) {
-        lv_obj_del(g_scripts_section);
-        g_scripts_section = NULL;
-    }
-    build_script_list();
-}
-
-void gs_scripts_init_in_page(lv_obj_t *parent, menu_page_data_t *menu_page_data)
-{
-    g_parent_page = parent;
-    g_menu_page_data = menu_page_data;
-
-    create_text(parent, LV_SYMBOL_DIRECTORY, "Custom Scripts", NULL, NULL, false, LV_MENU_ITEM_BUILDER_VARIANT_1);
-    create_text(parent, NULL, "Scripts are loaded from " SCRIPT_DIR, NULL, NULL, false, LV_MENU_ITEM_BUILDER_VARIANT_1);
-
-    build_script_list();
-}

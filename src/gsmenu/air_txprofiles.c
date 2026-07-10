@@ -3,7 +3,6 @@
 
 #include "lvgl/lvgl.h"
 #include "styles.h"
-#include "ui.h"
 #include "helper.h"
 #include "../input.h"
 #include "executor.h"
@@ -31,6 +30,7 @@ extern lv_indev_t * indev_drv;
 extern lv_group_t * default_group;
 extern lv_obj_t * pp_menu_screen;
 lv_group_t * tx_profile_group;
+lv_group_t * txprofiles_return_group;   /* set by the menu before launching */
 extern lv_obj_t * sub_air_alink_page;
 
 lv_obj_t * input_box;
@@ -370,8 +370,7 @@ static void txprofiles_back_button_callback(lv_event_t * e) {
     
     if(code == LV_EVENT_CLICKED) {
         lv_screen_load(pp_menu_screen);
-        menu_page_data_t * menu_page_data = (menu_page_data_t *) lv_obj_get_user_data(sub_air_alink_page);
-        lv_indev_set_group(indev_drv,menu_page_data->indev_group);
+        lv_indev_set_group(indev_drv, txprofiles_return_group);
         control_mode = GSMENU_CONTROL_MODE_NAV;
     }
 }
@@ -382,6 +381,8 @@ static void table_focus_callback(lv_event_t * e) {
 
 static void txprofiles_save_callback() {
     lv_screen_load(pp_menu_screen);
+    lv_indev_set_group(indev_drv, txprofiles_return_group);
+    control_mode = GSMENU_CONTROL_MODE_NAV;
 }
 
 // Function to save table data back to file
@@ -569,6 +570,9 @@ void create_table(lv_obj_t * parent) {
     lv_obj_add_style(table, &style_openipc_dark_background, LV_PART_MAIN);
     lv_obj_add_style(table, &style_openipc_outline, LV_PART_MAIN | LV_STATE_FOCUS_KEY);
     lv_obj_set_style_pad_all(table,2,LV_PART_ITEMS);
+    /* Local style (highest precedence) guarantees readable light cell text on
+     * the dark table background, incl. the "..." menu indicator in column 0. */
+    lv_obj_set_style_text_color(table, lv_color_hex(0xf2f4f8), LV_PART_ITEMS | LV_STATE_DEFAULT);
 
     // Add event handler
     lv_obj_add_event_cb(table, table_event_cb, LV_EVENT_ALL, NULL);
@@ -605,7 +609,6 @@ void create_table(lv_obj_t * parent) {
     lv_obj_set_style_outline_width(kb,0,LV_PART_MAIN | LV_STATE_FOCUS_KEY);
     lv_obj_add_style(kb, &style_openipc, LV_PART_ITEMS| LV_STATE_FOCUS_KEY);
     lv_obj_add_style(kb, &style_openipc_dark_background, LV_PART_ITEMS| LV_STATE_DEFAULT);
-    lv_obj_add_style(kb, &style_openipc_textcolor, LV_PART_ITEMS| LV_STATE_FOCUS_KEY);
     lv_obj_add_style(kb, &style_openipc_lightdark_background, LV_PART_MAIN | LV_STATE_DEFAULT);
     
     lv_obj_add_event_cb(kb, kb_event_cb, LV_EVENT_ALL,kb);
