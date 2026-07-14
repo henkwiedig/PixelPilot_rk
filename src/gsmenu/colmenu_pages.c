@@ -47,6 +47,12 @@ void dvr_set_max_size(int mb);
 void dvr_set_raw_fps(int fps);
 void dvr_start_all(void);
 void dvr_stop_all(void);
+/* USB webcam (UVC) live setters — same pattern as the DVR ones. */
+void webcam_set_enabled(int on);
+void webcam_set_osd(int enabled);
+void webcam_set_resolution(int idx);
+void webcam_set_fps(int fps);
+void webcam_set_quality(int q);
 #endif
 
 static void on_live_colortrans(const char * value)
@@ -140,6 +146,33 @@ static void on_dvr_reenc_bitrate(const char * value)
 {
     int kbps = value ? atoi(value) : 0;
     if(kbps > 0) DVR_LIVE(dvr_reenc_set_bitrate(kbps), "dvr_reenc_set_bitrate(%d)", kbps);
+}
+
+/* ── GS Webcam (UVC) live hooks ──────────────────────────────────────────── */
+static void on_webcam_enabled(const char * value)   /* start/stop the USB webcam */
+{
+    int on = (value && strcmp(value, "on") == 0) ? 1 : 0;
+    DVR_LIVE(webcam_set_enabled(on), "webcam_set_enabled(%d)", on);
+}
+static void on_webcam_osd(const char * value)        /* burn OSD into the webcam feed */
+{
+    int on = (value && strcmp(value, "on") == 0) ? 1 : 0;
+    DVR_LIVE(webcam_set_osd(on), "webcam_set_osd(%d)", on);
+}
+static void on_webcam_resolution(const char * value) /* 720p=0, 1080p=1 */
+{
+    int idx = (value && strcmp(value, "1080p") == 0) ? 1 : 0;
+    DVR_LIVE(webcam_set_resolution(idx), "webcam_set_resolution(%d)", idx);
+}
+static void on_webcam_fps(const char * value)
+{
+    int fps = value ? atoi(value) : 0;
+    if(fps > 0) DVR_LIVE(webcam_set_fps(fps), "webcam_set_fps(%d)", fps);
+}
+static void on_webcam_quality(const char * value)    /* JPEG quality 1..99 */
+{
+    int q = value ? atoi(value) : 0;
+    if(q > 0) DVR_LIVE(webcam_set_quality(q), "webcam_set_quality(%d)", q);
 }
 
 /* Full-screen editors reached from the menu (built by the app elsewhere). Each
@@ -396,12 +429,21 @@ static const colmenu_item_t sys_dvr_items[] = {
     { .kind=COLMENU_SWITCH,   .label="Record OSD in DVR", .param="dvr_osd",              .on_change=on_dvr_osd },
 };
 static const colmenu_page_t sys_dvr_page = { "DVR", "gs", "system", sys_dvr_items, 9 };
+static const colmenu_item_t sys_webcam_items[] = {
+    { .kind=COLMENU_SWITCH,   .label="Enabled",           .param="webcam_enabled",    .on_change=on_webcam_enabled },
+    { .kind=COLMENU_DROPDOWN, .label="Resolution",        .param="webcam_resolution", .on_change=on_webcam_resolution },
+    { .kind=COLMENU_DROPDOWN, .label="FPS",               .param="webcam_fps",        .on_change=on_webcam_fps },
+    { .kind=COLMENU_DROPDOWN, .label="Quality",           .param="webcam_quality",    .on_change=on_webcam_quality },
+    { .kind=COLMENU_SWITCH,   .label="Show OSD in webcam", .param="webcam_osd",        .on_change=on_webcam_osd },
+};
+static const colmenu_page_t sys_webcam_page = { "Webcam", "gs", "system", sys_webcam_items, 5 };
 static const colmenu_item_t system_items[] = {
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_WIFI,  .label="Receiver", .sub=&sys_receiver_page },
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_IMAGE, .label="Display",  .sub=&sys_display_page },
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_VIDEO, .label="DVR",      .sub=&sys_dvr_page },
+    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_VIDEO, .label="Webcam",   .sub=&sys_webcam_page },
 };
-static const colmenu_page_t system_page = { "System", "gs", "system", system_items, 3 };
+static const colmenu_page_t system_page = { "System", "gs", "system", system_items, 4 };
 
 /* WiFi. The WiFi page shows the live connection (get gs wifi ssid) — entering the
  * connected network gives Disconnect / Forget. "Networks" lists only AVAILABLE

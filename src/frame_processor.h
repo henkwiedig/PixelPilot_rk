@@ -56,6 +56,11 @@ public:
     // Set encoder output resolution (thread-safe).
     void set_resolution(EncResolution r) { target_res_.store((int)r, std::memory_order_relaxed); }
 
+    // Process/submit frames continuously, independent of the DVR recording
+    // state (dvr_enabled). The DVR pacer only encodes while recording; the
+    // webcam pacer must run whenever it exists. Thread-safe.
+    void set_always_active(bool on) { always_active_.store(on, std::memory_order_relaxed); }
+
     // Enable GPU color correction using the DRM gamma formula y = clamp((x+offset)*gain, 0, 1).
     // Safe to call from any thread.  drm_fd is used to create the GBM/EGL context (lazy).
     void set_color_correction(float gain, float offset, int drm_fd);
@@ -88,6 +93,7 @@ private:
     std::atomic<long>     interval_ns;
     std::atomic<int>      target_res_{1};  // 0=720p, 1=1080p
     std::atomic<bool>     running{true};
+    std::atomic<bool>     always_active_{false};  // true = ignore dvr_enabled gate
     std::mutex              mtx;       // guards pending (shared with frame/decoder thread)
     std::condition_variable cv_;       // signalled by push_latest(); processor waits here
     std::mutex              copy_mtx_; // held by processor while it uses a decoder buffer

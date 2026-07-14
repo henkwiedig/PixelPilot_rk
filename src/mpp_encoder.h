@@ -20,6 +20,7 @@ struct MppEncoderParams {
     int fps = 30;
     int bitrate_kbps = 8000;
     EncResolution resolution = EncResolution::Res1080p;
+    int quality = 80;  // MJPEG only: JPEG q_factor (1..99)
 };
 
 struct EncRpc {
@@ -29,6 +30,7 @@ struct EncRpc {
         RPC_SET_BITRATE,  // live bitrate change (no reinit)
         RPC_SET_CODEC,    // codec change (forces reinit on next frame)
         RPC_SET_FPS,      // fps change (forces reinit on next frame)
+        RPC_SET_QUALITY,  // MJPEG live q_factor change (no reinit)
         RPC_SHUTDOWN
     } command;
 
@@ -41,9 +43,10 @@ struct EncRpc {
     MppFrameFormat fmt = MPP_FMT_YUV420SP;
     uint64_t pts = 0;
 
-    // For RPC_SET_BITRATE / RPC_SET_FPS
+    // For RPC_SET_BITRATE / RPC_SET_FPS / RPC_SET_QUALITY
     int new_bitrate = 0;
     int new_fps     = 0;
+    int new_quality = 0;
     // For RPC_SET_CODEC
     VideoCodec new_codec = VideoCodec::UNKNOWN;
 };
@@ -66,6 +69,7 @@ public:
     void set_bitrate(int kbps);   // update RC bitrate without reinit
     void set_codec(VideoCodec c); // change codec — forces reinit on next frame
     void set_fps(int fps);        // change fps — forces reinit on next frame
+    void set_quality(int q);      // MJPEG q_factor — updated live without reinit
 
     VideoCodec get_codec() const { return params.codec; }
 

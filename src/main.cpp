@@ -52,6 +52,7 @@ extern "C" {
 #include "dvr.h"
 #include "mpp_encoder.h"
 #include "frame_processor.h"
+#include "uvc_sink.h"
 #include "gstrtpreceiver.h"
 #include "scheduling_helper.hpp"
 #include "time_util.h"
@@ -128,6 +129,26 @@ static pthread_t g_tid_fproc = 0;
 static pthread_t g_tid_dvr_raw   = 0;
 static pthread_t g_tid_dvr_reenc = 0;
 
+// ── USB webcam (UVC) re-stream ──────────────────────────────────────────────
+// Independent MJPEG pipeline (own encoder + pacer + UVC sink) so it can run
+// concurrently with the H264/H265 DVR re-encode. Mirrors the DVR globals above.
+FrameProcessor  *webcam_frame_proc = nullptr;
+MppEncoder      *webcam_encoder    = nullptr;
+UvcSink         *webcam_sink       = nullptr;
+MppEncoderParams webcam_params = [] {
+    MppEncoderParams p;
+    p.codec      = VideoCodec::MJPEG;
+    p.resolution = EncResolution::Res720p;
+    p.fps        = 30;
+    p.quality    = 80;
+    return p;
+}();
+bool webcam_enabled = false;
+bool webcam_osd     = false;
+static bool webcam_autostart = false;
+static pthread_t g_tid_webcam_enc   = 0;
+static pthread_t g_tid_webcam_fproc = 0;
+
 // Decoded frame geometry – updated in init_buffer(), used in __FRAME_THREAD__
 uint32_t decoded_hor_stride = 0;
 uint32_t decoded_ver_stride = 0;
@@ -181,6 +202,7 @@ void init_buffer(MppFrame frame) {
 	// the group.  Without this the group teardown races with the pacer's copy
 	// loop and the buffer fds become invalid while still in use.
 	if (frame_proc) frame_proc->drain_decoder_refs();
+	if (webcam_frame_proc) webcam_frame_proc->drain_decoder_refs();
 
 	if (mpi.frm_grp) {
 		spdlog::debug("Freeing current mpp_buffer_group");
@@ -370,14 +392,23 @@ void *__FRAME_THREAD__(void *param)
 					ret = pthread_mutex_unlock(&video_mutex);
 					assert(!ret);
 
-					if (frame_proc != nullptr &&
+					if ((frame_proc != nullptr || webcam_frame_proc != nullptr) &&
 					    decoded_hor_stride > 0 && decoded_ver_stride > 0) {
 						MppFrameFormat fmt = mpp_frame_get_fmt(frame);
-						frame_proc->push_latest(buffer,
-						                       output_list->video_frm_width,
-						                       output_list->video_frm_height,
-						                       decoded_hor_stride,
-						                       decoded_ver_stride, fmt);
+						// push_latest() takes its own buffer ref, so fanning out to
+						// both the DVR and webcam pacers is ref-safe.
+						if (frame_proc != nullptr)
+							frame_proc->push_latest(buffer,
+							                       output_list->video_frm_width,
+							                       output_list->video_frm_height,
+							                       decoded_hor_stride,
+							                       decoded_ver_stride, fmt);
+						if (webcam_frame_proc != nullptr)
+							webcam_frame_proc->push_latest(buffer,
+							                       output_list->video_frm_width,
+							                       output_list->video_frm_height,
+							                       decoded_hor_stride,
+							                       decoded_ver_stride, fmt);
 					}
 				} else {
 					spdlog::warn("dropping frame (buffer={}, discard={})", buffer ? "ok" : "null", discard);
@@ -497,6 +528,15 @@ void sig_handler(int signum)
 	if (reencoder != NULL) {
 		reencoder->shutdown();
 	}
+	if (webcam_frame_proc != NULL) {
+		webcam_frame_proc->shutdown();
+	}
+	if (webcam_encoder != NULL) {
+		webcam_encoder->shutdown();
+	}
+	if (webcam_sink != NULL) {
+		webcam_sink->stop();
+	}
 	return_value = signum;
 }
 
@@ -566,6 +606,32 @@ static void *dvr_shutdown_worker(void *arg) {
     delete ctx->p;
     delete ctx->e;
     delete ctx->dvr_inst;
+    delete ctx;
+    return nullptr;
+}
+
+static void webcam_target_dims(uint32_t &w, uint32_t &h) {
+    if (webcam_params.resolution == EncResolution::Res720p) { w = 1280; h = 720; }
+    else { w = 1920; h = 1080; }
+}
+
+// Detached teardown for the webcam pipeline (mirrors dvr_shutdown_worker): join
+// the pacer + encoder threads (so no callback can touch the sink), then delete
+// everything and drop the gadget. Runs off the UI thread to avoid blocking on joins.
+struct WebcamShutdownCtx {
+    FrameProcessor *p;
+    MppEncoder     *e;
+    UvcSink        *s;
+    pthread_t       tp, te;
+};
+static void *webcam_shutdown_worker(void *arg) {
+    auto *ctx = static_cast<WebcamShutdownCtx *>(arg);
+    if (ctx->tp) pthread_join(ctx->tp, nullptr);
+    if (ctx->te) pthread_join(ctx->te, nullptr);
+    delete ctx->p;
+    delete ctx->e;
+    if (ctx->s) { ctx->s->stop(); delete ctx->s; }
+    system("/usr/sbin/webcam-gadget down");
     delete ctx;
     return nullptr;
 }
@@ -657,6 +723,111 @@ extern "C" {
         dvr_enabled = 0;
         osd_publish_bool_fact("dvr.recording", NULL, 0, false);
     }
+
+    // ── USB webcam (UVC) live control ───────────────────────────────────────
+    // Toggle the webcam pipeline. On: bring up the gadget (auto-detect UDC),
+    // then create MJPEG encoder + pacer + UVC sink. Off: tear down + drop gadget.
+    void webcam_set_enabled(int on) {
+        if ((bool)on == webcam_enabled) return;
+        if (on) {
+            webcam_params.codec = VideoCodec::MJPEG;
+            uint32_t ww, wh; webcam_target_dims(ww, wh);
+
+            // Bring up the gadget for exactly this resolution/fps so the configfs
+            // descriptors, the UVC sink, and the encoder all agree on one frame.
+            char cmd[160];
+            snprintf(cmd, sizeof(cmd), "/usr/sbin/webcam-gadget up %u %u %d",
+                     ww, wh, webcam_params.fps);
+            if (system(cmd) != 0)
+                spdlog::warn("webcam-gadget up returned non-zero (continuing)");
+
+            std::vector<UvcSink::FrameSize> frames = {
+                { ww, wh, (uint32_t)webcam_params.fps }
+            };
+            webcam_sink = new UvcSink(frames);
+            if (!webcam_sink->start()) {
+                spdlog::error("webcam: UvcSink failed to start; aborting enable");
+                delete webcam_sink; webcam_sink = nullptr;
+                system("/usr/sbin/webcam-gadget down");
+                return;
+            }
+
+            webcam_encoder = new MppEncoder(webcam_params,
+                [](std::shared_ptr<std::vector<uint8_t>> jpeg) {
+                    static bool first = true;  // __ENCODER thread only
+                    if (first && jpeg && !jpeg->empty()) {
+                        spdlog::info("webcam: producing MJPEG (~{} bytes/frame)", jpeg->size());
+                        first = false;
+                    }
+                    if (webcam_sink) webcam_sink->submit_frame(jpeg);
+                });
+            pthread_create(&g_tid_webcam_enc, NULL, &MppEncoder::__THREAD__, webcam_encoder);
+
+            webcam_frame_proc = new FrameProcessor(webcam_encoder, webcam_params.fps,
+                                                   webcam_params.resolution, drm_fd);
+            // The webcam streams continuously — it must not be gated by the DVR
+            // recording state the way the DVR pacer is.
+            webcam_frame_proc->set_always_active(true);
+            if (enable_live_colortrans)
+                webcam_frame_proc->set_color_correction(live_colortrans_gain,
+                                                        live_colortrans_offset, drm_fd);
+            pthread_create(&g_tid_webcam_fproc, NULL, &FrameProcessor::__THREAD__, webcam_frame_proc);
+
+            webcam_enabled = true;
+            spdlog::info("webcam: enabled {}x{} MJPEG @ {}fps q{}",
+                         ww, wh, webcam_params.fps, webcam_params.quality);
+        } else {
+            // Null the globals first so the decoder/OSD fan-out and encoder
+            // callback stop touching them, then join+delete off the UI thread.
+            FrameProcessor *p = webcam_frame_proc;
+            MppEncoder     *e = webcam_encoder;
+            UvcSink        *s = webcam_sink;
+            pthread_t tp = g_tid_webcam_fproc;
+            pthread_t te = g_tid_webcam_enc;
+            webcam_frame_proc = nullptr;
+            webcam_encoder    = nullptr;
+            webcam_sink       = nullptr;
+            g_tid_webcam_fproc = 0;
+            g_tid_webcam_enc   = 0;
+            webcam_enabled = false;
+            if (p) p->shutdown();
+            if (e) e->shutdown();
+            auto *ctx = new WebcamShutdownCtx{p, e, s, tp, te};
+            pthread_t cleanup_tid;
+            pthread_create(&cleanup_tid, NULL, webcam_shutdown_worker, ctx);
+            pthread_detach(cleanup_tid);
+            spdlog::info("webcam: disabled");
+        }
+    }
+
+    void webcam_set_osd(int enabled) {
+        webcam_osd = (bool)enabled;
+        if (!enabled && webcam_frame_proc)
+            webcam_frame_proc->set_osd_blend(-1, 0, 0, 0);
+    }
+
+    // Note: a live resolution change updates the encoder output but does NOT
+    // renegotiate the committed UVC frame with the host — toggle the webcam
+    // off/on for the host to pick up the new size.
+    void webcam_set_resolution(int idx) {
+        webcam_params.resolution = (EncResolution)idx;
+        if (webcam_frame_proc) webcam_frame_proc->set_resolution(webcam_params.resolution);
+    }
+    void webcam_set_fps(int fps) {
+        webcam_params.fps = fps;
+        if (webcam_frame_proc) webcam_frame_proc->set_fps(fps);
+        if (webcam_encoder)    webcam_encoder->set_fps(fps);
+    }
+    void webcam_set_quality(int q) {
+        webcam_params.quality = q;
+        if (webcam_encoder) webcam_encoder->set_quality(q);
+    }
+
+    int webcam_get_enabled(void)    { return (int)webcam_enabled; }
+    int webcam_get_osd(void)        { return (int)webcam_osd; }
+    int webcam_get_resolution(void) { return (int)webcam_params.resolution; }  // 0=720p,1=1080p
+    int webcam_get_fps(void)        { return webcam_params.fps; }
+    int webcam_get_quality(void)    { return webcam_params.quality; }
 
     /* C-callable wrapper so the menu (C) can set the raw DVR framerate without
      * touching the C++ Dvr* directly. */
@@ -1545,6 +1716,21 @@ int main(int argc, char **argv)
 			restream_set_pinned_ip(ip.c_str());
 		}
 
+		// USB webcam (UVC) settings. Values seed the globals; the pipeline is
+		// actually brought up later (after DRM/threads) if enabled here.
+		if (config["webcam"] && config["webcam"].IsMap()) {
+			auto wc = config["webcam"];
+			if (wc["resolution"]) {
+				std::string r = wc["resolution"].as<std::string>();
+				webcam_params.resolution = (r == "1080p") ? EncResolution::Res1080p
+				                                           : EncResolution::Res720p;
+			}
+			if (wc["fps"])     webcam_params.fps     = wc["fps"].as<int>();
+			if (wc["quality"]) webcam_params.quality = wc["quality"].as<int>();
+			if (wc["osd"])     webcam_osd            = wc["osd"].as<bool>();
+			if (wc["enabled"]) webcam_autostart      = wc["enabled"].as<bool>();
+		}
+
 		if (config["os_sensors"] && config["os_sensors"].IsMap()) {
 			if (config["os_sensors"]["cpu"]) {
 				auto cpu = config["os_sensors"]["cpu"];
@@ -1741,6 +1927,10 @@ int main(int argc, char **argv)
 	assert(!ret);
 	ret = pthread_create(&tid_display, NULL, __DISPLAY_THREAD__, NULL);
 	assert(!ret);
+	// Bring the webcam up now that DRM + decode/display threads are live.
+	if (webcam_autostart) {
+		webcam_set_enabled(1);
+	}
 	if (enable_osd) {
 		nlohmann::json osd_config;
 		if(osd_config_path != "") {

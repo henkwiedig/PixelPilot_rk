@@ -110,6 +110,8 @@ set(LIB_SOURCE_FILES
         src/mpp_encoder.cpp
         src/frame_processor.h
         src/frame_processor.cpp
+        src/uvc_sink.h
+        src/uvc_sink.cpp
         src/frame_colorcorrect.h
         src/frame_colorcorrect.cpp
         src/mavlink.h

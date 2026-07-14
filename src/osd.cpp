@@ -81,6 +81,8 @@ extern float live_colortrans_gain;
 #include "frame_processor.h"
 extern FrameProcessor *frame_proc;
 extern bool dvr_osd;
+extern FrameProcessor *webcam_frame_proc;
+extern bool webcam_osd;
 
 osd_thread_params *p;
 
@@ -2006,6 +2008,9 @@ void my_flush_cb(lv_display_t * display, const lv_area_t * area, uint8_t * px_ma
 	if (dvr_osd && frame_proc)
 		frame_proc->set_osd_blend(dst->prime_fd, dst->width, dst->height,
 		                         dst->stride / 4);
+	if (webcam_osd && webcam_frame_proc)
+		webcam_frame_proc->set_osd_blend(dst->prime_fd, dst->width, dst->height,
+		                         dst->stride / 4);
 
 	// tell the display thread that we have a update
 	ret = pthread_mutex_lock(&video_mutex);
@@ -2139,6 +2144,9 @@ void *__OSD_THREAD__(void *param) {
 
 				if (dvr_osd && frame_proc)
 					frame_proc->set_osd_blend(buf->prime_fd, buf->width, buf->height,
+					                         buf->stride / 4);
+				if (webcam_osd && webcam_frame_proc)
+					webcam_frame_proc->set_osd_blend(buf->prime_fd, buf->width, buf->height,
 					                         buf->stride / 4);
 
 				// tell the display thread that we have a update

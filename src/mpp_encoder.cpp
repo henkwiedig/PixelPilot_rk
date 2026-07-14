@@ -4,6 +4,15 @@
 
 #include "spdlog/spdlog.h"
 
+static const char *codec_name(VideoCodec c) {
+    switch (c) {
+    case VideoCodec::H264:  return "h264";
+    case VideoCodec::H265:  return "h265";
+    case VideoCodec::MJPEG: return "mjpeg";
+    default:                return "unknown";
+    }
+}
+
 MppEncoder::MppEncoder(MppEncoderParams p, FrameCallback cb)
     : params(p), output_cb(cb) {}
 
@@ -57,6 +66,13 @@ void MppEncoder::set_fps(int fps) {
     EncRpc rpc;
     rpc.command = EncRpc::RPC_SET_FPS;
     rpc.new_fps = fps;
+    enqueue(std::move(rpc));
+}
+
+void MppEncoder::set_quality(int q) {
+    EncRpc rpc;
+    rpc.command     = EncRpc::RPC_SET_QUALITY;
+    rpc.new_quality = q;
     enqueue(std::move(rpc));
 }
 
@@ -114,13 +130,27 @@ void MppEncoder::loop() {
             params.codec = rpc.new_codec;
             cleanup_encoder(); // will reinit on the next RPC_FRAME
             spdlog::info("Encoder codec changed to {}, reinit pending",
-                         params.codec == VideoCodec::H265 ? "h265" : "h264");
+                         codec_name(params.codec));
             break;
 
         case EncRpc::RPC_SET_FPS:
             params.fps = rpc.new_fps;
             cleanup_encoder(); // will reinit on the next RPC_FRAME with correct RC fps/gop
             spdlog::info("Encoder fps changed to {}, reinit pending", rpc.new_fps);
+            break;
+
+        case EncRpc::RPC_SET_QUALITY:
+            params.quality = rpc.new_quality;
+            if (initialized && ctx && params.codec == VideoCodec::MJPEG) {
+                MppEncCfg cfg = nullptr;
+                mpp_enc_cfg_init(&cfg);
+                if (mpi->control(ctx, MPP_ENC_GET_CFG, cfg) == MPP_OK) {
+                    mpp_enc_cfg_set_s32(cfg, "jpeg:q_factor", params.quality);
+                    mpi->control(ctx, MPP_ENC_SET_CFG, cfg);
+                }
+                mpp_enc_cfg_deinit(cfg);
+                spdlog::info("Encoder MJPEG quality updated to {}", params.quality);
+            }
             break;
 
         case EncRpc::RPC_SHUTDOWN:
@@ -141,9 +171,10 @@ bool MppEncoder::init_encoder(uint32_t width, uint32_t height,
                                MppFrameFormat fmt) {
     cleanup_encoder();
 
-    MppCodingType coding = (params.codec == VideoCodec::H265)
-                               ? MPP_VIDEO_CodingHEVC
-                               : MPP_VIDEO_CodingAVC;
+    const bool is_mjpeg = (params.codec == VideoCodec::MJPEG);
+    MppCodingType coding = is_mjpeg ? MPP_VIDEO_CodingMJPEG
+                         : (params.codec == VideoCodec::H265) ? MPP_VIDEO_CodingHEVC
+                                                              : MPP_VIDEO_CodingAVC;
 
     if (mpp_create(&ctx, &mpi) != MPP_OK) {
         spdlog::error("MPP encoder: mpp_create failed");
@@ -171,19 +202,34 @@ bool MppEncoder::init_encoder(uint32_t width, uint32_t height,
     mpp_enc_cfg_set_s32(cfg, "prep:ver_stride", (int)ver_stride);
     mpp_enc_cfg_set_s32(cfg, "prep:format",     (int)fmt);
 
-    int bps = params.bitrate_kbps * 1000;
-    mpp_enc_cfg_set_s32(cfg, "rc:mode",       MPP_ENC_RC_MODE_CBR);
-    mpp_enc_cfg_set_s32(cfg, "rc:bps_target", bps);
-    mpp_enc_cfg_set_s32(cfg, "rc:bps_max",    bps * 12 / 10);
-    mpp_enc_cfg_set_s32(cfg, "rc:bps_min",    bps * 8 / 10);
+    if (is_mjpeg) {
+        // MJPEG: intra-only, fixed-quality. No CBR/GOP/header stream — each frame
+        // is a self-contained JPEG. Quality is the JPEG q_factor (1..99).
+        mpp_enc_cfg_set_s32(cfg, "rc:mode",       MPP_ENC_RC_MODE_FIXQP);
+        mpp_enc_cfg_set_s32(cfg, "rc:fps_in_flex",   0);
+        mpp_enc_cfg_set_s32(cfg, "rc:fps_in_num",    params.fps);
+        mpp_enc_cfg_set_s32(cfg, "rc:fps_in_denorm", 1);
+        mpp_enc_cfg_set_s32(cfg, "rc:fps_out_flex",  0);
+        mpp_enc_cfg_set_s32(cfg, "rc:fps_out_num",   params.fps);
+        mpp_enc_cfg_set_s32(cfg, "rc:fps_out_denorm",1);
+        mpp_enc_cfg_set_s32(cfg, "jpeg:q_factor",    params.quality);
+        mpp_enc_cfg_set_s32(cfg, "jpeg:qf_min",      1);
+        mpp_enc_cfg_set_s32(cfg, "jpeg:qf_max",      99);
+    } else {
+        int bps = params.bitrate_kbps * 1000;
+        mpp_enc_cfg_set_s32(cfg, "rc:mode",       MPP_ENC_RC_MODE_CBR);
+        mpp_enc_cfg_set_s32(cfg, "rc:bps_target", bps);
+        mpp_enc_cfg_set_s32(cfg, "rc:bps_max",    bps * 12 / 10);
+        mpp_enc_cfg_set_s32(cfg, "rc:bps_min",    bps * 8 / 10);
 
-    mpp_enc_cfg_set_s32(cfg, "rc:fps_in_flex",   0);
-    mpp_enc_cfg_set_s32(cfg, "rc:fps_in_num",    params.fps);
-    mpp_enc_cfg_set_s32(cfg, "rc:fps_in_denorm", 1);
-    mpp_enc_cfg_set_s32(cfg, "rc:fps_out_flex",  0);
-    mpp_enc_cfg_set_s32(cfg, "rc:fps_out_num",   params.fps);
-    mpp_enc_cfg_set_s32(cfg, "rc:fps_out_denorm",1);
-    mpp_enc_cfg_set_s32(cfg, "rc:gop",           params.fps * 2);
+        mpp_enc_cfg_set_s32(cfg, "rc:fps_in_flex",   0);
+        mpp_enc_cfg_set_s32(cfg, "rc:fps_in_num",    params.fps);
+        mpp_enc_cfg_set_s32(cfg, "rc:fps_in_denorm", 1);
+        mpp_enc_cfg_set_s32(cfg, "rc:fps_out_flex",  0);
+        mpp_enc_cfg_set_s32(cfg, "rc:fps_out_num",   params.fps);
+        mpp_enc_cfg_set_s32(cfg, "rc:fps_out_denorm",1);
+        mpp_enc_cfg_set_s32(cfg, "rc:gop",           params.fps * 2);
+    }
 
     if (mpi->control(ctx, MPP_ENC_SET_CFG, cfg) != MPP_OK) {
         spdlog::error("MPP encoder: MPP_ENC_SET_CFG failed");
@@ -196,9 +242,10 @@ bool MppEncoder::init_encoder(uint32_t width, uint32_t height,
 
     // Fetch VPS/SPS/PPS so we can send them explicitly before the first frame.
     // MPP_ENC_GET_HDR_SYNC is the current API (GET_EXTRA_INFO is deprecated/unsafe).
+    // MJPEG has no stream-level headers (each JPEG is self-contained) — skip it.
     extra_data.clear();
     headers_sent = false;
-    {
+    if (!is_mjpeg) {
         MppBuffer hdr_buf = nullptr;
         mpp_buffer_get(nullptr, &hdr_buf, 4096);
         if (hdr_buf) {
@@ -215,9 +262,9 @@ bool MppEncoder::init_encoder(uint32_t width, uint32_t height,
             }
             mpp_packet_deinit(&hdr_pkt);
         }
-    }
-    if (extra_data.empty()) {
-        spdlog::warn("MPP encoder: MPP_ENC_GET_HDR_SYNC returned no data");
+        if (extra_data.empty()) {
+            spdlog::warn("MPP encoder: MPP_ENC_GET_HDR_SYNC returned no data");
+        }
     }
 
     enc_width      = width;
@@ -227,9 +274,9 @@ bool MppEncoder::init_encoder(uint32_t width, uint32_t height,
     initialized    = true;
     idr_pending    = true;
 
-    spdlog::info("MPP encoder initialized: {}x{} @ {}fps {}kbps codec={} headers={}B",
+    spdlog::info("MPP encoder initialized: {}x{} @ {}fps {}kbps codec={} q={} headers={}B",
                  width, height, params.fps, params.bitrate_kbps,
-                 params.codec == VideoCodec::H265 ? "h265" : "h264",
+                 codec_name(params.codec), params.quality,
                  extra_data.size());
     return true;
 }
@@ -258,10 +305,13 @@ void MppEncoder::encode_frame(EncRpc &rpc) {
     }
 
     // Request IDR if pending (e.g. recording just started); reset headers so
-    // they are re-sent at the start of the new segment.
+    // they are re-sent at the start of the new segment. MJPEG is intra-only —
+    // every frame is a keyframe, so there is nothing to force.
     if (idr_pending) {
-        RK_U32 force_idr = 1;
-        mpi->control(ctx, MPP_ENC_SET_IDR_FRAME, &force_idr);
+        if (params.codec != VideoCodec::MJPEG) {
+            RK_U32 force_idr = 1;
+            mpi->control(ctx, MPP_ENC_SET_IDR_FRAME, &force_idr);
+        }
         headers_sent = false;
         idr_pending = false;
     }

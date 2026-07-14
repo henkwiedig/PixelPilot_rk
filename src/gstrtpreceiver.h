@@ -24,7 +24,8 @@
 enum class VideoCodec {
     UNKNOWN=0,
     H264,
-    H265
+    H265,
+    MJPEG
 };
 
 static VideoCodec video_codec(const char * str) {
@@ -33,6 +34,9 @@ static VideoCodec video_codec(const char * str) {
     }
     if (!strcmp(str, "h265")) {
         return VideoCodec::H265;
+    }
+    if (!strcmp(str, "mjpeg")) {
+        return VideoCodec::MJPEG;
     }
     return VideoCodec::UNKNOWN;
 }

@@ -65,3 +65,13 @@ os_sensors:
 #   always visible as an option, even when auto-discovery finds no clients.
 # restream:
 #   manual_ip: 192.168.1.100
+
+# USB webcam (UVC) re-stream. Re-encodes the received video to MJPEG and exposes
+# it as a standard USB webcam via the webcam-gadget script. Toggle live from the
+# GS menu (System → Webcam); values below are the startup defaults.
+# webcam:
+#   enabled: false      # bring the webcam up at boot
+#   resolution: 720p    # 720p | 1080p
+#   fps: 30
+#   quality: 80         # MJPEG JPEG quality 1..99
+#   osd: false          # burn the OSD overlay into the webcam feed

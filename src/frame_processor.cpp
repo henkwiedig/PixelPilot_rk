@@ -128,8 +128,10 @@ void FrameProcessor::process_loop() {
         }
         if (!fresh.buffer) continue;
 
-        // If DVR is not active, just drain the frame to release the decoder ref.
-        if (!dvr_enabled || !encoder) {
+        // Skip processing when there is no consumer: the DVR pacer only encodes
+        // while recording (dvr_enabled); an always-active pacer (webcam) runs
+        // whenever it exists. Just drain the frame to release the decoder ref.
+        if ((!dvr_enabled && !always_active_.load(std::memory_order_relaxed)) || !encoder) {
             fresh.release();
             continue;
         }
@@ -323,7 +325,7 @@ void FrameProcessor::timer_loop() {
         }
         clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, nullptr);
         if (!running) break;
-        if (!dvr_enabled || !encoder) continue;
+        if ((!dvr_enabled && !always_active_.load(std::memory_order_relaxed)) || !encoder) continue;
 
         // Pick the latest processed frame.  If no fresh frame is ready,
         // wait up to half an interval for the processor to finish — this

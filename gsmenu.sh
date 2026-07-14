@@ -431,6 +431,24 @@ case "$@" in
     "get gs system dvr_osd"*)
         echo 0
         ;;
+    "get gs system webcam_enabled"*)
+        echo 0
+        ;;
+    "get gs system webcam_resolution"*)
+        echo -n "720p"
+        emit_values "720p\n1080p"
+        ;;
+    "get gs system webcam_fps"*)
+        echo -n "30"
+        emit_values "15\n30"
+        ;;
+    "get gs system webcam_quality"*)
+        echo -n "80"
+        emit_values "50\n60\n70\n80\n90"
+        ;;
+    "get gs system webcam_osd"*)
+        echo 0
+        ;;
 
     "set gs system rx_codec"*)              : ;;
     "set gs system rx_mode"*)               : ;;
@@ -448,6 +466,11 @@ case "$@" in
     "set gs system dvr_reenc_fps"*)         : ;;
     "set gs system dvr_reenc_bitrate"*)     : ;;
     "set gs system dvr_osd"*)               : ;;
+    "set gs system webcam_enabled"*)        : ;;
+    "set gs system webcam_resolution"*)     : ;;
+    "set gs system webcam_fps"*)            : ;;
+    "set gs system webcam_quality"*)        : ;;
+    "set gs system webcam_osd"*)            : ;;
 
 # ── GS: APFPV ───────────────────────────────────────────────────────────────
 
