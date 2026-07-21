@@ -106,6 +106,11 @@ bool mavlink_dvr_on_arm = false;
 bool osd_custom_message = false;
 bool disable_vsync = false;
 bool disable_gregidr = false;
+// Headless: run without an HDMI/DRM display. The RTP stream is still received
+// and restreamed to a tethered phone, but local decode/display, OSD and DVR
+// are skipped. Lets the ground station forward video to the phone even when no
+// monitor is attached.
+bool headless = false;
 uint32_t refresh_frequency_ms = 1000;
 
 VideoCodec codec = VideoCodec::H265;
@@ -1184,16 +1189,19 @@ void read_gstreamerpipe_stream(MppPacket *packet, int gst_udp_port, const char *
 		receiver = std::make_unique<GstRtpReceiver>(gst_udp_port, codec);
 	}
 	// Realign the MPP decoder whenever the receiver detects a mid-stream codec
-	// switch and rebuilds its pipeline.
-	receiver->set_codec_changed_callback([](VideoCodec c) {
-		MppCodingType t = (c == VideoCodec::H265) ? MPP_VIDEO_CodingHEVC : MPP_VIDEO_CodingAVC;
-		stream_mpp_type = t;
-		// Keep the global codec in sync so the decoder info-change handler
-		// (init_buffer) hands the raw DVR the right codec and rolls its file.
-		::codec = c;
-		reinit_mpp_decoder(t);
-		publish_codec_fact(c);
-	});
+	// switch and rebuilds its pipeline. In headless mode there is no decoder to
+	// realign, so the callback is left unset.
+	if (!headless) {
+		receiver->set_codec_changed_callback([](VideoCodec c) {
+			MppCodingType t = (c == VideoCodec::H265) ? MPP_VIDEO_CodingHEVC : MPP_VIDEO_CodingAVC;
+			stream_mpp_type = t;
+			// Keep the global codec in sync so the decoder info-change handler
+			// (init_buffer) hands the raw DVR the right codec and rolls its file.
+			::codec = c;
+			reinit_mpp_decoder(t);
+			publish_codec_fact(c);
+		});
+	}
 	long long bytes_received = 0; 
 	uint64_t period_start=0;
     auto cb=[&packet,/*&decoder_stalled_count,*/ &bytes_received, &period_start](std::shared_ptr<std::vector<uint8_t>> frame){
@@ -1208,7 +1216,9 @@ void read_gstreamerpipe_stream(MppPacket *packet, int gst_udp_port, const char *
 		bytes_received += frame->size();
 		uint64_t now = get_time_ms();
 		osd_publish_uint_fact("gstreamer.received_bytes", NULL, 0, frame->size());
-        const bool fed_ok = feed_packet_to_decoder(packet,frame->data(),frame->size());
+        // In headless mode there is no MPP decoder; the restream branch inside the
+        // GStreamer pipeline still forwards the RTP stream to the phone.
+        const bool fed_ok = headless ? true : feed_packet_to_decoder(packet,frame->data(),frame->size());
         if (!fed_ok) {
             stall_count++;
             if (stall_count >= 3 && (now - last_stall_idr_ms) > 500) {
@@ -1234,13 +1244,15 @@ void read_gstreamerpipe_stream(MppPacket *packet, int gst_udp_port, const char *
     publish_codec_fact(::codec);
     main_loop();
     receiver->stop_receiving();
-    spdlog::info("Feeding eos");
-    mpp_packet_set_eos(packet);
-    //mpp_packet_set_pos(packet, nal_buffer);
-    mpp_packet_set_length(packet, 0);
-    int ret=0;
-    while (MPP_OK != (ret = mpi.mpi->decode_put_packet(mpi.ctx, packet))) {
-        usleep(10000);
+    if (!headless) {
+        spdlog::info("Feeding eos");
+        mpp_packet_set_eos(packet);
+        //mpp_packet_set_pos(packet, nal_buffer);
+        mpp_packet_set_length(packet, 0);
+        int ret=0;
+        while (MPP_OK != (ret = mpi.mpi->decode_put_packet(mpi.ctx, packet))) {
+            usleep(10000);
+        }
     }
 };
 
@@ -1356,6 +1368,10 @@ void printHelp() {
     "    --osd-plane-id         - Override default drm plane used for osd by plane-id\n"
     "\n"
     "    --disable-vsync        - Disable VSYNC commits\n"
+    "\n"
+    "    --headless             - Run without an HDMI/DRM display. Local video,\n"
+    "                             OSD and DVR are disabled; the stream is still\n"
+    "                             received and restreamed to a tethered phone.\n"
     "\n"
     "    --disable-gregidr      - Disable last-hop probing and IDR requests\n"
     "\n"
@@ -1588,6 +1604,11 @@ int main(int argc, char **argv)
 		continue;
 	}
 
+	__OnArgument("--headless") {
+		headless = true;
+		continue;
+	}
+
 	__OnArgument("--disable-gregidr") {
 		disable_gregidr = true;
 		continue;
@@ -1791,51 +1812,60 @@ int main(int argc, char **argv)
 	assert(!ret);
 	
 	//////////////////////////////////  DRM SETUP
-	ret = modeset_open(&drm_fd, "/dev/dri/card0");
-	if (ret < 0) {
-		spdlog::warn("modeset_open() =  {}", ret);
-	}
-	assert(drm_fd >= 0);
-	if (print_modelist) {
-		modeset_print_modes(drm_fd);
-		close(drm_fd);
-		return 0;
-	}
+	if (headless) {
+		spdlog::warn("Running in headless mode: skipping DRM/HDMI display setup. "
+					 "Local video, OSD and DVR are disabled; the RTP stream is still "
+					 "received and restreamed to the tethered phone.");
+	} else {
+		ret = modeset_open(&drm_fd, "/dev/dri/card0");
+		if (ret < 0) {
+			spdlog::warn("modeset_open() =  {}", ret);
+		}
+		assert(drm_fd >= 0);
+		if (print_modelist) {
+			modeset_print_modes(drm_fd);
+			close(drm_fd);
+			return 0;
+		}
 
-	output_list = modeset_prepare(drm_fd, mode_width, mode_height, mode_vrefresh, video_plane_id_override, osd_plane_id_override, video_scale_factor);
-	if (!output_list) {
-		fprintf(stderr,
-				"cannot initialize display. Is display connected? Is --screen-mode correct?\n");
-		return -2;
-	}
+		output_list = modeset_prepare(drm_fd, mode_width, mode_height, mode_vrefresh, video_plane_id_override, osd_plane_id_override, video_scale_factor);
+		if (!output_list) {
+			fprintf(stderr,
+					"cannot initialize display. Is display connected? Is --screen-mode correct?\n");
+			return -2;
+		}
 
-	gamma_lut_controller_init(&lut_ctrl, drm_fd, output_list);
+		gamma_lut_controller_init(&lut_ctrl, drm_fd, output_list);
 
-	if (enable_live_colortrans) {
-		if (gamma_lut_enable(&lut_ctrl, live_colortrans_offset, live_colortrans_gain)) {
-			spdlog::info("Gamma LUT enabled with offset={}, gain={}", live_colortrans_offset, live_colortrans_gain);
+		if (enable_live_colortrans) {
+			if (gamma_lut_enable(&lut_ctrl, live_colortrans_offset, live_colortrans_gain)) {
+				spdlog::info("Gamma LUT enabled with offset={}, gain={}", live_colortrans_offset, live_colortrans_gain);
+			}
 		}
 	}
 	
 	////////////////////////////////// MPI SETUP
-	MppPacket packet;
+	MppPacket packet = NULL;
+	uint8_t* nal_buffer = NULL;
 
-	uint8_t* nal_buffer = (uint8_t*)malloc(1024 * 1024);
-	assert(nal_buffer);
-	ret = mpp_packet_init(&packet, nal_buffer, READ_BUF_SIZE);
-	assert(!ret);
+	if (!headless) {
+		nal_buffer = (uint8_t*)malloc(1024 * 1024);
+		assert(nal_buffer);
+		ret = mpp_packet_init(&packet, nal_buffer, READ_BUF_SIZE);
+		assert(!ret);
 
-	ret = mpp_create(&mpi.ctx, &mpi.mpi);
-	assert(!ret);
-    set_mpp_decoding_parameters(mpi.mpi,mpi.ctx);
-	ret = mpp_init(mpi.ctx, MPP_CTX_DEC, mpp_type);
-    assert(!ret);
-    set_mpp_decoding_parameters(mpi.mpi,mpi.ctx);
+		ret = mpp_create(&mpi.ctx, &mpi.mpi);
+		assert(!ret);
+		set_mpp_decoding_parameters(mpi.mpi,mpi.ctx);
+		ret = mpp_init(mpi.ctx, MPP_CTX_DEC, mpp_type);
+		assert(!ret);
+		set_mpp_decoding_parameters(mpi.mpi,mpi.ctx);
 
-	// blocked/wait read of frame in thread
-	int param = MPP_POLL_BLOCK;
-	ret = mpi.mpi->control(mpi.ctx, MPP_SET_OUTPUT_BLOCK, &param);
-	assert(!ret);
+		// blocked/wait read of frame in thread
+		int param = MPP_POLL_BLOCK;
+		ret = mpi.mpi->control(mpi.ctx, MPP_SET_OUTPUT_BLOCK, &param);
+		assert(!ret);
+	}
 
 
 	////////////////////////////////// SIGNAL SETUP
@@ -1854,6 +1884,7 @@ int main(int argc, char **argv)
 	assert(!ret);
 
 	pthread_t tid_frame, tid_display, tid_osd, tid_mavlink, tid_wfbcli;
+	if (!headless) {
 	if (dvr_template != NULL) {
 		bool has_raw   = (dvr_mode == DVR_MODE_RAW || dvr_mode == DVR_MODE_BOTH);
 		bool has_reenc = (dvr_mode == DVR_MODE_REENCODE || dvr_mode == DVR_MODE_BOTH);
@@ -1958,12 +1989,14 @@ int main(int argc, char **argv)
 		ret = pthread_create(&tid_osd, NULL, __OSD_THREAD__, args);
 		assert(!ret);
 	}
+	} // if (!headless)
 
 	////////////////////////////////////////////// MAIN LOOP
     read_gstreamerpipe_stream((void**)packet, listen_port, unix_socket, codec);
 
 	////////////////////////////////////////////// MPI CLEANUP
 
+	if (!headless) {
 	ret = pthread_join(tid_frame, NULL);
 	assert(!ret);
 	
@@ -2053,6 +2086,7 @@ int main(int argc, char **argv)
 	gamma_lut_cleanup(&lut_ctrl);
 	modeset_cleanup(drm_fd, output_list);
 	close(drm_fd);
+	} // if (!headless)
 
     remove(pidFilePath.c_str());
 
