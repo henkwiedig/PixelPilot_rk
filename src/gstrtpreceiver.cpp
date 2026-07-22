@@ -157,7 +157,10 @@ namespace {
     static std::mutex g_restream_mutex;
     static GstElement* g_restream_valve = nullptr;
     static GstElement* g_restream_sink = nullptr;
-    static std::atomic<bool> g_restream_enabled{false};
+    // Enabled by default (matches the "Phone Restream" menu, which shows "on" when
+    // no state file exists). The valve still only opens once a phone client is
+    // discovered in ARP, so this is a no-op until a phone actually connects.
+    static std::atomic<bool> g_restream_enabled{true};
     static std::string g_restream_target_ip;
     static std::string g_restream_manual_ip; // user's active selection; empty = auto-discover
     static std::string g_restream_pinned_ip;  // always shown in dropdown, set from config
@@ -278,6 +281,21 @@ namespace {
             set_restream_valve_locked(false);
         }
 
+        // Runs the (throttled, ~1/s) ARP scan + IDR-request bookkeeping on its own
+        // thread instead of the video frame-delivery thread (loop_pull_appsink_samples).
+        // Reading /proc/net/arp and poking the IDR socket must never be able to stall
+        // HDMI frame output — e.g. a phone's USB tethering interface flapping through
+        // several enumerations can transiently slow procfs/network stack access.
+        static std::once_flag watchdog_started;
+        std::call_once(watchdog_started, [] {
+            std::thread([] {
+                for (;;) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                    maybe_update_restream_target(false);
+                }
+            }).detach();
+        });
+
         maybe_update_restream_target(true);
     }
 
@@ -289,17 +307,33 @@ namespace {
         return ss.str();
     }
 
+    // wlan0 is only a phone-tethering candidate when the GS is actually running it as a
+    // WiFi Hotspot (see gsmenu.sh's "get gs wifi hotspot" — same check). Otherwise wlan0 is
+    // typically a plain WiFi *client* connection (e.g. to a home/office network for updates),
+    // and its ARP table is full of unrelated devices (router, other LAN clients, ...) that
+    // must never be mistaken for the phone.
+    static bool is_wlan0_hotspot() {
+        std::ifstream f("/etc/wpa_supplicant.hotspot.conf");
+        return f.good();
+    }
+
     static std::vector<std::string> scan_hotspot_clients() {
         std::ifstream arp_file("/proc/net/arp");
         if (!arp_file.is_open()) return {};
         std::string line;
         std::getline(arp_file, line); // skip header
         std::vector<std::string> result;
+        const bool wlan0_hotspot = is_wlan0_hotspot();
         while (std::getline(arp_file, line)) {
             std::istringstream iss(line);
             std::string ip, hw_type, flags, hw_address, mask, device;
             if (!(iss >> ip >> hw_type >> flags >> hw_address >> mask >> device)) continue;
-            if (device != "wlan0" && device != "usb0") continue;
+            // usb0 = Gadget Mode (SBC as USB device); usbtether0 = a phone plugged into a
+            // normal USB host port with USB tethering enabled (renamed deterministically by
+            // udev from whatever usbN the kernel happened to assign — see 91-usb-tether.rules).
+            bool is_usb_iface = device.compare(0, 3, "usb") == 0;
+            bool is_wlan0_client = (device == "wlan0" && wlan0_hotspot);
+            if (!is_usb_iface && !is_wlan0_client) continue;
             if (flags == "0x0" || hw_address == "00:00:00:00:00:00") continue;
             result.push_back(ip);
         }

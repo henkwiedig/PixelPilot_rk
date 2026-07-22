@@ -17,6 +17,7 @@
 #include "helper.h"       /* show_restart_notice(), find_first_focusable_obj() */
 #include "../menu.h"      /* MenuAction, screens */
 #include "../main.h"      /* sig_handler() — graceful shutdown / restart */
+#include "../gstrtpreceiver.h" /* restream_* — live phone-restream control (real + simulator stubs) */
 #ifndef USE_SIMULATOR
 #include "../drm.h"       /* gamma_lut_controller, gamma_lut_enable/disable */
 #endif
@@ -576,6 +577,51 @@ static void build_connected(colmenu_emit_t * e)
 }
 static const colmenu_page_t wifi_connected_page = { .title="Connected", .type="gs", .page="wifi", .build=build_connected };
 
+/* Phone Restream: forwards the decoded RTP stream to a phone connected via WiFi
+ * Hotspot or USB Gadget mode (usb0), so apps like Android PixelPilot can view the
+ * feed. This is a live, in-process toggle (gstrtpreceiver.cpp) — enabled by default.
+ * gsmenu.sh's "get gs wifi restream" can't see our in-process state directly, so we
+ * mirror it into a small state file here every time it changes; gsmenu.sh reads that
+ * file back (defaulting to "on" if it doesn't exist yet), which is what keeps the
+ * switch showing the correct value after closing and reopening the menu. */
+#define RESTREAM_STATE_FILE "/tmp/.pp_restream_enabled"
+static void on_restream_enabled(const char *value)
+{
+    bool on = value && strcmp(value, "on") == 0;
+    restream_set_enabled(on);
+    FILE *f = fopen(RESTREAM_STATE_FILE, "w");
+    if (f) {
+        fputs(on ? "1" : "0", f);
+        fclose(f);
+    }
+}
+
+static void select_restream_ip(void *ctx)
+{
+    restream_set_manual_ip((const char *)ctx);
+    colmenu_rescan();
+}
+
+/* "Stream To" target list: "Auto" (ARP auto-discovery on wlan0/usb0) plus any
+ * currently connected client IPs, from the live restream_scan_clients() scan. */
+static void build_restream_ips(colmenu_emit_t *e)
+{
+    char clients[512];
+    restream_scan_clients(clients, sizeof(clients));
+    char current[64];
+    snprintf(current, sizeof(current), "%s", restream_get_manual_ip());
+
+    char *save = NULL;
+    for (char *line = strtok_r(clients, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        if (line[0] == '\0')
+            continue;
+        bool is_auto = strcmp(line, "Auto") == 0;
+        bool selected = is_auto ? (current[0] == '\0') : (strcmp(line, current) == 0);
+        colmenu_emit_action(e, selected ? LV_SYMBOL_OK : LV_SYMBOL_WIFI, line, select_restream_ip, strdup(line));
+    }
+}
+static const colmenu_page_t restream_ip_page = {.title = "Stream To", .type = "gs", .page = "wifi", .build = build_restream_ips};
+
 /* WiFi main page (dynamic — reflects the live connection state). */
 static void build_wifi(colmenu_emit_t * e)
 {
@@ -596,6 +642,18 @@ static void build_wifi(colmenu_emit_t * e)
 
     colmenu_emit_submenu(e, LV_SYMBOL_WIFI, "Networks", &networks_page);
     colmenu_emit_switch (e, LV_SYMBOL_WIFI, "Hotspot", "gs", "wifi", "hotspot", NULL);
+
+    /* Gadget Mode: USB composite gadget (network usb0 + serial + mass storage), enabled
+     * by default. gsmenu.sh's get reads the live kernel state (usb_gadget/g1 presence),
+     * so this always shows the correct value; set applies it live and persists the
+     * boot-time default — no on_change hook needed, the backend handles everything. */
+    colmenu_emit_switch(e, LV_SYMBOL_USB, "Gadget Mode", "gs", "wifi", "gadget", NULL);
+
+    colmenu_emit_switch(e, LV_SYMBOL_VIDEO, "Phone Restream", "gs", "wifi", "restream", on_restream_enabled);
+    char stream_to[96];
+    const char *manual_ip = restream_get_manual_ip();
+    snprintf(stream_to, sizeof(stream_to), "Stream To: %s", (manual_ip && manual_ip[0]) ? manual_ip : "Auto");
+    colmenu_emit_submenu(e, LV_SYMBOL_WIFI, stream_to, &restream_ip_page);
 }
 static const colmenu_page_t wifi_page = { .title="WiFi", .type="gs", .page="wifi", .build=build_wifi };
 
