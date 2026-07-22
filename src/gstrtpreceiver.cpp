@@ -157,7 +157,10 @@ namespace {
     static std::mutex g_restream_mutex;
     static GstElement* g_restream_valve = nullptr;
     static GstElement* g_restream_sink = nullptr;
-    static std::atomic<bool> g_restream_enabled{false};
+    // Enabled by default (matches the "Phone Restream" menu, which shows "on" when
+    // no state file exists). The valve still only opens once a phone client is
+    // discovered in ARP, so this is a no-op until a phone actually connects.
+    static std::atomic<bool> g_restream_enabled{true};
     static std::string g_restream_target_ip;
     static std::string g_restream_manual_ip; // user's active selection; empty = auto-discover
     static std::string g_restream_pinned_ip;  // always shown in dropdown, set from config

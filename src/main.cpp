@@ -1830,16 +1830,22 @@ int main(int argc, char **argv)
 
 		output_list = modeset_prepare(drm_fd, mode_width, mode_height, mode_vrefresh, video_plane_id_override, osd_plane_id_override, video_scale_factor);
 		if (!output_list) {
-			fprintf(stderr,
-					"cannot initialize display. Is display connected? Is --screen-mode correct?\n");
-			return -2;
-		}
+			// No usable display (HDMI disconnected, or --screen-mode not offered by the
+			// panel). Exiting here would, under the pixelpilot.sh respawn loop, become an
+			// endless restart loop that ALSO tears down the phone restream. Instead fall
+			// back to headless: RTP receive + phone restream keep running, and a later
+			// restart with HDMI reconnected brings the local display back.
+			spdlog::warn("cannot initialize display (HDMI disconnected or --screen-mode "
+						 "unsupported); falling back to headless. Phone restream continues.");
+			if (drm_fd >= 0) { close(drm_fd); drm_fd = -1; }
+			headless = true;
+		} else {
+			gamma_lut_controller_init(&lut_ctrl, drm_fd, output_list);
 
-		gamma_lut_controller_init(&lut_ctrl, drm_fd, output_list);
-
-		if (enable_live_colortrans) {
-			if (gamma_lut_enable(&lut_ctrl, live_colortrans_offset, live_colortrans_gain)) {
-				spdlog::info("Gamma LUT enabled with offset={}, gain={}", live_colortrans_offset, live_colortrans_gain);
+			if (enable_live_colortrans) {
+				if (gamma_lut_enable(&lut_ctrl, live_colortrans_offset, live_colortrans_gain)) {
+					spdlog::info("Gamma LUT enabled with offset={}, gain={}", live_colortrans_offset, live_colortrans_gain);
+				}
 			}
 		}
 	}
