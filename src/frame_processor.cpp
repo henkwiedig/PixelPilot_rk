@@ -1,15 +1,21 @@
 #include <pthread.h>
 #include <time.h>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <fcntl.h>
+#include <sys/ioctl.h>
 
 #include "spdlog/spdlog.h"
 
 #include <rga/im2d.h>
 #include <rga/rga.h>
+#include <xf86drm.h>
 
 #include "dvr.h"
 #include "frame_processor.h"
+#include "mem_info.h"
+#include "rockchip_bo.h"
 
 // Map MPP pixel format to the corresponding RGA format for im2d DMA copies.
 static int mpp_fmt_to_rga(MppFrameFormat fmt)
@@ -23,6 +29,63 @@ static int mpp_fmt_to_rga(MppFrameFormat fmt)
 
 static inline uint32_t align_up(uint32_t v, uint32_t a) {
     return (v + a - 1) & ~(a - 1);
+}
+
+bool FrameProcessor::alloc_contig_proc_copy(size_t size) {
+    struct drm_mode_create_dumb dmcd;
+    memset(&dmcd, 0, sizeof(dmcd));
+    // Opaque byte blob: width=size, height=1, bpp=8 gives exactly `size`
+    // bytes with pitch==size -- no image format semantics needed here,
+    // proc_copy_ is addressed by mpp_buffer_get_fd()/get_ptr() only.
+    dmcd.width  = (uint32_t)size;
+    dmcd.height = 1;
+    dmcd.bpp    = 8;
+    dmcd.flags  = ROCKCHIP_BO_CONTIG;
+    int ret;
+    do {
+        ret = ioctl(drm_fd_, DRM_IOCTL_MODE_CREATE_DUMB, &dmcd);
+    } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
+    if (ret == -1) {
+        spdlog::error("FrameProcessor: CONTIG dumb-buffer create failed ({})", strerror(errno));
+        return false;
+    }
+
+    struct drm_prime_handle dph;
+    memset(&dph, 0, sizeof(dph));
+    dph.handle = dmcd.handle;
+    dph.flags  = DRM_RDWR;
+    dph.fd     = -1;
+    do {
+        ret = ioctl(drm_fd_, DRM_IOCTL_PRIME_HANDLE_TO_FD, &dph);
+    } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
+
+    // The dma-buf fd (once exported) holds its own reference to the
+    // backing memory, so the GEM handle can be closed immediately --
+    // standard DRM/dma-buf pattern, same as done for the FrameColorCorrect
+    // render targets.
+    struct drm_mode_destroy_dumb dmd;
+    memset(&dmd, 0, sizeof(dmd));
+    dmd.handle = dmcd.handle;
+    ioctl(drm_fd_, DRM_IOCTL_MODE_DESTROY_DUMB, &dmd);
+
+    if (ret == -1) {
+        spdlog::error("FrameProcessor: CONTIG prime export failed ({})", strerror(errno));
+        return false;
+    }
+
+    MppBufferInfo info;
+    memset(&info, 0, sizeof(info));
+    info.type = MPP_BUFFER_TYPE_DRM;
+    info.size = size;
+    info.fd   = dph.fd;
+    MPP_RET mret = mpp_buffer_import(&proc_copy_, &info);
+    if (dph.fd != info.fd) close(dph.fd);  // mpp_buffer_import dups the fd
+    if (mret != MPP_OK) {
+        spdlog::error("FrameProcessor: CONTIG buffer import failed ({})", (int)mret);
+        proc_copy_ = nullptr;
+        return false;
+    }
+    return true;
 }
 
 FrameProcessor::FrameProcessor(MppEncoder *enc, int fps, EncResolution res, int drm_fd,
@@ -164,9 +227,20 @@ void FrameProcessor::process_loop() {
 
             size_t dst_sz = (size_t)dst_hs * dst_vs * 3 / 2;  // NV12
 
-            if (hold_grp && (!proc_copy_ || mpp_buffer_get_size(proc_copy_) < dst_sz)) {
+            if (!proc_copy_ || mpp_buffer_get_size(proc_copy_) < dst_sz) {
                 if (proc_copy_) { mpp_buffer_put(proc_copy_); proc_copy_ = nullptr; }
-                mpp_buffer_get(hold_grp, &proc_copy_, dst_sz);
+
+                if (platform_has_large_ram() && drm_fd_ >= 0) {
+                    alloc_contig_proc_copy(dst_sz);
+                    // On failure, deliberately do NOT fall back to hold_grp
+                    // here: that would risk landing this buffer >=4GB again,
+                    // exactly the corruption this workaround exists to
+                    // prevent (see mem_info.h). proc_copy_ staying null is
+                    // handled as fatal below, same as any other
+                    // unrecoverable conversion failure.
+                } else if (hold_grp) {
+                    mpp_buffer_get(hold_grp, &proc_copy_, dst_sz);
+                }
             }
             if (proc_copy_) {
                 // ── GL path: colour-correct + OSD in one GPU pass ───────
@@ -274,6 +348,9 @@ void FrameProcessor::process_loop() {
                     proc_meta_.fmt        = fresh.fmt;
                     proc_meta_.buffer     = nullptr;
                 }
+            } else {
+                spdlog::error("FrameProcessor: no reencode working buffer available, stopping DVR reencode");
+                fatal = true;
             }
             fresh.release();  // decoder buffer is free again
         }
