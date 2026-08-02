@@ -59,9 +59,14 @@ private:
      * temp_measurement_interval default. */
     static constexpr std::chrono::seconds THERMAL_INTERVAL{10};
 
+    /* Published for an adapter that is not linked. Deliberately outside the 0..100
+     * percentage range, so an icon widget hides unless the config maps it. */
+    static constexpr int RSSI_NONE = -1;
+
     std::string base_path_;
     std::chrono::steady_clock::time_point last_thermal_read_;
     bool warned_no_driver_;
+    std::vector<std::string> known_interfaces_;  // adapters seen on the previous run()
 
     /* Number of tags every fact carries: `interface` and `adapter`, plus the one
      * describing the value itself (`type` / `rf_path`). Kept identical for all
@@ -73,6 +78,7 @@ private:
      * by interface name so the adapter index of a card doesn't depend on readdir
      * order (it does change when adapters are added or removed, though). */
     std::vector<std::filesystem::path> find_interfaces();
+    void flush_if_interfaces_changed(const std::vector<std::filesystem::path>& interfaces);
     WiFiStats parse_interface_stats(const std::string& file_path);
     std::vector<ThermalStats> parse_thermal_state(const std::string& file_path);
     void make_base_tags(osd_tag* tags, const std::string& interface_name, int adapter);

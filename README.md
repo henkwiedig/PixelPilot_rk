@@ -237,6 +237,13 @@ MAC-derived interface name, which differs per ground station. Note that the inde
 when other adapters are plugged in or removed. Temperature is sampled every 10 seconds, because
 reading it makes the driver trigger an ADC conversion on the RF chip.
 
+An adapter that is not associated (no drone yet, drone powered off) publishes `connected` = 0 and
+`-1` for every rssi value, so a bar bound to it disappears instead of freezing at the last value it
+saw. `-1` is outside the 0..100 percentage range that `IconSelectorWidget` configs cover, so it
+hides by default; add a range for it (`{"range": [-1, 0], "icon_path": "no_signal.png"}`) to show an
+explicit "no signal" icon instead. If an adapter is unplugged entirely, its facts are dropped back
+to undefined, which hides the widget as well.
+
 There are many facts based on Mavlink telemetry, see `mavlink.c`. All of them have tags "sysid" and
 "compid", but some have extra tags.
 Currently implemented fact categories are grouped by Mavlink message types:

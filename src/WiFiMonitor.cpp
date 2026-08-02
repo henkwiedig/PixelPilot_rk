@@ -71,9 +71,39 @@ std::vector<fs::path> WiFiMonitor::find_interfaces() {
     return interfaces;
 }
 
+/* Drop the whole os_mon.wifi.* namespace when the set of adapters changes.
+ *
+ * A card that disappears (unplugged, driver unloaded) simply stops being
+ * published for, and nothing else retracts its facts, so its widgets would keep
+ * rendering the last value it ever reported. Worse, the `adapter` tag is the
+ * position in the list, so adding or removing a card renumbers the ones after
+ * it and their widgets would show another card's readings until every one of
+ * them happens to publish again.
+ *
+ * The adapters that are still here re-publish in the same run() below, and the
+ * fact processor applies pending flushes before the facts of the same batch, so
+ * they don't get cleared by our own flush. */
+void WiFiMonitor::flush_if_interfaces_changed(const std::vector<fs::path>& interfaces) {
+    std::vector<std::string> names;
+    names.reserve(interfaces.size());
+    for (const auto& interface : interfaces) {
+        names.push_back(interface.filename());
+    }
+
+    if (names == known_interfaces_) {
+        return;
+    }
+    known_interfaces_ = std::move(names);
+
+    static const char* const prefix = "os_mon.wifi.";
+    osd_flush_facts(&prefix, 1);
+}
+
 void WiFiMonitor::run() {
 
     std::vector<fs::path> interfaces = find_interfaces();
+    flush_if_interfaces_changed(interfaces);
+
     if (interfaces.empty()) {
         if (!warned_no_driver_) {
             spdlog::error("No Realtek WiFi driver found below {}, no wifi stats will be published", base_path_);
@@ -204,21 +234,27 @@ void WiFiMonitor::make_base_tags(osd_tag* tags, const std::string& interface_nam
 }
 
 void WiFiMonitor::add_interface_stats_to_batch(void* batch, const osd_tag* base_tags, const WiFiStats& stats) {
-    if (!stats.is_linked) {
-        return; // Don't publish stats for disconnected interfaces
-    }
+    /* An unlinked adapter (no drone yet, drone powered off, adapter never brought
+     * up) has no RSSI to report. Going silent leaves the widgets showing the last
+     * RSSI of a link that is gone, so publish RSSI_NONE instead: it is outside
+     * every icon range, so IconSelectorWidget hides the bar, and a config that
+     * wants a visible "no signal" instead can just add a range covering it.
+     * Retracting per adapter, rather than with osd_flush_facts(), because that is
+     * scoped by fact-name prefix - it would take the other adapters and the
+     * temperature down with it. */
+    const bool linked = stats.is_linked;
 
     // Publish RSSI A
-    add_rssi_fact_to_batch(batch, base_tags, "rssi_a", stats.rssi_a);
+    add_rssi_fact_to_batch(batch, base_tags, "rssi_a", linked ? stats.rssi_a : RSSI_NONE);
 
     // Publish RSSI B
-    add_rssi_fact_to_batch(batch, base_tags, "rssi_b", stats.rssi_b);
+    add_rssi_fact_to_batch(batch, base_tags, "rssi_b", linked ? stats.rssi_b : RSSI_NONE);
 
     // Publish RSSI Overall Percentage
-    add_rssi_fact_to_batch(batch, base_tags, "rssi_percent", stats.rssi_percent);
+    add_rssi_fact_to_batch(batch, base_tags, "rssi_percent", linked ? stats.rssi_percent : RSSI_NONE);
 
     // Publish connection status
-    add_rssi_fact_to_batch(batch, base_tags, "connected", 1);
+    add_rssi_fact_to_batch(batch, base_tags, "connected", linked ? 1 : 0);
 }
 
 void WiFiMonitor::add_rssi_fact_to_batch(void* batch, const osd_tag* base_tags, const std::string& rssi_type, int value) {
@@ -273,18 +309,17 @@ void WiFiMonitor::publish_interface_reset(void* batch, const fs::path& interface
     osd_tag base_tags[BASE_TAGS];
     make_base_tags(base_tags, interface_path.filename(), adapter);
 
-    // Publish all RSSI values as -1 (reset/error value)
-    add_rssi_fact_to_batch(batch, base_tags, "rssi_a", -1);
-    add_rssi_fact_to_batch(batch, base_tags, "rssi_b", -1);
-    add_rssi_fact_to_batch(batch, base_tags, "rssi_min", -1);
-    add_rssi_fact_to_batch(batch, base_tags, "rssi_percent", -1);
+    // Publish all RSSI values as "no link"
+    add_rssi_fact_to_batch(batch, base_tags, "rssi_a", RSSI_NONE);
+    add_rssi_fact_to_batch(batch, base_tags, "rssi_b", RSSI_NONE);
+    add_rssi_fact_to_batch(batch, base_tags, "rssi_percent", RSSI_NONE);
     add_rssi_fact_to_batch(batch, base_tags, "connected", 0);  // 0 = disconnected
 
     // Same for the temperature of every RF path the card reports
     std::string thermal_file = interface_path / "thermal_state";
     if (fs::exists(thermal_file)) {
         for (const auto& thermal : parse_thermal_state(thermal_file)) {
-            add_temperature_fact_to_batch(batch, base_tags, thermal.rf_path, -1);
+            add_temperature_fact_to_batch(batch, base_tags, thermal.rf_path, RSSI_NONE);
         }
     }
 }
