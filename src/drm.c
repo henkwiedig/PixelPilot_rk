@@ -13,7 +13,6 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #include <drm_fourcc.h>
-#include <cairo.h>
 #include <pthread.h>
 #include <rockchip/rk_mpi.h>
 #include <assert.h>
@@ -415,6 +414,93 @@ err_destroy:
 }
 
 
+int modeset_create_black_video(int fd, struct modeset_output *out)
+{
+	uint32_t w = out->mode.hdisplay;
+	uint32_t h = out->mode.vdisplay;
+
+	struct drm_mode_create_dumb creq;
+	memset(&creq, 0, sizeof(creq));
+	creq.width  = w;
+	creq.height = h * 3 / 2;   // NV12: Y plane (h rows) + interleaved UV (h/2 rows)
+	creq.bpp    = 8;
+	if (drmIoctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq) < 0) {
+		fprintf(stderr, "black video: create dumb failed: %m\n");
+		return -errno;
+	}
+	out->black_video_handle = creq.handle;
+	out->black_video_size   = creq.size;
+	uint32_t pitch = creq.pitch;
+
+	struct drm_mode_map_dumb mreq;
+	memset(&mreq, 0, sizeof(mreq));
+	mreq.handle = creq.handle;
+	if (drmIoctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &mreq) < 0) {
+		fprintf(stderr, "black video: map dumb failed: %m\n");
+		goto err_destroy;
+	}
+	uint8_t *map = mmap(0, creq.size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, mreq.offset);
+	if (map == MAP_FAILED) {
+		fprintf(stderr, "black video: mmap failed: %m\n");
+		goto err_destroy;
+	}
+	memset(map, 0, pitch * h);                     // Y = 0 (black)
+	memset(map + pitch * h, 128, pitch * h / 2);   // UV = 128 (neutral chroma)
+	munmap(map, creq.size);
+
+	uint32_t handles[4] = { creq.handle, creq.handle, 0, 0 };
+	uint32_t pitches[4] = { pitch, pitch, 0, 0 };
+	uint32_t offsets[4] = { 0, pitch * h, 0, 0 };
+	if (drmModeAddFB2(fd, w, h, DRM_FORMAT_NV12, handles, pitches, offsets, &out->black_video_fb, 0)) {
+		fprintf(stderr, "black video: addfb2 failed: %m\n");
+		goto err_destroy;
+	}
+	return 0;
+
+err_destroy:
+	{
+		struct drm_mode_destroy_dumb dreq;
+		memset(&dreq, 0, sizeof(dreq));
+		dreq.handle = out->black_video_handle;
+		drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+		out->black_video_handle = 0;
+		out->black_video_fb = 0;
+	}
+	return -errno;
+}
+
+void modeset_set_video_geometry(struct modeset_output *out, drmModeAtomicReq *req, int fullscreen, int zpos)
+{
+	uint32_t sw, sh, cw, ch;
+	int cx, cy;
+	if (fullscreen) {
+		sw = out->mode.hdisplay; sh = out->mode.vdisplay;
+		cw = out->mode.hdisplay; ch = out->mode.vdisplay;
+		cx = 0; cy = 0;
+	} else {
+		// Aspect-scaled placement, matching modeset_atomic_prepare_commit.
+		sw = out->video_frm_width; sh = out->video_frm_height;
+		uint32_t ocw = out->video_crtc_width, och = out->video_crtc_height;
+		float ratio = sh ? (float)sw / sh : 1.0f;
+		if (ocw / ratio > och) ocw = (uint32_t)(och * ratio);
+		else                   och = (uint32_t)(ocw / ratio);
+		cw = (uint32_t)(ocw * out->video_scale_factor);
+		ch = (uint32_t)(och * out->video_scale_factor);
+		cx = (out->video_crtc_width  - (int)cw) / 2;
+		cy = (out->video_crtc_height - (int)ch) / 2;
+	}
+	set_drm_object_property(req, &out->video_plane, "CRTC_ID", out->crtc.id);
+	set_drm_object_property(req, &out->video_plane, "zpos",   zpos);
+	set_drm_object_property(req, &out->video_plane, "SRC_X",  0);
+	set_drm_object_property(req, &out->video_plane, "SRC_Y",  0);
+	set_drm_object_property(req, &out->video_plane, "SRC_W",  sw << 16);
+	set_drm_object_property(req, &out->video_plane, "SRC_H",  sh << 16);
+	set_drm_object_property(req, &out->video_plane, "CRTC_X", cx);
+	set_drm_object_property(req, &out->video_plane, "CRTC_Y", cy);
+	set_drm_object_property(req, &out->video_plane, "CRTC_W", cw);
+	set_drm_object_property(req, &out->video_plane, "CRTC_H", ch);
+}
+
 void modeset_destroy_fb(int fd, struct modeset_buf *buf)
 {
 	struct drm_mode_destroy_dumb dreq;
@@ -785,7 +871,29 @@ int modeset_perform_modeset(int fd, struct modeset_output *out, drmModeAtomicReq
 }
 
 
-int modeset_atomic_prepare_commit(int fd, struct modeset_output *out, drmModeAtomicReq *req, struct drm_object *plane, 
+// Find the value of an enum property's named entry (e.g. "pixel blend mode" ->
+// "Coverage"). Returns 0 and sets *value on success, -1 if not found/not enum.
+static int get_drm_object_prop_enum(struct drm_object *obj, const char *prop_name,
+	const char *enum_name, uint64_t *value)
+{
+	for (int i = 0; i < obj->props->count_props; i++) {
+		drmModePropertyRes *p = obj->props_info[i];
+		if (!p || strcmp(p->name, prop_name))
+			continue;
+		if (!(p->flags & DRM_MODE_PROP_ENUM))
+			return -1;
+		for (int e = 0; e < p->count_enums; e++) {
+			if (!strcmp(p->enums[e].name, enum_name)) {
+				*value = p->enums[e].value;
+				return 0;
+			}
+		}
+		return -1;
+	}
+	return -1;
+}
+
+int modeset_atomic_prepare_commit(int fd, struct modeset_output *out, drmModeAtomicReq *req, struct drm_object *plane,
 	int fb_id, uint32_t width, uint32_t height, int zpos)
 {
 	if (set_drm_object_property(req, &out->connector, "CRTC_ID", out->crtc.id) < 0)
@@ -821,6 +929,17 @@ int modeset_atomic_prepare_commit(int fd, struct modeset_output *out, drmModeAto
 		return -1;
 	if (set_drm_object_property(req, plane, "zpos", zpos) < 0)
 		return -1;
+
+	// The OSD carries straight (non-premultiplied) alpha from LVGL. Ask the
+	// display controller to blend it as "Coverage" instead of the default
+	// "Pre-multiplied", otherwise semi-transparent COLOURED OSD pixels composite
+	// wrong (colour not scaled by alpha; a red gradient looks solid). Optional:
+	// silently skipped if the driver does not expose the property.
+	if (plane == &out->osd_plane) {
+		uint64_t coverage;
+		if (get_drm_object_prop_enum(plane, "pixel blend mode", "Coverage", &coverage) == 0)
+			set_drm_object_property(req, plane, "pixel blend mode", coverage);
+	}
 
 	return 0;
 }

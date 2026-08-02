@@ -7,7 +7,7 @@
 ## Introduction
 
 WFB-ng client (Video Decoder) for Rockchip platform powered by the [Rockchip MPP library](https://github.com/rockchip-linux/mpp).
-It also displays a simple cairo based OSD that shows the bandwidth, decoding latency, and framerate of the decoded video, and wfb-ng link statistics.
+It also displays a simple LVGL based OSD that shows the bandwidth, decoding latency, and framerate of the decoded video, and wfb-ng link statistics.
 
 Additional features:
 - **GPU color correction** — live linear color transform applied to video and OSD via EGL/GLES2 (configurable gain/offset, e.g. for FPV color grading)
@@ -79,10 +79,10 @@ Build on the Rockchip linux system directly.
 
 #### Install dependencies
 
-- drm, cairo, mpp, logging, json, msgpack, gpiod, yaml-cpp
+- drm, png, mpp, logging, json, msgpack, gpiod, yaml-cpp
 
 ```
-sudo apt install libdrm-dev libcairo-dev librockchip-mpp-dev libspdlog-dev nlohmann-json3-dev libmsgpack-dev libgpiod-dev libyaml-cpp-dev
+sudo apt install libdrm-dev libpng-dev librockchip-mpp-dev libspdlog-dev nlohmann-json3-dev libmsgpack-dev libgpiod-dev libyaml-cpp-dev
 ```
 
 - EGL/GLES2 and RGA (required for GPU color correction and DVR re-encoding)
@@ -353,6 +353,18 @@ Specific widgets expect quite concrete facts as input:
   but can probably be used with Mavlink as well.
 * `{"type": "IconSelectorWidget", "ranges_and_icons": [{"range": [0, 10], "icon_path": "0_10.png"}, {"range": [11, 20], ...}]}` - shows
   different icon depending on the range where the value lands to.
+* `{"type": "SignalWarningWidget", "threshold": -80, "critical": -95}` - draws a red warning border
+  around the video that fades in as the signal drops below `threshold`, reaching full intensity at
+  `critical`. Omit `critical` for a simple on/off (full border the moment the value crosses `threshold`).
+  Accepts **one or more** numeric facts and reacts to the **best (highest)** value among them, so you
+  can bind every antenna's RSSI (`wfbcli.rx.ant_stats.rssi_avg` with different `ant_id` tags) and the
+  border only appears once even the strongest antenna has dropped below `threshold`. Lower values are
+  treated as worse, so it suits RSSI in dBm. The widget's `x`/`y` are ignored (it always covers the
+  whole screen).
+* `{"type": "MspDisplayPortWidget", "font_path": "font.png", "udp_port": 14551}` - renders an MSP
+  DisplayPort OSD coming from a flight controller (Betaflight / INAV / ArduPilot). It listens for
+  DisplayPort messages over UDP (`udp_port`, default 14551) and draws the character grid using the
+  bitmap font glyph atlas at `font_path` (required), scaling the grid to fill the screen. Takes no facts.
 
 ## Color Correction
 
@@ -421,8 +433,7 @@ It uses `mpp` library to decode MPEG frames using Rockchip hardware decoder.
 It uses [Direct Rendering Manager (DRM)](https://en.wikipedia.org/wiki/Direct_Rendering_Manager) to
 display video on the screen, see `drm.c`.
 It uses `mavlink` decoder to read Mavlink telemetry from telemetry UDP (if enabled), see `mavlink.c`
-It uses `cairo` library to draw OSD elements (if enabled), see `osd.c`.
-It uses `lvgl` to draw the gsmenu.
+It uses `lvgl` to draw OSD elements (if enabled), see `osd.cpp`, and to draw the gsmenu.
 It writes non-decoded MPEG stream to file as DVR (if enabled) using `minimp4.h` library.
 It uses EGL/GLES2 (via `frame_colorcorrect.cpp`) to apply a GPU color transform to decoded frames before display and recording.
 It uses Rockchip MPP hardware encoder (`mpp_encoder.cpp`) to optionally re-encode the color-corrected video with OSD blended in for DVR recording.
@@ -456,8 +467,7 @@ Pixelpilot starts several threads:
 * OSD_THREAD (if OSD is enabled):
   takes `drm_fd`, `output_list` and JSON config as thread parameters,
   receives Facts through mutex-with-timeout-protected `std::queue`, feeds Facts to widgets and
-  periodically draws widgets on a buffer inside `output_list` using Cairo library.
-  There exists legacy OSD, is based on `osd_vars`, draws using Cairo library, to be removed.
+  periodically draws widgets on a buffer inside `output_list` using LVGL.
   The loop yields on queue's mutex with timeout (timeout in order to re-draw OSD at fixed intervals).
 * ENCODER_PACER_THREAD (if DVR re-encoding is enabled):
   wakes at the target FPS interval and submits the most recent decoded frame to the MPP re-encoder.

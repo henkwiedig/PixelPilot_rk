@@ -27,7 +27,6 @@ set(CMAKE_CXX_STANDARD 17) #C17
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 pkg_check_modules(LIBDRM REQUIRED libdrm)
-pkg_check_modules(CAIRO IMPORTED_TARGET REQUIRED cairo)
 pkg_check_modules(SPDLOG REQUIRED spdlog)
 
 find_package(PNG REQUIRED)
@@ -166,13 +165,12 @@ else()
       ${RGA_INCLUDE_DIRS}
   )
   
-  target_link_libraries(${PROJECT_NAME} 
-      rockchip_mpp 
-      pthread 
-      drm 
-      m 
-      PkgConfig::CAIRO
-      spdlog::spdlog 
+  target_link_libraries(${PROJECT_NAME}
+      rockchip_mpp
+      pthread
+      drm
+      m
+      spdlog::spdlog
       fmt::fmt
       nlohmann_json::nlohmann_json 
       yaml-cpp 
@@ -219,10 +217,10 @@ if(BUILD_TESTS)
 
     # Test executable
     add_executable(pixelpilot_tests ${LIB_SOURCE_FILES} ${TEST_SOURCES})
-    target_include_directories(pixelpilot_tests PUBLIC "${PROJECT_BINARY_DIR}" ${LIBDRM_INCLUDE_DIRS} ${CAIRO_INCLUDE_DIRS})
+    target_include_directories(pixelpilot_tests PUBLIC "${PROJECT_BINARY_DIR}" ${LIBDRM_INCLUDE_DIRS})
     # Define the TEST preprocessor directive
     target_compile_definitions(pixelpilot_tests PRIVATE TEST)
-    target_link_libraries(pixelpilot_tests rockchip_mpp pthread drm m cairo spdlog::spdlog nlohmann_json::nlohmann_json yaml-cpp rt lvgl ${LIBGPIOD_LIBRARIES} ${PNG_LIBRARIES} Catch2::Catch2WithMain)
+    target_link_libraries(pixelpilot_tests rockchip_mpp pthread drm m spdlog::spdlog nlohmann_json::nlohmann_json yaml-cpp rt lvgl ${LIBGPIOD_LIBRARIES} ${PNG_LIBRARIES} Catch2::Catch2WithMain)
 
     find_package(PkgConfig REQUIRED)
     pkg_search_module(GST REQUIRED
