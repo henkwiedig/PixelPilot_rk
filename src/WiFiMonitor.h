@@ -5,7 +5,7 @@
 extern "C" {
 #endif
 
-void wifi_rssi_monitor_reset(void);
+void wifi_monitor_reset(void);
 
 #ifdef __cplusplus
 }

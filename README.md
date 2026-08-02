@@ -175,7 +175,7 @@ Typical OSD config looks like:
             "x": 10,
             "y": 60,
             "icon_path": "device_thermostat.png",
-            "template": "CPU: %.0f⁰C, GPU: %.0f⁰C",
+            "template": "CPU: %.0f°C, GPU: %.0f°C",
             "facts": [
                 {"name": "os_mon.temperature",
                  "tags": {"name": "soc-thermal"},
@@ -222,7 +222,20 @@ lot of facts to which widgets can subscribe to:
 | `video.decoder_feed_time_ms`   | uint | Time to feed the video packet to hardware decoder                         |
 | `gstreamer.received_bytes`     | uint | Number of bytes received from gstreamer (published for each packet)       |
 | `osd.custom_message`           | str  | The custom message passed via `--osd-custom-message` feature              |
-| `os_mon.wifi.rssi`             | uint | rssi as reported from /proc/net/rtl88x2eu/<interface>/trx_info_debug      |
+| `os_mon.wifi.rssi`             | int  | rssi as reported from /proc/net/`<driver>`/`<interface>`/trx_info_debug   |
+| `os_mon.wifi.temperature`      | int  | RF chip temperature, degrees C, from /proc/net/`<driver>`/`<interface>`/thermal_state |
+
+The `os_mon.wifi.*` facts are only published in APFPV mode (in WFB mode the same data comes from
+wfb-ng as `wfbcli.*`). They are read from the proc interface of the Realtek drivers - every
+`/proc/net/rtl*` directory is scanned, so all card families (rtl88x2eu, rtl88x2cu, rtl88x2bu, ...)
+are covered; cards whose driver has no `thermal_state` simply publish no temperature.
+Both are tagged with `interface` (eg `wlx0013eff604e2`) and `adapter`, plus `type`
+(`rssi_a`/`rssi_b`/`rssi_percent`/`connected`) for the rssi and `rf_path` (`0`/`1`) for the
+temperature. `adapter` is the index of the card among all adapters found, counted from 0 in
+interface-name order - bind widgets to it (`{"adapter": "0", "type": "rssi_a"}`) rather than to the
+MAC-derived interface name, which differs per ground station. Note that the index of a card changes
+when other adapters are plugged in or removed. Temperature is sampled every 10 seconds, because
+reading it makes the driver trigger an ADC conversion on the RF chip.
 
 There are many facts based on Mavlink telemetry, see `mavlink.c`. All of them have tags "sysid" and
 "compid", but some have extra tags.
@@ -332,6 +345,10 @@ to display any fact (as long as datatype matches):
 * `{"type": "PopupWidget", "timeout_ms": 2000}` - displays a stacked pop-ups with text facts which fade-away after timeout.
 * `{"type": "DebugWidget"}` - displays debug information (name, type, tags, value) about fact(s)
 * `{"type": "IconSelectorWidget"}` - display a icon based on a fact's value
+
+Text is rendered with LVGL's built-in Montserrat font, which only covers ASCII plus the degree sign
+`°` (U+00B0) and a few symbols. Any other character comes out as an empty box - watch out for
+look-alikes such as `⁰` (U+2070, superscript zero).
 
 Specific widgets expect quite concrete facts as input:
 

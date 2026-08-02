@@ -132,6 +132,123 @@
             ]
         },
         {
+            "type": "IconSelectorWidget",
+            "name": "APFPV RSSI of adapter 1 antenna 1",
+            "x": -250,
+            "y": 0,
+            "facts": [
+                {
+                    "__comment": "APFPV counterpart of the six widgets above: same slots, but fed by the WiFi driver instead of wfb-ng. Only one of the two sets is ever published, the other stays hidden. RSSI is a percentage here, not dBm. `adapter` counts the cards from 0 in interface-name order, `type` picks the RF path",
+                    "name": "os_mon.wifi.rssi", "tags": {"adapter": "0", "type": "rssi_a"}
+                }
+            ],
+            "ranges_and_icons": [
+                {"range": [70, 100], "icon_path": "signal1.png"},
+                {"range": [60, 69],  "icon_path": "signal2.png"},
+                {"range": [50, 59],  "icon_path": "signal3.png"},
+                {"range": [40, 49],  "icon_path": "signal4.png"},
+                {"range": [30, 39],  "icon_path": "signal5.png"},
+                {"range": [20, 29],  "icon_path": "signal6.png"},
+                {"range": [10, 19],  "icon_path": "signal7.png"},
+                {"range": [1, 9],    "icon_path": "signal8.png"}
+            ]
+        },
+        {
+            "type": "IconSelectorWidget",
+            "name": "APFPV RSSI of adapter 1 antenna 2",
+            "x": -205,
+            "y": 0,
+            "facts": [
+                {"name": "os_mon.wifi.rssi", "tags": {"adapter": "0", "type": "rssi_b"}}
+            ],
+            "ranges_and_icons": [
+                {"range": [70, 100], "icon_path": "signal1.png"},
+                {"range": [60, 69],  "icon_path": "signal2.png"},
+                {"range": [50, 59],  "icon_path": "signal3.png"},
+                {"range": [40, 49],  "icon_path": "signal4.png"},
+                {"range": [30, 39],  "icon_path": "signal5.png"},
+                {"range": [20, 29],  "icon_path": "signal6.png"},
+                {"range": [10, 19],  "icon_path": "signal7.png"},
+                {"range": [1, 9],    "icon_path": "signal8.png"}
+            ]
+        },
+        {
+            "type": "IconSelectorWidget",
+            "name": "APFPV RSSI of adapter 2 antenna 1",
+            "x": -160,
+            "y": 0,
+            "facts": [
+                {"name": "os_mon.wifi.rssi", "tags": {"adapter": "1", "type": "rssi_a"}}
+            ],
+            "ranges_and_icons": [
+                {"range": [70, 100], "icon_path": "signal1.png"},
+                {"range": [60, 69],  "icon_path": "signal2.png"},
+                {"range": [50, 59],  "icon_path": "signal3.png"},
+                {"range": [40, 49],  "icon_path": "signal4.png"},
+                {"range": [30, 39],  "icon_path": "signal5.png"},
+                {"range": [20, 29],  "icon_path": "signal6.png"},
+                {"range": [10, 19],  "icon_path": "signal7.png"},
+                {"range": [1, 9],    "icon_path": "signal8.png"}
+            ]
+        },
+        {
+            "type": "IconSelectorWidget",
+            "name": "APFPV RSSI of adapter 2 antenna 2",
+            "x": -115,
+            "y": 0,
+            "facts": [
+                {"name": "os_mon.wifi.rssi", "tags": {"adapter": "1", "type": "rssi_b"}}
+            ],
+            "ranges_and_icons": [
+                {"range": [70, 100], "icon_path": "signal1.png"},
+                {"range": [60, 69],  "icon_path": "signal2.png"},
+                {"range": [50, 59],  "icon_path": "signal3.png"},
+                {"range": [40, 49],  "icon_path": "signal4.png"},
+                {"range": [30, 39],  "icon_path": "signal5.png"},
+                {"range": [20, 29],  "icon_path": "signal6.png"},
+                {"range": [10, 19],  "icon_path": "signal7.png"},
+                {"range": [1, 9],    "icon_path": "signal8.png"}
+            ]
+        },
+        {
+            "type": "IconSelectorWidget",
+            "name": "APFPV RSSI of adapter 3 antenna 1",
+            "x": -70,
+            "y": 0,
+            "facts": [
+                {"name": "os_mon.wifi.rssi", "tags": {"adapter": "2", "type": "rssi_a"}}
+            ],
+            "ranges_and_icons": [
+                {"range": [70, 100], "icon_path": "signal1.png"},
+                {"range": [60, 69],  "icon_path": "signal2.png"},
+                {"range": [50, 59],  "icon_path": "signal3.png"},
+                {"range": [40, 49],  "icon_path": "signal4.png"},
+                {"range": [30, 39],  "icon_path": "signal5.png"},
+                {"range": [20, 29],  "icon_path": "signal6.png"},
+                {"range": [10, 19],  "icon_path": "signal7.png"},
+                {"range": [1, 9],    "icon_path": "signal8.png"}
+            ]
+        },
+        {
+            "type": "IconSelectorWidget",
+            "name": "APFPV RSSI of adapter 3 antenna 2",
+            "x": -25,
+            "y": 0,
+            "facts": [
+                {"name": "os_mon.wifi.rssi", "tags": {"adapter": "2", "type": "rssi_b"}}
+            ],
+            "ranges_and_icons": [
+                {"range": [70, 100], "icon_path": "signal1.png"},
+                {"range": [60, 69],  "icon_path": "signal2.png"},
+                {"range": [50, 59],  "icon_path": "signal3.png"},
+                {"range": [40, 49],  "icon_path": "signal4.png"},
+                {"range": [30, 39],  "icon_path": "signal5.png"},
+                {"range": [20, 29],  "icon_path": "signal6.png"},
+                {"range": [10, 19],  "icon_path": "signal7.png"},
+                {"range": [1, 9],    "icon_path": "signal8.png"}
+            ]
+        },
+        {
             "name": "Video FPS and resolution",
             "type": "VideoWidget",
             "x": -250,
@@ -211,6 +328,30 @@
             "threshold": 8,
             "critical": 2,
             "facts": [ { "name": "gstreamer.received_bytes" } ]
+        },
+        {
+            "name": "APFPV WiFi RF temperature adapter 1",
+            "type": "---IconTplTextWidget",
+            "x": -250,
+            "y": 155,
+            "icon_path": "device_thermostat.png",
+            "template": "RF %i°C / %i°C",
+            "facts": [
+                {"name": "os_mon.wifi.temperature", "tags": {"adapter": "0", "rf_path": "0"}},
+                {"name": "os_mon.wifi.temperature", "tags": {"adapter": "0", "rf_path": "1"}}
+            ]
+        },
+        {
+            "name": "APFPV WiFi RF temperature adapter 2",
+            "type": "---IconTplTextWidget",
+            "x": -250,
+            "y": 185,
+            "icon_path": "device_thermostat.png",
+            "template": "RF %i°C / %i°C",
+            "facts": [
+                {"name": "os_mon.wifi.temperature", "tags": {"adapter": "1", "rf_path": "0"}},
+                {"name": "os_mon.wifi.temperature", "tags": {"adapter": "1", "rf_path": "1"}}
+            ]
         },
         {
             "name": "MspDisplayPort",

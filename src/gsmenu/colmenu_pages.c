@@ -184,7 +184,7 @@ static void apply_rx_mode(bool apfpv)
     setenv("REMOTE_IP",         apfpv ? "192.168.0.1" : "10.5.0.10", 1);
     setenv("AIR_FIRMWARE_TYPE", apfpv ? "apfpv"       : "wfb",       1);
     /* Drop the previous mode's stale facts: wfbcli.* (the wfbcli thread only runs in
-     * WFB) and os_mon.wifi.* (WiFiRSSIMonitor only runs in apfpv). The active source
+     * WFB) and os_mon.wifi.* (WiFiMonitor only runs in apfpv). The active source
      * re-publishes its own. Only these two prefixes - a blanket flush would also clear
      * facts nobody re-publishes, e.g. video.width/height (published once per decoder
      * frame-info change), leaving the VideoWidget stuck on "?x?". */

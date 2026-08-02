@@ -61,7 +61,7 @@ extern "C" {
 #include "os_mon.hpp"
 #include "pixelpilot_config.h"
 #include <iostream>
-#include "WiFiRSSIMonitor.hpp"
+#include "WiFiMonitor.hpp"
 #include "menu.h"
 
 
@@ -144,7 +144,7 @@ size_t gsactions_count;
 uint32_t video_plane_id_override = 0;
 uint32_t osd_plane_id_override = 0;
 
-WiFiRSSIMonitor wifi_monitor;
+WiFiMonitor wifi_monitor;
 extern enum RXMode RXMODE;
 
 bool enable_live_colortrans = false;

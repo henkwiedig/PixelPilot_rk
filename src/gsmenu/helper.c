@@ -5,7 +5,7 @@
 #include "../menu.h"       /* enum RXMode, RXMODE */
 #include "helper.h"
 #include "styles.h"
-#include "../WiFiRSSIMonitor.h"
+#include "../WiFiMonitor.h"
 
 extern lv_indev_t * indev_drv;
 
@@ -72,7 +72,7 @@ void gsmenu_toggle_rxmode() {
         setenv("REMOTE_IP" , "10.5.0.10", 1);
         setenv("AIR_FIRMWARE_TYPE" , "wfb", 1);
 #ifndef USE_SIMULATOR
-        wifi_rssi_monitor_reset();
+        wifi_monitor_reset();
 #endif
         break;
 

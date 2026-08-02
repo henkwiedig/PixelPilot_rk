@@ -115,8 +115,8 @@ set(LIB_SOURCE_FILES
         src/mavlink.c
         src/wfbcli.hpp
         src/wfbcli.cpp
-        src/WiFiRSSIMonitor.hpp
-        src/WiFiRSSIMonitor.cpp
+        src/WiFiMonitor.hpp
+        src/WiFiMonitor.cpp
         src/scheduling_helper.hpp
         src/gstrtpreceiver.cpp
         src/gstrtpreceiver.h)
