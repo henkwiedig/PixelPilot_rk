@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "lvgl/lvgl.h"
 #include "menu.h"
 #include "input.h"
@@ -38,16 +39,25 @@ void my_log_cb(lv_log_level_t level, const char * buf)
 }
 
 // Simulator stubs for restream API (real impl lives in gstrtpreceiver.cpp,
-// which is not part of the simulator build)
-bool restream_get_enabled() { return false; }
-void restream_set_enabled(bool enabled) { (void)enabled; }
+// which is not part of the simulator build). Stateful so the menu rows can
+// actually be exercised; the client list is faked.
+static bool sim_restream_enabled = false;
+static char sim_restream_ip[64] = "";
+bool restream_get_enabled() { return sim_restream_enabled; }
+void restream_set_enabled(bool enabled) { sim_restream_enabled = enabled; }
+void restream_scan_clients(char* buf, size_t buf_len) {
+    if (buf && buf_len) snprintf(buf, buf_len, "Auto\n192.168.1.23\n192.168.1.47");
+}
+const char* restream_get_manual_ip() { return sim_restream_ip; }
+void restream_set_manual_ip(const char* ip) {
+    if (ip && ip[0] && strcmp(ip, "Auto") != 0) snprintf(sim_restream_ip, sizeof(sim_restream_ip), "%s", ip);
+    else sim_restream_ip[0] = '\0';
+}
+
 int  audio_get_enabled(void) { return 0; }
 void audio_set_enabled(int enabled) { (void)enabled; }
 void audio_set_device(const char* device) { (void)device; }
 void audio_set_volume(int percent) { (void)percent; }
-void restream_scan_clients(char* buf, size_t buf_len) { if (buf && buf_len) buf[0] = '\0'; }
-const char* restream_get_manual_ip() { return ""; }
-void restream_set_manual_ip(const char* ip) { (void)ip; }
 
 int main(int argc, char **argv)
 {

@@ -442,13 +442,25 @@ static const colmenu_item_t sys_dvr_items[] = {
     { .kind=COLMENU_SWITCH,   .label="Record OSD in DVR", .param="dvr_osd",              .on_change=on_dvr_osd },
 };
 static const colmenu_page_t sys_dvr_page = { "DVR", "gs", "system", sys_dvr_items, 8 };
+
+/* Restream to phone/laptop over the local WiFi. Both rows are served by the app
+ * itself, not gsmenu.sh — colmenu.c intercepts the "restream_" params on read
+ * and write. The Target dropdown's options are the discovered clients, with
+ * "Auto" (pick whoever shows up) as the first entry. */
+static const colmenu_item_t restream_items[] = {
+    { .kind=COLMENU_SWITCH,   .icon=LV_SYMBOL_WIFI, .label="Enabled", .param="restream_enabled" },
+    { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_WIFI, .label="Target",  .param="restream_target"  },
+};
+static const colmenu_page_t sys_restream_page = { "Restream", "gs", "system", restream_items, 2 };
+
 static const colmenu_item_t system_items[] = {
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_WIFI,  .label="Receiver", .sub=&sys_receiver_page },
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_AUDIO, .label="Audio",    .sub=&sys_audio_page },
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_IMAGE, .label="Display",  .sub=&sys_display_page },
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_VIDEO, .label="DVR",      .sub=&sys_dvr_page },
+    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_WIFI,  .label="Restream", .sub=&sys_restream_page },
 };
-static const colmenu_page_t system_page = { "System", "gs", "system", system_items, 4 };
+static const colmenu_page_t system_page = { "System", "gs", "system", system_items, 5 };
 
 /* WiFi. The WiFi page shows the live connection (get gs wifi ssid) — entering the
  * connected network gives Disconnect / Forget. "Networks" lists only AVAILABLE

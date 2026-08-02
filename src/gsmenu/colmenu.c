@@ -17,6 +17,14 @@ extern lv_indev_t * indev_drv;
 extern int  audio_get_enabled(void);
 extern void audio_set_enabled(int enabled);
 
+/* Restream C API (gstrtpreceiver.cpp on device, stubs in simulator.c) — declared
+ * here rather than including gstrtpreceiver.h, which drags in gst/gst.h. */
+extern bool         restream_get_enabled(void);
+extern void         restream_set_enabled(bool enabled);
+extern void         restream_scan_clients(char * buf, size_t buf_len);
+extern const char * restream_get_manual_ip(void);
+extern void         restream_set_manual_ip(const char * ip);
+
 static colstack_t * g_cs;
 
 /* True while the command-error dialog is up, so async teardowns (e.g. the text
@@ -101,6 +109,24 @@ char * colmenu_get(const char * type, const char * page, const char * param, cha
      * read it straight from the app (switch builder atoi()s this: 0/1, not on/off). */
     if(strcmp(param, "audio") == 0) {
         return strdup(audio_get_enabled() ? "1" : "0");
+    }
+
+    /* Restream is configured from pixelpilot.yaml and lives entirely inside the
+     * app — gsmenu.sh has no say in it. Serve its rows from the C API, here on
+     * read and in do_set() on write, so no shell round-trip happens at all. */
+    if(strcmp(param, "restream_enabled") == 0) {
+        return strdup(restream_get_enabled() ? "1" : "0");
+    }
+    if(strcmp(param, "restream_target") == 0) {
+        /* scan_clients already returns the dropdown's option list: "Auto" followed
+         * by one discovered/pinned IP per line. Empty manual ip == auto-discover. */
+        if(opts) {
+            char clients[1024] = {0};
+            restream_scan_clients(clients, sizeof(clients));
+            *opts = strdup(clients);
+        }
+        const char * ip = restream_get_manual_ip();
+        return strdup(ip && ip[0] ? ip : "Auto");
     }
 
     char errf[] = "/tmp/gsmenu_gerr_XXXXXX";
@@ -373,6 +399,18 @@ static void do_set_done(void * ctx, int rc)
 static void do_set(void * ctx, const char * value)
 {
     bind_ctx_t * b = ctx;
+
+    /* Restream applies to the running app only (see colmenu_get) — apply it
+     * straight away and skip the gsmenu.sh set entirely. */
+    if(b->param && strncmp(b->param, "restream_", 9) == 0) {
+        if(strcmp(b->param, "restream_enabled") == 0)
+            restream_set_enabled(value && strcmp(value, "on") == 0);
+        else if(strcmp(b->param, "restream_target") == 0)
+            restream_set_manual_ip(value ? value : "");   /* "Auto" → auto-discover */
+        if(b->on_change) b->on_change(value ? value : "");
+        return;
+    }
+
     char cmd[320];
     snprintf(cmd, sizeof(cmd), "gsmenu.sh set %s %s %s \"%s\"",
              b->type, b->page, b->param, value ? value : "");
