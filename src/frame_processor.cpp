@@ -54,7 +54,7 @@ bool FrameProcessor::alloc_contig_proc_copy(size_t size) {
     struct drm_prime_handle dph;
     memset(&dph, 0, sizeof(dph));
     dph.handle = dmcd.handle;
-    dph.flags  = DRM_RDWR;
+    dph.flags  = DRM_CLOEXEC | DRM_RDWR;
     dph.fd     = -1;
     do {
         ret = ioctl(drm_fd_, DRM_IOCTL_PRIME_HANDLE_TO_FD, &dph);
@@ -80,7 +80,11 @@ bool FrameProcessor::alloc_contig_proc_copy(size_t size) {
     info.size = size;
     info.fd   = dph.fd;
     MPP_RET mret = mpp_buffer_import(&proc_copy_, &info);
-    if (dph.fd != info.fd) close(dph.fd);  // mpp_buffer_import dups the fd
+    // mpp_buffer_import() dups whatever fd it's handed rather than taking
+    // ownership of it -- close our copy unconditionally, on both success
+    // and failure, or a failed import leaks dph.fd (info.fd is only
+    // touched on the success path).
+    close(dph.fd);
     if (mret != MPP_OK) {
         spdlog::error("FrameProcessor: CONTIG buffer import failed ({})", (int)mret);
         proc_copy_ = nullptr;

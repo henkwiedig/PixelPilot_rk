@@ -239,7 +239,7 @@ bool FrameColorCorrect::create_targets() {
                 struct drm_prime_handle dph;
                 memset(&dph, 0, sizeof(dph));
                 dph.handle = dmcd.handle;
-                dph.flags  = DRM_RDWR;
+                dph.flags  = DRM_CLOEXEC | DRM_RDWR;
                 dph.fd     = -1;
                 do {
                     ret = ioctl(drm_fd_, DRM_IOCTL_PRIME_HANDLE_TO_FD, &dph);
@@ -512,10 +512,10 @@ void FrameColorCorrect::destroy_targets() {
         if (t.bo) {
             gbm_bo_destroy(t.bo); t.bo = nullptr;
         } else if (t.gem_handle) {
-            struct drm_gem_close dgc;
-            memset(&dgc, 0, sizeof(dgc));
-            dgc.handle = t.gem_handle;
-            ioctl(drm_fd_, DRM_IOCTL_GEM_CLOSE, &dgc);
+            struct drm_mode_destroy_dumb dmd;
+            memset(&dmd, 0, sizeof(dmd));
+            dmd.handle = t.gem_handle;
+            ioctl(drm_fd_, DRM_IOCTL_MODE_DESTROY_DUMB, &dmd);
             t.gem_handle = 0;
         }
     }
