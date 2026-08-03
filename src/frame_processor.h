@@ -130,7 +130,8 @@ private:
     std::atomic<bool>  color_correct_{false};
     bool               gl_init_done_{false};
     uint32_t           gl_out_w_{0}, gl_out_h_{0};  // output dims at last GL init
-    float              cc_gain_{1.f}, cc_offset_{0.f};
+    std::atomic<float> cc_gain_{1.f};
+    std::atomic<float> cc_offset_{0.f};
     int                drm_fd_{-1};  // DRM fd for GBM/EGL (passed at construction)
     FrameColorCorrect  color_gl_;
 };

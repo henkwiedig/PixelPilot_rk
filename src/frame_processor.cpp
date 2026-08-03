@@ -80,11 +80,14 @@ void FrameProcessor::set_osd_blend(int prime_fd, uint32_t w, uint32_t h, uint32_
 }
 
 void FrameProcessor::set_color_correction(float gain, float offset, int drm_fd) {
-    cc_gain_   = gain;
-    cc_offset_ = offset;
+    cc_gain_.store(gain,     std::memory_order_relaxed);
+    cc_offset_.store(offset, std::memory_order_relaxed);
     if (drm_fd >= 0) drm_fd_ = drm_fd;  // update if caller supplies one
-    color_correct_.store(true, std::memory_order_relaxed);
-    // Actual EGL/GL init happens lazily on the processor thread (first frame)
+    // Release-store so the processor thread can't observe the enable before
+    // the gain/offset it belongs to.
+    color_correct_.store(true, std::memory_order_release);
+    // Actual EGL/GL init happens lazily on the processor thread (first frame);
+    // an already-initialised context picks the new params up on the next frame.
 }
 
 // ── Processor thread entry point ────────────────────────────────────────────
@@ -174,9 +177,16 @@ void FrameProcessor::process_loop() {
                 // The GL render target is at OUTPUT size (dst_w × dst_h);
                 // samplerExternalOES handles any input-to-output resize implicitly.
                 // Re-init when output dimensions change.
-                bool need_gl = drm_fd_ >= 0 &&
-                               (color_correct_.load(std::memory_order_relaxed) ||
-                                osd_snap.prime_fd >= 0);
+                // The GL context is created once and outlives any number of
+                // recordings, so the correction parameters must be re-read from
+                // the (UI-writable) members every frame -- baking them in at
+                // init() would freeze whatever colortrans state happened to be
+                // active when the first DVR started.
+                bool  cc_on     = color_correct_.load(std::memory_order_acquire);
+                float cc_gain   = cc_on ? cc_gain_.load(std::memory_order_relaxed)   : 1.f;
+                float cc_offset = cc_on ? cc_offset_.load(std::memory_order_relaxed) : 0.f;
+
+                bool need_gl = drm_fd_ >= 0 && (cc_on || osd_snap.prime_fd >= 0);
                 if (gl_init_done_ && (dst_w != gl_out_w_ || dst_h != gl_out_h_)) {
                     color_gl_.deinit();
                     gl_init_done_ = false;
@@ -185,7 +195,7 @@ void FrameProcessor::process_loop() {
                     gl_init_done_ = true;
                     gl_out_w_ = dst_w;
                     gl_out_h_ = dst_h;
-                    color_gl_.init(drm_fd_, dst_w, dst_h, cc_gain_, cc_offset_);
+                    color_gl_.init(drm_fd_, dst_w, dst_h, cc_gain, cc_offset);
                 }
 
                 bool ok;
@@ -194,6 +204,8 @@ void FrameProcessor::process_loop() {
                     //      → NV12 (RGA CSC, no resize — GBM BO is at output size)
                     ok = color_gl_.ready();
                     if (ok) {
+                        color_gl_.set_params(cc_gain, cc_offset);
+
                         if (osd_snap.prime_fd >= 0)
                             color_gl_.set_osd(osd_snap.prime_fd,
                                               osd_snap.width, osd_snap.height,
