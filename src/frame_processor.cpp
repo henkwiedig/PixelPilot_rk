@@ -79,10 +79,9 @@ void FrameProcessor::set_osd_blend(int prime_fd, uint32_t w, uint32_t h, uint32_
     osd_info_.stride_px  = stride_px;
 }
 
-void FrameProcessor::set_color_correction(float gain, float offset, int drm_fd) {
+void FrameProcessor::set_color_correction(float gain, float offset) {
     cc_gain_.store(gain,     std::memory_order_relaxed);
     cc_offset_.store(offset, std::memory_order_relaxed);
-    if (drm_fd >= 0) drm_fd_ = drm_fd;  // update if caller supplies one
     // Release-store so the processor thread can't observe the enable before
     // the gain/offset it belongs to.
     color_correct_.store(true, std::memory_order_release);
