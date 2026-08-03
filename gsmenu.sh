@@ -195,6 +195,17 @@ case "$@" in
         echo 0
         emit_values "0 1"
         ;;
+    "get air camera audio_enabled")
+        echo 0
+        ;;
+    "get air camera audio_volume")
+        echo 50
+        emit_values "0 100"
+        ;;
+    "get air camera audio_srate")
+        echo 8000
+        emit_values "8000\n16000\n32000\n48000"
+        ;;
 
     "set air camera mirror"*)       : ;;
     "set air camera flip"*)         : ;;
@@ -217,6 +228,9 @@ case "$@" in
     "set air camera sensor_file"*)  : ;;
     "set air camera fpv_enable"*)   : ;;
     "set air camera noiselevel"*)   : ;;
+    "set air camera audio_enabled"*) : ;;
+    "set air camera audio_volume"*)  : ;;
+    "set air camera audio_srate"*)   : ;;
 
 # ── Air: Telemetry ───────────────────────────────────────────────────────────
 
@@ -397,10 +411,6 @@ case "$@" in
     "get gs system gs_live_colortrans")
         echo 0
         ;;
-    "get gs system rec_fps")
-        echo 60
-        emit_values "60\n90\n120"
-        ;;
     "get gs system dvr_mode"*)
         echo "raw"
         emit_values "raw\nreencode\nboth"
@@ -431,6 +441,17 @@ case "$@" in
     "get gs system dvr_osd"*)
         echo 0
         ;;
+    "get gs system audio_device"*)
+        echo default
+        emit_values "default\nrockchiphdmi\nHEADSET"
+        ;;
+    "get gs system audio_volume"*)
+        echo 100
+        emit_values "0 100"
+        ;;
+    "get gs system audio"*)
+        echo 0
+        ;;
 
     "set gs system rx_codec"*)              : ;;
     "set gs system rx_mode"*)               : ;;
@@ -439,7 +460,6 @@ case "$@" in
     "set gs system resolution"*)            : ;;
     "set gs system video_scale"*)           : ;;
     "set gs system gs_live_colortrans"*)    : ;;
-    "set gs system rec_fps"*)               : ;;
     "set gs system rec_enabled"*)           : ;;
     "set gs system dvr_mode"*)              : ;;
     "set gs system dvr_max_size"*)          : ;; # needs division by 100
@@ -448,6 +468,9 @@ case "$@" in
     "set gs system dvr_reenc_fps"*)         : ;;
     "set gs system dvr_reenc_bitrate"*)     : ;;
     "set gs system dvr_osd"*)               : ;;
+    "set gs system audio_device"*)          : ;;
+    "set gs system audio_volume"*)          : ;;
+    "set gs system audio"*)                 : ;;
 
 # ── GS: APFPV ───────────────────────────────────────────────────────────────
 

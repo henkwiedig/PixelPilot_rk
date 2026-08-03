@@ -27,6 +27,11 @@ extern MenuAction airactions[]; extern size_t airactions_count;
 extern MenuAction gsactions[];  extern size_t gsactions_count;
 extern enum RXMode RXMODE;
 
+extern int  audio_get_enabled(void);
+extern void audio_set_enabled(int enabled);
+extern void audio_set_device(const char * device);
+extern void audio_set_volume(int percent);
+
 /* Live Colortrans / Video scale apply their effect to the DRM/GL pipeline live,
  * as the old gs_system.c widget callbacks did — a gsmenu.sh set alone won't. */
 extern bool  enable_live_colortrans;
@@ -45,7 +50,6 @@ void dvr_reenc_set_codec(int idx);
 void dvr_reenc_set_resolution(int idx);
 void dvr_set_mode(int mode);
 void dvr_set_max_size(int mb);
-void dvr_set_raw_fps(int fps);
 void dvr_start_all(void);
 void dvr_stop_all(void);
 #endif
@@ -84,63 +88,59 @@ static void on_video_scale(const char * value)
 #endif
 }
 
-/* ── GS DVR live hooks ───────────────────────────────────────────────────────
+/* ── GS live-apply hooks ─────────────────────────────────────────────────────
  * These restore the "apply immediately" behaviour the old gs_system.c widget
- * callbacks had. Without them a change to a DVR setting only persists to config
- * (gsmenu.sh) and takes effect on the next restart. The dropdown value strings
- * come straight from gsmenu.sh's option lists. */
+ * callbacks had. Without them a menu change would only persist to config
+ * (gsmenu.sh) and take effect on the next restart. Used by the DVR, audio and
+ * other receiver settings. The value strings come straight from gsmenu.sh's
+ * option lists. In the simulator there's no backend, so we just print the call. */
 #ifdef USE_SIMULATOR
-#define DVR_LIVE(call, fmt, ...) do { printf(fmt "\n", __VA_ARGS__); fflush(stdout); } while(0)
+#define MENU_LIVE(call, fmt, ...) do { printf(fmt "\n", __VA_ARGS__); fflush(stdout); } while(0)
 #else
-#define DVR_LIVE(call, fmt, ...) do { call; } while(0)
+#define MENU_LIVE(call, fmt, ...) do { call; } while(0)
 #endif
 
 static void on_rec_enabled(const char * value)   /* start/stop recording now */
 {
     int on = value && strcmp(value, "on") == 0;
-    if(on) DVR_LIVE(dvr_start_all(), "dvr_start_all()%s", "");
-    else   DVR_LIVE(dvr_stop_all(),  "dvr_stop_all()%s",  "");
+    if(on) MENU_LIVE(dvr_start_all(), "dvr_start_all()%s", "");
+    else   MENU_LIVE(dvr_stop_all(),  "dvr_stop_all()%s",  "");
 }
 static void on_dvr_osd(const char * value)       /* burn OSD into the re-encode */
 {
     int on = (value && strcmp(value, "on") == 0) ? 1 : 0;
-    DVR_LIVE(dvr_reenc_set_osd(on), "dvr_reenc_set_osd(%d)", on);
+    MENU_LIVE(dvr_reenc_set_osd(on), "dvr_reenc_set_osd(%d)", on);
 }
 static void on_dvr_mode(const char * value)      /* raw=0, reencode=1, both=2 */
 {
     int mode = 0;
     if(value) { if(!strcmp(value, "reencode")) mode = 1; else if(!strcmp(value, "both")) mode = 2; }
-    DVR_LIVE(dvr_set_mode(mode), "dvr_set_mode(%d)", mode);
+    MENU_LIVE(dvr_set_mode(mode), "dvr_set_mode(%d)", mode);
 }
 static void on_dvr_max_size(const char * value)  /* param is in units of 100 MB */
 {
     int mb = (value ? atoi(value) : 0) * 100;
-    DVR_LIVE(dvr_set_max_size(mb), "dvr_set_max_size(%d)", mb);
-}
-static void on_rec_fps(const char * value)       /* raw recorder framerate */
-{
-    int fps = value ? atoi(value) : 0;
-    if(fps > 0) DVR_LIVE(dvr_set_raw_fps(fps), "dvr_set_raw_fps(%d)", fps);
+    MENU_LIVE(dvr_set_max_size(mb), "dvr_set_max_size(%d)", mb);
 }
 static void on_dvr_reenc_codec(const char * value)      /* h264=0, h265=1 */
 {
     int idx = (value && strcmp(value, "h265") == 0) ? 1 : 0;
-    DVR_LIVE(dvr_reenc_set_codec(idx), "dvr_reenc_set_codec(%d)", idx);
+    MENU_LIVE(dvr_reenc_set_codec(idx), "dvr_reenc_set_codec(%d)", idx);
 }
 static void on_dvr_reenc_resolution(const char * value) /* 720p=0, 1080p=1 */
 {
     int idx = (value && strcmp(value, "1080p") == 0) ? 1 : 0;
-    DVR_LIVE(dvr_reenc_set_resolution(idx), "dvr_reenc_set_resolution(%d)", idx);
+    MENU_LIVE(dvr_reenc_set_resolution(idx), "dvr_reenc_set_resolution(%d)", idx);
 }
 static void on_dvr_reenc_fps(const char * value)
 {
     int fps = value ? atoi(value) : 0;
-    if(fps > 0) DVR_LIVE(dvr_reenc_set_fps(fps), "dvr_reenc_set_fps(%d)", fps);
+    if(fps > 0) MENU_LIVE(dvr_reenc_set_fps(fps), "dvr_reenc_set_fps(%d)", fps);
 }
 static void on_dvr_reenc_bitrate(const char * value)
 {
     int kbps = value ? atoi(value) : 0;
-    if(kbps > 0) DVR_LIVE(dvr_reenc_set_bitrate(kbps), "dvr_reenc_set_bitrate(%d)", kbps);
+    if(kbps > 0) MENU_LIVE(dvr_reenc_set_bitrate(kbps), "dvr_reenc_set_bitrate(%d)", kbps);
 }
 
 /* Full-screen editors reached from the menu (built by the app elsewhere). Each
@@ -172,6 +172,22 @@ static void open_txprofiles(void)
 }
 
 static void notify_restart(const char * v) { (void)v; show_restart_notice(); }
+
+static void on_audio_enabled(const char * value)  /* toggle Opus audio playback now */
+{
+    int on = (value && strcmp(value, "on") == 0) ? 1 : 0;
+    MENU_LIVE(audio_set_enabled(on), "audio_set_enabled(%d)", on);
+}
+static void on_audio_device(const char * value)   /* switch the ALSA output card now */
+{
+    const char * dev = value ? value : "";
+    MENU_LIVE(audio_set_device(dev), "audio_set_device(%s)", dev);
+}
+static void on_audio_volume(const char * value)   /* software output volume 0-100% */
+{
+    int pct = value ? atoi(value) : 100;
+    MENU_LIVE(audio_set_volume(pct), "audio_set_volume(%d)", pct);
+}
 
 /* Apply the receiver mode: set RXMODE and the env vars the rest of the app reads
  * (REMOTE_IP / AIR_FIRMWARE_TYPE). Called both at startup and on a mode change, so
@@ -311,14 +327,23 @@ static const colmenu_item_t cam_fpv_items[] = {
     { .kind=COLMENU_SLIDER, .label="Noiselevel", .param="noiselevel" },
 };
 static const colmenu_page_t cam_fpv_page = { "FPV", "air", "camera", cam_fpv_items, 2 };
+/* Air-unit audio (majestic.yaml audio.*). Applied on the air side via gsmenu.sh
+ * (cli -s + majestic restart); no local hooks needed. */
+static const colmenu_item_t cam_audio_items[] = {
+    { .kind=COLMENU_SWITCH,   .label="Enabled",     .param="audio_enabled" },
+    { .kind=COLMENU_SLIDER,   .label="Volume",      .param="audio_volume" },
+    { .kind=COLMENU_DROPDOWN, .label="Sample Rate", .param="audio_srate" },
+};
+static const colmenu_page_t cam_audio_page = { "Audio", "air", "camera", cam_audio_items, 3 };
 static const colmenu_item_t camera_items[] = {
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_VIDEO,    .label="Video",     .sub=&cam_video_page },
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_IMAGE,    .label="Image",     .sub=&cam_image_page },
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_VIDEO,    .label="Recording", .sub=&cam_rec_page },
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_EYE_OPEN, .label="ISP",       .sub=&cam_isp_page },
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_GPS,      .label="FPV",       .sub=&cam_fpv_page },
+    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_AUDIO,    .label="Audio",     .sub=&cam_audio_page },
 };
-static const colmenu_page_t camera_page = { "Camera", "air", "camera", camera_items, 5 };
+static const colmenu_page_t camera_page = { "Camera", "air", "camera", camera_items, 6 };
 
 static const colmenu_item_t air_tel_items[] = {
     { .kind=COLMENU_DROPDOWN, .label="Serial Port", .param="serial" },
@@ -392,6 +417,12 @@ static const colmenu_item_t sys_receiver_items[] = {
     { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="RX Mode", .param="rx_mode", .on_change=on_rx_mode_change },
 };
 static const colmenu_page_t sys_receiver_page = { "Receiver", "gs", "system", sys_receiver_items, 2 };
+static const colmenu_item_t sys_audio_items[] = {
+    { .kind=COLMENU_SWITCH,   .icon=LV_SYMBOL_AUDIO,      .label="Audio",  .param="audio",        .on_change=on_audio_enabled },
+    { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_AUDIO,      .label="Output", .param="audio_device", .on_change=on_audio_device },
+    { .kind=COLMENU_SLIDER,   .icon=LV_SYMBOL_VOLUME_MAX, .label="Volume", .param="audio_volume", .on_change=on_audio_volume, .on_live=on_audio_volume },
+};
+static const colmenu_page_t sys_audio_page = { "Audio", "gs", "system", sys_audio_items, 3 };
 static const colmenu_item_t sys_display_items[] = {
     { .kind=COLMENU_SWITCH,   .icon=LV_SYMBOL_SETTINGS, .label="GS Rendering",   .param="gs_rendering" },
     { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Connector",      .param="connector" },
@@ -404,20 +435,20 @@ static const colmenu_item_t sys_dvr_items[] = {
     { .kind=COLMENU_SWITCH,   .label="Enabled",           .param="rec_enabled",          .on_change=on_rec_enabled },
     { .kind=COLMENU_DROPDOWN, .label="Mode",              .param="dvr_mode",             .on_change=on_dvr_mode },
     { .kind=COLMENU_SLIDER,   .label="Max file size (MB)", .param="dvr_max_size",         .on_change=on_dvr_max_size, .display_scale=100 },
-    { .kind=COLMENU_DROPDOWN, .label="Raw FPS",           .param="rec_fps",              .on_change=on_rec_fps },
     { .kind=COLMENU_DROPDOWN, .label="Codec",             .param="dvr_reenc_codec",      .on_change=on_dvr_reenc_codec },
     { .kind=COLMENU_DROPDOWN, .label="Resolution",        .param="dvr_reenc_resolution", .on_change=on_dvr_reenc_resolution },
     { .kind=COLMENU_DROPDOWN, .label="Re-encode FPS",     .param="dvr_reenc_fps",        .on_change=on_dvr_reenc_fps },
     { .kind=COLMENU_DROPDOWN, .label="Bitrate (kbps)",    .param="dvr_reenc_bitrate",    .on_change=on_dvr_reenc_bitrate },
     { .kind=COLMENU_SWITCH,   .label="Record OSD in DVR", .param="dvr_osd",              .on_change=on_dvr_osd },
 };
-static const colmenu_page_t sys_dvr_page = { "DVR", "gs", "system", sys_dvr_items, 9 };
+static const colmenu_page_t sys_dvr_page = { "DVR", "gs", "system", sys_dvr_items, 8 };
 static const colmenu_item_t system_items[] = {
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_WIFI,  .label="Receiver", .sub=&sys_receiver_page },
+    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_AUDIO, .label="Audio",    .sub=&sys_audio_page },
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_IMAGE, .label="Display",  .sub=&sys_display_page },
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_VIDEO, .label="DVR",      .sub=&sys_dvr_page },
 };
-static const colmenu_page_t system_page = { "System", "gs", "system", system_items, 3 };
+static const colmenu_page_t system_page = { "System", "gs", "system", system_items, 4 };
 
 /* WiFi. The WiFi page shows the live connection (get gs wifi ssid) — entering the
  * connected network gives Disconnect / Forget. "Networks" lists only AVAILABLE
