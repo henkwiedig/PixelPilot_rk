@@ -5,6 +5,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#include <unistd.h>
 
 #include "spdlog/spdlog.h"
 
