@@ -175,8 +175,7 @@ static void notify_restart(const char * v) { (void)v; show_restart_notice(); }
 
 /* Apply the receiver mode: set RXMODE and the env vars the rest of the app reads
  * (REMOTE_IP / AIR_FIRMWARE_TYPE). Called both at startup and on a mode change, so
- * the env is always in sync with the actual mode (the old gsmenu_toggle_rxmode()
- * set these from menu creation onward). */
+ * the env is always in sync with the actual mode. */
 static void apply_rx_mode(bool apfpv)
 {
     bool changed = ((RXMODE == APFPV) != apfpv);
@@ -211,8 +210,7 @@ static bool mode_is_apfpv(void)
 }
 
 /* Switching RX mode: apply the env the rest of the app expects and rebuild the
- * menu so the mode-specific pages appear. (Not the old gsmenu_toggle_rxmode(),
- * which pokes lv_menu objects that don't exist here.) */
+ * menu so the mode-specific pages appear. */
 static void on_rx_mode_change(const char * value)
 {
     bool apfpv = value && strcmp(value, "apfpv") == 0;

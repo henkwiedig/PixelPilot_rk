@@ -35,7 +35,6 @@ class WiFiMonitor {
 public:
     WiFiMonitor();
     void run();
-    void publish_reset();
 
 private:
     struct WiFiStats {
@@ -85,7 +84,6 @@ private:
     void add_interface_stats_to_batch(void* batch, const osd_tag* base_tags, const WiFiStats& stats);
     void add_rssi_fact_to_batch(void* batch, const osd_tag* base_tags, const std::string& rssi_type, int value);
     void add_temperature_fact_to_batch(void* batch, const osd_tag* base_tags, int rf_path, int value);
-    void publish_interface_reset(void* batch, const std::filesystem::path& interface_path, int adapter);
 
 };
 
