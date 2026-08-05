@@ -89,6 +89,9 @@ private:
     static constexpr int kTargets = 2;
     struct Target {
         gbm_bo*     bo{nullptr};
+        uint32_t    gem_handle{0};  // set instead of bo on the CONTIG (raw
+                                     // dumb-buffer) allocation path -- see
+                                     // create_targets() in the .cpp
         EGLImageKHR img{EGL_NO_IMAGE_KHR};
         GLuint      tex{0};
         GLuint      fbo{0};

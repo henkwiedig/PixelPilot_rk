@@ -5,9 +5,16 @@
  */
 
 #include "frame_colorcorrect.h"
+#include "mem_info.h"
+#include "rockchip_bo.h"
 
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
 #include <drm_fourcc.h>
+#include <xf86drm.h>
 #include <rga/im2d.h>
 #include <rga/rga.h>
 #include <spdlog/spdlog.h>
@@ -204,22 +211,73 @@ bool FrameColorCorrect::create_targets() {
         // GBM_BO_USE_SCANOUT hints the allocator toward a scanout-optimized
         // (potentially tiled/compressed) layout; GBM_BO_USE_LINEAR forces the
         // layout RGA actually expects.
-        t.bo = gbm_bo_create(gbm_, width_, height_, GBM_FORMAT_ARGB8888,
-                             GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR);
-        if (!t.bo) {
-            spdlog::error("FrameCC: gbm_bo_create failed for target {}", i);
-            return false;
+        //
+        // On >=4GB board variants, this buffer is one of the two RGA reads
+        // from/writes to during imcvtcolor() below, and GBM has no way to
+        // request the CMA-backed (<4GB) allocation RGA2's MMU requires (see
+        // mem_info.h). Bypass GBM there and allocate a plain KMS dumb buffer
+        // with the Rockchip CONTIG flag set directly; on the 1GB variant this
+        // can't matter (no memory exists above 4GB), so GBM is left as-is.
+        uint32_t stride_bytes = 0;
+        bool want_contig = platform_has_large_ram();
+        if (want_contig) {
+            struct drm_mode_create_dumb dmcd;
+            memset(&dmcd, 0, sizeof(dmcd));
+            dmcd.width  = width_;
+            dmcd.height = height_;
+            dmcd.bpp    = 32;
+            dmcd.flags  = ROCKCHIP_BO_CONTIG;
+            int ret;
+            do {
+                ret = ioctl(drm_fd_, DRM_IOCTL_MODE_CREATE_DUMB, &dmcd);
+            } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
+            if (ret == -1) {
+                spdlog::error("FrameCC: CONTIG dumb-buffer create failed for "
+                              "target {} ({}), falling back to GBM", i, strerror(errno));
+                want_contig = false;
+            } else {
+                struct drm_prime_handle dph;
+                memset(&dph, 0, sizeof(dph));
+                dph.handle = dmcd.handle;
+                dph.flags  = DRM_CLOEXEC | DRM_RDWR;
+                dph.fd     = -1;
+                do {
+                    ret = ioctl(drm_fd_, DRM_IOCTL_PRIME_HANDLE_TO_FD, &dph);
+                } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
+                if (ret == -1) {
+                    spdlog::error("FrameCC: prime export failed for CONTIG "
+                                  "target {} ({})", i, strerror(errno));
+                    struct drm_mode_destroy_dumb dmd;
+                    memset(&dmd, 0, sizeof(dmd));
+                    dmd.handle = dmcd.handle;
+                    ioctl(drm_fd_, DRM_IOCTL_MODE_DESTROY_DUMB, &dmd);
+                    return false;
+                }
+                t.gem_handle = dmcd.handle;
+                t.prime_fd   = dph.fd;
+                stride_bytes = dmcd.pitch;
+                spdlog::info("FrameCC: target {} CONTIG dumb bo stride={}", i, stride_bytes);
+            }
         }
-        spdlog::info("FrameCC: target {} bo stride={} modifier=0x{:x}", i,
-                     gbm_bo_get_stride(t.bo), gbm_bo_get_modifier(t.bo));
+        if (!want_contig) {
+            t.bo = gbm_bo_create(gbm_, width_, height_, GBM_FORMAT_ARGB8888,
+                                 GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR);
+            if (!t.bo) {
+                spdlog::error("FrameCC: gbm_bo_create failed for target {}", i);
+                return false;
+            }
+            stride_bytes = gbm_bo_get_stride(t.bo);
+            spdlog::info("FrameCC: target {} bo stride={} modifier=0x{:x}", i,
+                         stride_bytes, gbm_bo_get_modifier(t.bo));
 
-        // Export once; keep fd open for RGA use in process()
-        t.prime_fd = gbm_bo_get_fd(t.bo);
-        if (t.prime_fd < 0) {
-            spdlog::error("FrameCC: gbm_bo_get_fd failed for target {}", i);
-            return false;
+            // Export once; keep fd open for RGA use in process()
+            t.prime_fd = gbm_bo_get_fd(t.bo);
+            if (t.prime_fd < 0) {
+                spdlog::error("FrameCC: gbm_bo_get_fd failed for target {}", i);
+                return false;
+            }
         }
-        t.stride_px = gbm_bo_get_stride(t.bo) / 4;  // bytes/row ÷ 4 bytes/px
+        t.stride_px = stride_bytes / 4;  // bytes/row ÷ 4 bytes/px
 
         // Import as EGLImage → bind as texture → attach as FBO
         const EGLint img_attrs[] = {
@@ -228,7 +286,7 @@ bool FrameColorCorrect::create_targets() {
             EGL_LINUX_DRM_FOURCC_EXT,        (EGLint)DRM_FORMAT_ARGB8888,
             EGL_DMA_BUF_PLANE0_FD_EXT,       t.prime_fd,
             EGL_DMA_BUF_PLANE0_OFFSET_EXT,   0,
-            EGL_DMA_BUF_PLANE0_PITCH_EXT,    (EGLint)gbm_bo_get_stride(t.bo),
+            EGL_DMA_BUF_PLANE0_PITCH_EXT,    (EGLint)stride_bytes,
             EGL_NONE
         };
         t.img = eglCreateImageKHR_(dpy_, EGL_NO_CONTEXT,
@@ -451,7 +509,15 @@ void FrameColorCorrect::destroy_targets() {
             eglDestroyImageKHR_(dpy_, t.img); t.img = EGL_NO_IMAGE_KHR;
         }
         if (t.prime_fd >= 0) { close(t.prime_fd); t.prime_fd = -1; }
-        if (t.bo)   { gbm_bo_destroy(t.bo);            t.bo = nullptr; }
+        if (t.bo) {
+            gbm_bo_destroy(t.bo); t.bo = nullptr;
+        } else if (t.gem_handle) {
+            struct drm_mode_destroy_dumb dmd;
+            memset(&dmd, 0, sizeof(dmd));
+            dmd.handle = t.gem_handle;
+            ioctl(drm_fd_, DRM_IOCTL_MODE_DESTROY_DUMB, &dmd);
+            t.gem_handle = 0;
+        }
     }
 }
 

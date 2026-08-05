@@ -92,6 +92,14 @@ private:
     void process_loop();
     void timer_loop();
 
+    // Attempts CMA-backed (<4GB-guaranteed) allocation of proc_copy_ via a
+    // raw DRM dumb buffer, bypassing MPP's buffer-group CONTIG/DMA32 flags
+    // (see mem_info.h -- they don't reliably route to CMA on this
+    // platform). Only called on large-RAM boards. On failure, proc_copy_
+    // is left null; the caller does not fall back to hold_grp for this --
+    // see process_loop().
+    bool alloc_contig_proc_copy(size_t size);
+
     MppEncoder            *encoder;
     std::atomic<long>     interval_ns;
     std::atomic<int>      target_res_{1};  // 0=720p, 1=1080p
