@@ -683,7 +683,7 @@ extern "C" {
     void dvr_reenc_notify_colortrans(int enabled) {
         if (!frame_proc) return;
         if (enabled)
-            frame_proc->set_color_correction(live_colortrans_gain, live_colortrans_offset, drm_fd);
+            frame_proc->set_color_correction(live_colortrans_gain, live_colortrans_offset);
         else
             frame_proc->set_color_correction_enabled(false);
     }
@@ -830,7 +830,7 @@ extern "C" {
                                            dvr_reenc_on_fatal_error);
             if (enable_live_colortrans)
                 frame_proc->set_color_correction(live_colortrans_gain,
-                                                live_colortrans_offset, drm_fd);
+                                                live_colortrans_offset);
             pthread_create(&g_tid_fproc, NULL, &FrameProcessor::__THREAD__, frame_proc);
             dvr_configure_reenc_receiver();
             if (receiver) receiver->set_dvr_reenc_on_start(dvr_reenc_on_start);
@@ -1878,7 +1878,7 @@ int main(int argc, char **argv)
 			                               dvr_reenc_on_fatal_error);
 			if (enable_live_colortrans) {
 				frame_proc->set_color_correction(live_colortrans_gain,
-				                                live_colortrans_offset, drm_fd);
+				                                live_colortrans_offset);
 				spdlog::info("Encoder color correction enabled: gain={} offset={}",
 				             live_colortrans_gain, live_colortrans_offset);
 			}

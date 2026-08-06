@@ -65,8 +65,9 @@ public:
     void set_resolution(EncResolution r) { target_res_.store((int)r, std::memory_order_relaxed); }
 
     // Enable GPU color correction using the DRM gamma formula y = clamp((x+offset)*gain, 0, 1).
-    // Safe to call from any thread.  drm_fd is used to create the GBM/EGL context (lazy).
-    void set_color_correction(float gain, float offset, int drm_fd);
+    // Safe to call from any thread.  The GBM/EGL context is created lazily on
+    // the processor thread from the DRM fd given at construction.
+    void set_color_correction(float gain, float offset);
 
     // Enable/disable color correction at runtime without changing the stored params.
     // Thread-safe: safe to toggle from the UI thread while the pacer is running.
@@ -136,10 +137,14 @@ private:
     // Written by UI thread (set_color_correction / set_color_correction_enabled),
     // read by processor thread — must be atomic where shared.
     std::atomic<bool>  color_correct_{false};
-    bool               gl_init_done_{false};
-    uint32_t           gl_out_w_{0}, gl_out_h_{0};  // output dims at last GL init
-    float              cc_gain_{1.f}, cc_offset_{0.f};
-    int                drm_fd_{-1};  // DRM fd for GBM/EGL (passed at construction)
+    bool               gl_init_done_{false};       // processor thread only
+    uint32_t           gl_out_w_{0}, gl_out_h_{0}; // processor thread only: dims at last GL init
+    std::atomic<float> cc_gain_{1.f};
+    std::atomic<float> cc_offset_{0.f};
+    // DRM fd for GBM/EGL.  Immutable after construction: the processor thread
+    // reads it on every frame, so a runtime write from the UI thread would be
+    // a data race.  const enforces that rather than leaving it to convention.
+    const int          drm_fd_;
     FrameColorCorrect  color_gl_;
 };
 

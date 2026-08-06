@@ -41,6 +41,11 @@ public:
     void deinit();
     bool ready() const { return ready_; }
 
+    // Update the correction parameters of an already-initialised context.
+    // The uniforms are uploaded per frame in process(), so this takes effect
+    // on the next frame.  Must be called from the processor thread.
+    void set_params(float gain, float offset) { gain_ = gain; offset_ = offset; }
+
     // Register the current OSD DMA-buf for compositing.  Called whenever the
     // OSD double-buffer switches.  The EGLImage is cached and only re-imported
     // when prime_fd changes.  Must be called from the processor thread.
