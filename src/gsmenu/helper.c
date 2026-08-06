@@ -2,10 +2,8 @@
 #include <stdio.h>
 #include <signal.h>
 #include "../../lvgl/lvgl.h"
-#include "../menu.h"       /* enum RXMode, RXMODE */
 #include "helper.h"
 #include "styles.h"
-#include "../WiFiRSSIMonitor.h"
 
 extern lv_indev_t * indev_drv;
 
@@ -58,27 +56,6 @@ lv_obj_t * find_first_focusable_obj(lv_obj_t * parent) {
     }
 
     return NULL;
-}
-
-/* Apply the environment for the current RX mode (WFB vs APFPV). */
-void gsmenu_toggle_rxmode() {
-    switch (RXMODE)
-    {
-    case APFPV:
-        setenv("REMOTE_IP" , "192.168.0.1", 1);
-        setenv("AIR_FIRMWARE_TYPE" , "apfpv", 1);
-        break;
-    case WFB:
-        setenv("REMOTE_IP" , "10.5.0.10", 1);
-        setenv("AIR_FIRMWARE_TYPE" , "wfb", 1);
-#ifndef USE_SIMULATOR
-        wifi_rssi_monitor_reset();
-#endif
-        break;
-
-    default:
-        break;
-    }
 }
 
 typedef struct {

@@ -191,8 +191,7 @@ static void on_audio_volume(const char * value)   /* software output volume 0-10
 
 /* Apply the receiver mode: set RXMODE and the env vars the rest of the app reads
  * (REMOTE_IP / AIR_FIRMWARE_TYPE). Called both at startup and on a mode change, so
- * the env is always in sync with the actual mode (the old gsmenu_toggle_rxmode()
- * set these from menu creation onward). */
+ * the env is always in sync with the actual mode. */
 static void apply_rx_mode(bool apfpv)
 {
     bool changed = ((RXMODE == APFPV) != apfpv);
@@ -200,7 +199,7 @@ static void apply_rx_mode(bool apfpv)
     setenv("REMOTE_IP",         apfpv ? "192.168.0.1" : "10.5.0.10", 1);
     setenv("AIR_FIRMWARE_TYPE", apfpv ? "apfpv"       : "wfb",       1);
     /* Drop the previous mode's stale facts: wfbcli.* (the wfbcli thread only runs in
-     * WFB) and os_mon.wifi.* (WiFiRSSIMonitor only runs in apfpv). The active source
+     * WFB) and os_mon.wifi.* (WiFiMonitor only runs in apfpv). The active source
      * re-publishes its own. Only these two prefixes - a blanket flush would also clear
      * facts nobody re-publishes, e.g. video.width/height (published once per decoder
      * frame-info change), leaving the VideoWidget stuck on "?x?". */
@@ -227,8 +226,7 @@ static bool mode_is_apfpv(void)
 }
 
 /* Switching RX mode: apply the env the rest of the app expects and rebuild the
- * menu so the mode-specific pages appear. (Not the old gsmenu_toggle_rxmode(),
- * which pokes lv_menu objects that don't exist here.) */
+ * menu so the mode-specific pages appear. */
 static void on_rx_mode_change(const char * value)
 {
     bool apfpv = value && strcmp(value, "apfpv") == 0;

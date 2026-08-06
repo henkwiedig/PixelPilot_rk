@@ -557,7 +557,9 @@ public:
 		FactTags fact_tags = fact.getTags();
 		
 		for (const auto& [key, match_value] : tags) {
-			if (auto value = fact_tags.find(key); value != tags.end()) {
+			// Compare against fact_tags.end(): find() returns an iterator into
+			// fact_tags, and an unmatched key used to be dereferenced as if found.
+			if (auto value = fact_tags.find(key); value != fact_tags.end()) {
 				if (value->second != match_value) return false;
 			} else {
 				return false;
@@ -964,7 +966,10 @@ protected:
 
     std::vector<Token> tokenize(const std::string& tpl) {
         std::vector<Token> tokens;
-        std::regex token_regex(R"(%%|%[bisu]|%(\.\d+)?f|[^%]+)"); // Match placeholders and literals
+        // Match placeholders and literals. `d` belongs in the class: it is handled
+        // below (and documented) as an alias of `i`, but without it here the regex
+        // skips the '%' and the 'd' comes out as a literal.
+        std::regex token_regex(R"(%%|%[bisud]|%(\.\d+)?f|[^%]+)");
         std::sregex_iterator iter(tpl.begin(), tpl.end(), token_regex);
         std::sregex_iterator end;
 
