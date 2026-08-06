@@ -2476,6 +2476,16 @@ void restream_scan_clients(char* buf, size_t buf_len) {
         combined += '\n';
         combined += manual_ip;
     }
+    // Callers hand this straight to an LVGL dropdown, which splits on '\n', so a
+    // buffer too small to hold every entry must still end on a line boundary —
+    // a half-copied address would show up as a selectable, bogus target. Drop
+    // the partial tail rather than offering it (no trailing '\n' either, which
+    // would render as an empty option).
+    if (combined.size() >= buf_len) {
+        combined.resize(buf_len - 1);
+        const size_t last_nl = combined.find_last_of('\n');
+        combined.resize(last_nl == std::string::npos ? 0 : last_nl);
+    }
     strncpy(buf, combined.c_str(), buf_len - 1);
     buf[buf_len - 1] = '\0';
 }
