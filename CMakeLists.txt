@@ -106,6 +106,8 @@ set(LIB_SOURCE_FILES
         src/menu.c
         src/input.h
         src/input.cpp
+        src/adc_input.h
+        src/adc_input.cpp
         src/osd.h
         src/osd.hpp
         src/osd.cpp
