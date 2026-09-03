@@ -15,6 +15,7 @@
 #include "input.h"
 #include "menu.h"
 #include "osd.h"   /* osd_publish_int_fact() for the +/- test-fact keys */
+#include "adc_input.h"
 
 extern YAML::Node config;
 extern lv_group_t *main_group;
@@ -60,6 +61,114 @@ extern lv_obj_t * pp_menu_screen;
 static lv_key_t next_key = LV_KEY_END;  // Default to no key
 static bool next_key_pressed = false;    // Indicates if the next key should be pressed or released
 gsmenu_control_mode_t control_mode = GSMENU_CONTROL_MODE_NAV;
+
+// Shared by every input backend (GPIO buttons, VRX Pro ADC buttons). Kept
+// outside the USE_SIMULATOR guard below since it has no hardware dependency
+// and input.cpp itself is compiled into the simulator build too.
+void dispatch_named_key_event(const char *name) {
+    if (name == NULL) return;
+
+    switch (control_mode) {
+        case GSMENU_CONTROL_MODE_NAV:
+            if (strcmp(name, "up") == 0) {
+                next_key = LV_KEY_PREV;
+            }
+            else if (strcmp(name, "down") == 0) {
+                next_key = LV_KEY_NEXT;
+            }
+            else if (strcmp(name, "left") == 0) {
+                next_key = LV_KEY_HOME;
+            }
+            else if (strcmp(name, "right") == 0) {
+                next_key = LV_KEY_ENTER;
+            }
+            else if (strcmp(name, "center") == 0) {
+                next_key = LV_KEY_ENTER;
+            }
+            else if (strcmp(name, "rec") == 0) {
+                #ifdef USE_SIMULATOR
+                                dvr_enabled ^= 1;
+                #endif
+                            toggle_rec_enabled();
+            }
+            break;
+
+        case GSMENU_CONTROL_MODE_EDIT:
+            if (strcmp(name, "up") == 0) {
+                next_key = LV_KEY_UP;
+            }
+            else if (strcmp(name, "down") == 0) {
+                next_key = LV_KEY_DOWN;
+            }
+            else if (strcmp(name, "left") == 0) {
+                next_key = LV_KEY_ESC;
+            }
+            else if (strcmp(name, "right") == 0 ||
+                     strcmp(name, "center") == 0) {
+                next_key = LV_KEY_ENTER;
+            }
+            break;
+
+        case GSMENU_CONTROL_MODE_SLIDER:
+            if (strcmp(name, "up") == 0) {
+                next_key = LV_KEY_RIGHT;
+            }
+            else if (strcmp(name, "down") == 0) {
+                next_key = LV_KEY_LEFT;
+            }
+            else if (strcmp(name, "left") == 0) {
+                next_key = LV_KEY_ESC;
+            }
+            else if (strcmp(name, "right") == 0 ||
+                     strcmp(name, "center") == 0) {
+                next_key = LV_KEY_ENTER;
+            }
+            break;
+
+        case GSMENU_CONTROL_MODE_KEYBOARD:
+            if (strcmp(name, "up") == 0) {
+                next_key = LV_KEY_UP;
+            }
+            else if (strcmp(name, "down") == 0) {
+                next_key = LV_KEY_DOWN;
+            }
+            else if (strcmp(name, "left") == 0) {
+                next_key = LV_KEY_LEFT;
+            }
+            else if (strcmp(name, "right") == 0) {
+                next_key = LV_KEY_RIGHT;
+            }
+            else if (strcmp(name, "center") == 0) {
+                next_key = LV_KEY_ENTER;
+            }
+            break;
+
+        default:
+            break;
+    }
+
+    if (next_key != LV_KEY_END) {
+        next_key_pressed = true;
+    }
+}
+
+void dispatch_named_long_press(const char *name) {
+    if (strcmp(name, "right") == 0) {
+        next_key = LV_KEY_ENTER;
+        next_key_pressed = true;
+    }
+    else if (strcmp(name, "left") == 0 && !menu_active) {
+        toggle_rec_enabled();
+    }
+}
+
+bool dispatch_has_pending_key(void) {
+    return next_key != LV_KEY_END;
+}
+
+void dispatch_release_key(void) {
+    next_key_pressed = false;
+}
 
 extern uint64_t gtotal_tunnel_data;
 void simulate_traffic(lv_timer_t *t)
@@ -205,112 +314,30 @@ void setup_gpio(YAML::Node& config) {
 }
 
 void send_long_press_event(size_t button_index) {
-    if (strcmp(gpio_buttons[button_index].name, "right") == 0) {
-        next_key = LV_KEY_ENTER;
-        next_key_pressed = true;
+    const char *name = gpio_buttons[button_index].name;
+    bool was_right = (strcmp(name, "right") == 0);
+    bool was_left_rec_toggle = (strcmp(name, "left") == 0 && !menu_active);
 
+    dispatch_named_long_press(name);
+
+    if (was_right) {
         printf("GPIO Long Press: %s (acting as center) (Pin: %d, Chip: %s)\n",
-               gpio_buttons[button_index].name,
-               gpio_buttons[button_index].pin_number,
-               gpio_buttons[button_index].chip_name);
+               name, gpio_buttons[button_index].pin_number, gpio_buttons[button_index].chip_name);
     }
-    else if (strcmp(gpio_buttons[button_index].name, "left") == 0 && !menu_active) {
-        toggle_rec_enabled();
-
+    else if (was_left_rec_toggle) {
         printf("GPIO Long Press: %s (toggling recording) (Pin: %d, Chip: %s)\n",
-               gpio_buttons[button_index].name,
-               gpio_buttons[button_index].pin_number,
-               gpio_buttons[button_index].chip_name);
+               name, gpio_buttons[button_index].pin_number, gpio_buttons[button_index].chip_name);
     }
 }
 
 void send_button_event(size_t button_index) {
     if (gpio_buttons[button_index].name == NULL) return;
 
-    // Adjust for control_mode
-    switch (control_mode) {
-        case GSMENU_CONTROL_MODE_NAV:
-            if (strcmp(gpio_buttons[button_index].name, "up") == 0) {
-                next_key = LV_KEY_PREV;
-            } 
-            else if (strcmp(gpio_buttons[button_index].name, "down") == 0) {
-                next_key = LV_KEY_NEXT;
-            }
-            else if (strcmp(gpio_buttons[button_index].name, "left") == 0) {
-                next_key = LV_KEY_HOME;
-            }
-            else if (strcmp(gpio_buttons[button_index].name, "right") == 0) {
-                next_key = LV_KEY_ENTER;
-            }
-            else if (strcmp(gpio_buttons[button_index].name, "center") == 0) {
-                next_key = LV_KEY_ENTER;
-            }
-            else if (strcmp(gpio_buttons[button_index].name, "rec") == 0) {
-                #ifdef USE_SIMULATOR
-                                dvr_enabled ^= 1;
-                #endif
-                            toggle_rec_enabled();
-            }
-            break;
-            
-        case GSMENU_CONTROL_MODE_EDIT:
-            if (strcmp(gpio_buttons[button_index].name, "up") == 0) {
-                next_key = LV_KEY_UP;
-            } 
-            else if (strcmp(gpio_buttons[button_index].name, "down") == 0) {
-                next_key = LV_KEY_DOWN;
-            }
-            else if (strcmp(gpio_buttons[button_index].name, "left") == 0) {
-                next_key = LV_KEY_ESC;
-            }
-            else if (strcmp(gpio_buttons[button_index].name, "right") == 0 ||
-                     strcmp(gpio_buttons[button_index].name, "center") == 0) {
-                next_key = LV_KEY_ENTER;
-            }
-            break;
-            
-        case GSMENU_CONTROL_MODE_SLIDER:
-            if (strcmp(gpio_buttons[button_index].name, "up") == 0) {
-                next_key = LV_KEY_RIGHT;
-            } 
-            else if (strcmp(gpio_buttons[button_index].name, "down") == 0) {
-                next_key = LV_KEY_LEFT;
-            }
-            else if (strcmp(gpio_buttons[button_index].name, "left") == 0) {
-                next_key = LV_KEY_ESC;
-            }
-            else if (strcmp(gpio_buttons[button_index].name, "right") == 0 ||
-                     strcmp(gpio_buttons[button_index].name, "center") == 0) {
-                next_key = LV_KEY_ENTER;
-            }
-            break;
-            
-        case GSMENU_CONTROL_MODE_KEYBOARD:
-            if (strcmp(gpio_buttons[button_index].name, "up") == 0) {
-                next_key = LV_KEY_UP;
-            } 
-            else if (strcmp(gpio_buttons[button_index].name, "down") == 0) {
-                next_key = LV_KEY_DOWN;
-            }
-            else if (strcmp(gpio_buttons[button_index].name, "left") == 0) {
-                next_key = LV_KEY_LEFT;
-            }
-            else if (strcmp(gpio_buttons[button_index].name, "right") == 0) {
-                next_key = LV_KEY_RIGHT;
-            }
-            else if (strcmp(gpio_buttons[button_index].name, "center") == 0) {
-                next_key = LV_KEY_ENTER;
-            }
-            break;
-            
-        default:
-            break;
-    }
-    
+    dispatch_named_key_event(gpio_buttons[button_index].name);
+
     if (next_key != LV_KEY_END) {
-        next_key_pressed = true;
-        printf("GPIO %s: %s (Pin: %d, Chip: %s)\n", 
-               gpio_buttons[button_index].is_holding ? "Holding" : "Pressed", 
+        printf("GPIO %s: %s (Pin: %d, Chip: %s)\n",
+               gpio_buttons[button_index].is_holding ? "Holding" : "Pressed",
                gpio_buttons[button_index].name,
                gpio_buttons[button_index].pin_number,
                gpio_buttons[button_index].chip_name);
@@ -400,6 +427,7 @@ void cleanup_gpio(void) {
             gpio_buttons[i].chip_label = NULL;
         }
     }
+    cleanup_vrx_adc();
 }
 #endif
 
@@ -583,6 +611,7 @@ static void virtual_keyboard_read(lv_indev_t * indev, lv_indev_data_t * data) {
 
 #ifndef USE_SIMULATOR
     handle_gpio_input(); // Check GPIO state separately from keyboard input
+    handle_vrx_adc_input(); // Check VRX Pro's ADC button ladder
 #endif
 
     if (next_key != LV_KEY_END) {
@@ -611,8 +640,9 @@ static void virtual_keyboard_read(lv_indev_t * indev, lv_indev_data_t * data) {
 lv_indev_t * create_virtual_keyboard() {
 
     set_stdin_nonblock(); // setup keyboard input from stdin
-#ifndef USE_SIMULATOR 
+#ifndef USE_SIMULATOR
     setup_gpio(config);          // Initialize GPIO
+    setup_vrx_adc();             // Initialize VRX Pro's ADC button ladder
 #endif
     lv_indev_t * indev_drv = lv_indev_create();
     lv_indev_set_type(indev_drv, LV_INDEV_TYPE_KEYPAD);
