@@ -30,6 +30,15 @@ gsmenu:
     # right: 32
     # up: 16
     # down: 18
+  # Ascent VRX Pro: the 5-way joystick + OK/RECORD/BACK buttons are not on
+  # GPIOs at all -- they're one resistor-ladder button network read off a
+  # single SARADC channel (confirmed on real hardware: idle ~20mV, each
+  # button lands within a few mV of a fixed voltage table). This polls that
+  # channel directly instead of going through gpio: above. Leave this
+  # section out entirely on hardware that doesn't have it.
+  # vrx_adc:
+  #   enabled: true
+  #   device: /sys/bus/iio/devices/iio:device0/in_voltage6_raw
   # Define custom actions here
   # action is the command the button will trigger
   # actions:
