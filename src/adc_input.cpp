@@ -62,6 +62,7 @@
 
 #include "input.h"
 #include "adc_input.h"
+#include "gsmenu/bind_dialog.h"
 
 extern YAML::Node config;
 
@@ -106,6 +107,17 @@ const char *key_name(VrxKey k) {
 bool g_enabled = false;
 std::string g_device;
 
+// The "bind" button (in_voltage0_raw by default) is a separate SARADC
+// channel from the joystick ladder above: it's a plain momentary switch, not
+// a voltage ladder, so it's read as a raw ADC code rather than millivolts --
+// full-scale (~1023) when released, near zero when pressed.
+constexpr int kBindPressedRawThreshold = 15; // raw code below this = pressed (released reads ~1023)
+
+bool g_bind_enabled = false;
+std::string g_bind_device;
+bool g_bind_last_seen_pressed = false;
+bool g_bind_confirmed_pressed = false;
+
 // Debounce state: a raw reading must repeat on two consecutive polls before
 // it's accepted, which rejects the single-sample noise/mid-transition
 // voltages an analog ladder is prone to right as a button is pressed or
@@ -120,16 +132,28 @@ long now_ms() {
     return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
 }
 
-bool read_millivolts(int *out_mv) {
-    int fd = open(g_device.c_str(), O_RDONLY);
+bool read_raw(const std::string &path, int *out_raw) {
+    int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) return false;
     char buf[32] = {0};
     ssize_t n = read(fd, buf, sizeof(buf) - 1);
     close(fd);
     if (n <= 0) return false;
-    int raw = atoi(buf);
+    *out_raw = atoi(buf);
+    return true;
+}
+
+bool read_millivolts(int *out_mv) {
+    int raw;
+    if (!read_raw(g_device, &raw)) return false;
     *out_mv = (raw * 1800) / 1024;
     return true;
+}
+
+bool sample_bind_pressed() {
+    int raw;
+    if (!read_raw(g_bind_device, &raw)) return false;
+    return raw < kBindPressedRawThreshold;
 }
 
 VrxKey sample_key() {
@@ -172,6 +196,19 @@ void setup_vrx_adc(void) {
 
     g_enabled = true;
     printf("VRX ADC: polling %s\n", g_device.c_str());
+
+    g_bind_device = adc_config["bind_device"]
+        ? adc_config["bind_device"].as<std::string>()
+        : "/sys/bus/iio/devices/iio:device0/in_voltage0_raw";
+
+    int bind_raw;
+    if (!read_raw(g_bind_device, &bind_raw)) {
+        fprintf(stderr, "VRX ADC: failed to read bind button %s: %s\n", g_bind_device.c_str(), strerror(errno));
+        return;
+    }
+
+    g_bind_enabled = true;
+    printf("VRX ADC: polling bind button %s\n", g_bind_device.c_str());
 }
 
 void handle_vrx_adc_input(void) {
@@ -202,8 +239,30 @@ void handle_vrx_adc_input(void) {
     }
 }
 
+void handle_vrx_bind_input(void) {
+    if (!g_bind_enabled) return;
+
+    bool seen = sample_bind_pressed();
+    if (seen != g_bind_last_seen_pressed) {
+        g_bind_last_seen_pressed = seen;
+        return; // wait one more tick to confirm this isn't a noise transient
+    }
+
+    if (seen == g_bind_confirmed_pressed) return;
+    g_bind_confirmed_pressed = seen;
+
+    if (seen) {
+        printf("VRX ADC: bind button pressed\n");
+        bind_dialog_trigger();
+    }
+}
+
 void cleanup_vrx_adc(void) {
     g_enabled = false;
     g_last_seen = VrxKey::None;
     g_confirmed = VrxKey::None;
+
+    g_bind_enabled = false;
+    g_bind_last_seen_pressed = false;
+    g_bind_confirmed_pressed = false;
 }

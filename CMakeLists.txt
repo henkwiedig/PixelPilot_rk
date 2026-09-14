@@ -91,6 +91,8 @@ set(LIB_SOURCE_FILES
         src/gsmenu/colmenu.c
         src/gsmenu/colmenu_pages.h
         src/gsmenu/colmenu_pages.c
+        src/gsmenu/bind_dialog.h
+        src/gsmenu/bind_dialog.c
         src/lvosd.h
         src/lvosd.c
         src/menu.h
