@@ -612,6 +612,7 @@ static void virtual_keyboard_read(lv_indev_t * indev, lv_indev_data_t * data) {
 #ifndef USE_SIMULATOR
     handle_gpio_input(); // Check GPIO state separately from keyboard input
     handle_vrx_adc_input(); // Check VRX Pro's ADC button ladder
+    handle_vrx_bind_input(); // Check VRX Pro's dedicated bind button
 #endif
 
     if (next_key != LV_KEY_END) {

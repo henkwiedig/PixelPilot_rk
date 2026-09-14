@@ -27,6 +27,12 @@ void handle_vrx_adc_input(void);
 // the other input backends' setup/cleanup pairing.
 void cleanup_vrx_adc(void);
 
+// Poll the dedicated "bind" button's ADC channel (in_voltage0_raw -- a
+// separate SARADC channel from the joystick ladder above) and, on a press
+// edge, launch /usr/bin/bind via bind_dialog_trigger(). Call once per input
+// tick alongside handle_vrx_adc_input(); no-op unless vrx_adc is configured.
+void handle_vrx_bind_input(void);
+
 #ifdef __cplusplus
 }
 #endif
