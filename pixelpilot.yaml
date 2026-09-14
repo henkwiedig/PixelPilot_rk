@@ -39,6 +39,10 @@ gsmenu:
   # vrx_adc:
   #   enabled: true
   #   device: /sys/bus/iio/devices/iio:device0/in_voltage6_raw
+  #   # Dedicated "bind" button: its own SARADC channel, read as a plain raw
+  #   # code (idle ~1023, pressed <15) rather than the joystick's voltage
+  #   # ladder. Pressing it runs /usr/bin/bind and shows a progress popup.
+  #   bind_device: /sys/bus/iio/devices/iio:device0/in_voltage0_raw
   # Define custom actions here
   # action is the command the button will trigger
   # actions:
