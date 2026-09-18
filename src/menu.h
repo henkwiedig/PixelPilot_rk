@@ -13,8 +13,8 @@ typedef struct {
     char action[MAX_ACTION_LEN];
 } MenuAction;
 
-/* Receiver mode (WFB vs APFPV). Defined in menu.c. */
-enum RXMode { WFB, APFPV };
+/* Receiver mode (WFB, APFPV, or Artosyn/waybeam). Defined in menu.c. */
+enum RXMode { WFB, APFPV, ARTOSYN };
 extern enum RXMode RXMODE;
 
 /* Toggle DVR recording (hardware button). Defined in menu.c. */

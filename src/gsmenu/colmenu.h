@@ -24,11 +24,12 @@ typedef enum {
 
 struct colmenu_page;
 
-/* RX mode bitmask for item gating: bit 0=WFB, bit 1=APFPV. 0=show in all modes. */
+/* RX mode bitmask for item gating: bit 0=WFB, bit 1=APFPV, bit 2=Artosyn. 0=show in all modes. */
 typedef enum {
-    COLMENU_MODE_WFB   = (1 << 0),
-    COLMENU_MODE_APFPV = (1 << 1),
-    COLMENU_MODE_ALL   = (1 << 0) | (1 << 1),
+    COLMENU_MODE_WFB     = (1 << 0),
+    COLMENU_MODE_APFPV   = (1 << 1),
+    COLMENU_MODE_ARTOSYN = (1 << 2),
+    COLMENU_MODE_ALL     = (1 << 0) | (1 << 1) | (1 << 2),
 } colmenu_mode_t;
 
 typedef struct colmenu_item {

@@ -306,6 +306,10 @@ int reconnect_to_server(const char *host, int port) {
                 SPDLOG_DEBUG("rxMode is apfpv, idle WFB thread");
                 break;
 
+            case ARTOSYN:
+                SPDLOG_DEBUG("rxMode is artosyn, idle WFB thread");
+                break;
+
             case WFB:
                 {
                     SPDLOG_DEBUG("wfb-cli attempting to connect to API server...");

@@ -986,7 +986,9 @@ static void build_page(colstack_t * cs, lv_obj_t * body, const colmenu_page_t * 
 
         /* Skip items that don't match the current RX mode. */
         if(it->mode_mask) {
-            int mode_bit = (RXMODE == APFPV) ? COLMENU_MODE_APFPV : COLMENU_MODE_WFB;
+            int mode_bit = (RXMODE == APFPV)   ? COLMENU_MODE_APFPV
+                          : (RXMODE == ARTOSYN) ? COLMENU_MODE_ARTOSYN
+                          :                       COLMENU_MODE_WFB;
             if(!(it->mode_mask & mode_bit)) continue;
         }
 

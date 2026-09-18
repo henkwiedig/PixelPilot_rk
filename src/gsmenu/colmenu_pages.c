@@ -189,20 +189,48 @@ static void on_audio_volume(const char * value)   /* software output volume 0-10
     MENU_LIVE(audio_set_volume(pct), "audio_set_volume(%d)", pct);
 }
 
+/* Map the gsmenu.sh rx_mode string to the RXMode enum. Unknown/empty -> WFB. */
+static enum RXMode rx_mode_from_string(const char * v)
+{
+    if(v && strcmp(v, "apfpv")   == 0) return APFPV;
+    if(v && strcmp(v, "artosyn") == 0) return ARTOSYN;
+    return WFB;
+}
+
 /* Apply the receiver mode: set RXMODE and the env vars the rest of the app reads
  * (REMOTE_IP / AIR_FIRMWARE_TYPE). Called both at startup and on a mode change, so
  * the env is always in sync with the actual mode. */
-static void apply_rx_mode(bool apfpv)
+static void apply_rx_mode(enum RXMode mode)
 {
-    bool changed = ((RXMODE == APFPV) != apfpv);
-    RXMODE = apfpv ? APFPV : WFB;
-    setenv("REMOTE_IP",         apfpv ? "192.168.0.1" : "10.5.0.10", 1);
-    setenv("AIR_FIRMWARE_TYPE", apfpv ? "apfpv"       : "wfb",       1);
+    bool changed = (RXMODE != mode);
+    RXMODE = mode;
+    switch(mode) {
+    case APFPV:
+        setenv("REMOTE_IP",         "192.168.0.1", 1);
+        setenv("AIR_FIRMWARE_TYPE", "apfpv",       1);
+        break;
+    case ARTOSYN:
+        /* The air unit sits at 192.168.100.1 over the ar8030 TUN bridge
+         * (ar_net0): sbc-groundstations' own package/ar8030/files/etc/network/
+         * interfaces.d/ar_net0 assigns the GS side 192.168.100.2, and the
+         * matching air-side overlay in OpenIPC/builder
+         * (devices/hi3516cv6xx_fpv_caddx-ascent-lite/.../ar_net0) assigns
+         * 192.168.100.1. */
+        setenv("REMOTE_IP",         "192.168.100.1", 1);
+        setenv("AIR_FIRMWARE_TYPE", "artosyn",       1);
+        break;
+    case WFB:
+    default:
+        setenv("REMOTE_IP",         "10.5.0.10", 1);
+        setenv("AIR_FIRMWARE_TYPE", "wfb",       1);
+        break;
+    }
     /* Drop the previous mode's stale facts: wfbcli.* (the wfbcli thread only runs in
      * WFB) and os_mon.wifi.* (WiFiMonitor only runs in apfpv). The active source
      * re-publishes its own. Only these two prefixes - a blanket flush would also clear
      * facts nobody re-publishes, e.g. video.width/height (published once per decoder
-     * frame-info change), leaving the VideoWidget stuck on "?x?". */
+     * frame-info change), leaving the VideoWidget stuck on "?x?". Artosyn currently
+     * publishes neither prefix either, so flushing both on entry/exit stays correct. */
 #ifndef USE_SIMULATOR
     if (changed) {
         static const char *const stale_prefixes[] = { "wfbcli.", "os_mon.wifi." };
@@ -216,21 +244,18 @@ static void apply_rx_mode(bool apfpv)
 
 /* Receiver mode drives which link pages are shown. Read from the backend, kept
  * in the RXMODE global (shared with the rest of the app). */
-static bool mode_is_apfpv(void)
+static void mode_is_apfpv(void)
 {
     char * v = colmenu_get("gs", "system", "rx_mode", NULL);
-    bool apfpv = v && strcmp(v, "apfpv") == 0;
+    apply_rx_mode(rx_mode_from_string(v));
     free(v);
-    apply_rx_mode(apfpv);
-    return apfpv;
 }
 
 /* Switching RX mode: apply the env the rest of the app expects and rebuild the
  * menu so the mode-specific pages appear. */
 static void on_rx_mode_change(const char * value)
 {
-    bool apfpv = value && strcmp(value, "apfpv") == 0;
-    apply_rx_mode(apfpv);
+    apply_rx_mode(rx_mode_from_string(value));
     colmenu_rebuild();
 }
 
@@ -287,6 +312,21 @@ static const colmenu_item_t air_aalink_items[] = {
 };
 static const colmenu_page_t air_aalink_page = { "AALink", "air", "aalink", air_aalink_items, 11 };
 
+static const colmenu_item_t air_artosyn_items[] = {
+    /* Bandwidth is ar8030-lifecycled's own persisted setting (survives
+     * reconnects); Power Mode and Channel are live ar8030-linkctl reads/
+     * writes, not lifecycled-persisted. Channel's current value/range come
+     * from BB_GET_CHAN_INFO (0..chan_num-1, chan_num from the live device --
+     * a fixed range here would go stale if the channel table ever changes);
+     * setting it is a real synchronized retune (BB_SET_CHAN + BB_SET_REMOTE
+     * push to the connected peer, see ar8030-linkctl/main.c's cmd_channel),
+     * not a blind local change, but only takes effect while linked. */
+    { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Bandwidth",   .param="bandwidth" },
+    { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Power Mode", .param="power_mode" },
+    { .kind=COLMENU_SLIDER,   .icon=LV_SYMBOL_SETTINGS, .label="Channel",    .param="channel" },
+};
+static const colmenu_page_t air_artosyn_page = { "Artosyn", "air", "artosyn", air_artosyn_items, 3 };
+
 /* Camera sub-pages (all type=air page=camera) */
 static const colmenu_item_t cam_video_items[] = {
     /* Size and FPS are WFB-specific; APFPV direct connection has fixed camera modes. */
@@ -342,6 +382,53 @@ static const colmenu_item_t camera_items[] = {
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_AUDIO,    .label="Audio",     .sub=&cam_audio_page },
 };
 static const colmenu_page_t camera_page = { "Camera", "air", "camera", camera_items, 6 };
+
+/* Waybeam (Artosyn) camera sub-pages (all type=air page=waybeam). Rudimentary
+ * first pass - REST API fields fan out through gsmenu.sh exactly like the
+ * majestic "air camera" items above; the actual curl/jq REST calls live in the
+ * integrator's real gsmenu.sh, not in this app. Param names are prefixed
+ * (image_flip, video_size, ...) to stay visually distinct from majestic's
+ * flip/size/bitrate in gsmenu.sh's case statement, even though the different
+ * `page` value already keeps the two dispatches separate. */
+static const colmenu_item_t wb_sensor_items[] = {
+    { .kind=COLMENU_DROPDOWN, .label="Mode", .param="sensor_mode" },
+};
+static const colmenu_page_t wb_sensor_page = { "Sensor", "air", "waybeam", wb_sensor_items, 1 };
+static const colmenu_item_t wb_isp_items[] = {
+    /* waybeam's REST API itself has no endpoint to enumerate available .bin
+     * files (isp.sensorBin is just a full path); gsmenu.sh's real
+     * implementation lists /etc/sensors/*.bin on the air unit over SSH instead
+     * (list_waybeam_sensor_bins), the same way majestic's sensor_file does. */
+    { .kind=COLMENU_DROPDOWN, .label="Bin File", .param="isp_binfile" },
+    /* Placeholder for more ISP fields once waybeam's REST surface is known. */
+};
+static const colmenu_page_t wb_isp_page = { "ISP", "air", "waybeam", wb_isp_items, 1 };
+static const colmenu_item_t wb_image_items[] = {
+    /* waybeam's image.rotate isn't supported on this backend (cv610); flip and
+     * mirror only ever get set together (flip+mirror == a 180deg rotation), so
+     * this is one switch, not two independent ones. */
+    { .kind=COLMENU_SWITCH, .label="Rotate 180°", .param="image_rotate180" },
+};
+static const colmenu_page_t wb_image_page = { "Image", "air", "waybeam", wb_image_items, 1 };
+static const colmenu_item_t wb_video_items[] = {
+    { .kind=COLMENU_DROPDOWN, .label="Size",       .param="video_size" },
+    /* No manual bitrate control -- waybeam's rate control is fully adaptive
+     * (video0.rcMode), a fixed bitrate override doesn't apply here. */
+    { .kind=COLMENU_DROPDOWN, .label="Resilience", .param="video_resilience" },
+};
+static const colmenu_page_t wb_video_page = { "Video", "air", "waybeam", wb_video_items, 2 };
+static const colmenu_item_t wb_audio_items[] = {
+    { .kind=COLMENU_SWITCH, .label="Enabled", .param="audio_enabled" },
+};
+static const colmenu_page_t wb_audio_page = { "Audio", "air", "waybeam", wb_audio_items, 1 };
+static const colmenu_item_t waybeam_items[] = {
+    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_EYE_OPEN, .label="Sensor", .sub=&wb_sensor_page },
+    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_EYE_OPEN, .label="ISP",    .sub=&wb_isp_page },
+    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_IMAGE,    .label="Image",  .sub=&wb_image_page },
+    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_VIDEO,    .label="Video",  .sub=&wb_video_page },
+    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_AUDIO,    .label="Audio",  .sub=&wb_audio_page },
+};
+static const colmenu_page_t waybeam_page = { "Camera", "air", "waybeam", waybeam_items, 5 };
 
 static const colmenu_item_t air_tel_items[] = {
     { .kind=COLMENU_DROPDOWN, .label="Serial Port", .param="serial" },
@@ -408,6 +495,19 @@ static const colmenu_item_t gs_wfbng_items[] = {
     { .kind=COLMENU_SWITCH,   .icon=LV_SYMBOL_SETTINGS, .label="Enabled",   .param="adaptivelink" },
 };
 static const colmenu_page_t gs_wfbng_page = { "WFB-NG", "gs", "wfbng", gs_wfbng_items, 6 };
+
+/* GS-side Artosyn link page: this ground unit's own ar8030-lifecycled HTTP
+ * API (127.0.0.1:8899, always local -- see gsmenu.sh's lifecycled_url()), so
+ * unlike air_artosyn_page this isn't gated on drone detection: it's the local
+ * radio's own state, queryable/settable whether or not the air unit is
+ * currently linked. */
+static const colmenu_item_t gs_artosyn_items[] = {
+    { .kind=COLMENU_VALUE,    .icon=LV_SYMBOL_WIFI,     .label="Status",     .param="status" },
+    { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Bandwidth",  .param="bandwidth" },
+    { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Power Mode", .param="power_mode" },
+    { .kind=COLMENU_SLIDER,   .icon=LV_SYMBOL_SETTINGS, .label="Channel",    .param="channel" },
+};
+static const colmenu_page_t gs_artosyn_page = { "Artosyn", "gs", "artosyn", gs_artosyn_items, 4 };
 
 /* System → Receiver / Display / DVR */
 static const colmenu_item_t sys_receiver_items[] = {
@@ -698,25 +798,38 @@ static const colmenu_page_t gs_apfpv_page = { "APFPV", "gs", "apfpv", gs_apfpv_i
 
 static void build_root(colmenu_emit_t * e)
 {
-    bool apfpv = (RXMODE == APFPV);   /* RXMODE is set from the backend at open,
-                                         and updated live by on_rx_mode_change */
+    /* RXMODE is set from the backend at open, and updated live by
+     * on_rx_mode_change(). */
+    const colmenu_page_t * camera = &camera_page;
 
     /* Drone (air) pages are gated on VTX detection — greyed until the drone is
      * seen (mirrors the old check_connection_timer behaviour). */
     colmenu_emit_label(e, "Drone Settings");
-    if(apfpv) {
+    switch(RXMODE) {
+    case APFPV:
         colmenu_emit_submenu_gated(e, LV_SYMBOL_WIFI, "AALink", &air_aalink_page);
-    } else {
+        break;
+    case ARTOSYN:
+        colmenu_emit_submenu_gated(e, LV_SYMBOL_WIFI, "Artosyn", &air_artosyn_page);
+        camera = &waybeam_page;
+        break;
+    case WFB:
+    default:
         colmenu_emit_submenu_gated(e, LV_SYMBOL_WIFI, "WFB-NG", &air_wfbng_page);
         colmenu_emit_submenu_gated(e, LV_SYMBOL_WIFI, "ALink",  &air_alink_page);
+        break;
     }
-    colmenu_emit_submenu_gated(e, LV_SYMBOL_IMAGE,    "Camera",    &camera_page);
+    colmenu_emit_submenu_gated(e, LV_SYMBOL_IMAGE,    "Camera",    camera);
     colmenu_emit_submenu_gated(e, LV_SYMBOL_DOWNLOAD, "Telemetry", &air_tel_page);
     colmenu_emit_submenu_gated(e, LV_SYMBOL_PLAY,     "Actions",   &air_actions_page);
 
     colmenu_emit_label(e, "GS Settings");
-    if(apfpv) colmenu_emit_submenu(e, LV_SYMBOL_WIFI, "APFPV",  &gs_apfpv_page);
-    else      colmenu_emit_submenu(e, LV_SYMBOL_WIFI, "WFB-NG", &gs_wfbng_page);
+    switch(RXMODE) {
+    case APFPV:   colmenu_emit_submenu(e, LV_SYMBOL_WIFI, "APFPV",   &gs_apfpv_page);   break;
+    case ARTOSYN: colmenu_emit_submenu(e, LV_SYMBOL_WIFI, "Artosyn", &gs_artosyn_page); break;
+    case WFB:
+    default:      colmenu_emit_submenu(e, LV_SYMBOL_WIFI, "WFB-NG",  &gs_wfbng_page);   break;
+    }
     colmenu_emit_submenu(e, LV_SYMBOL_VIDEO,    "DVR-Player",      &dvr_page);
     colmenu_emit_submenu(e, LV_SYMBOL_SETTINGS, "System Settings", &system_page);
     colmenu_emit_submenu(e, LV_SYMBOL_WIFI,     "WiFi",            &wifi_page);

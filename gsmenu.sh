@@ -232,6 +232,39 @@ case "$@" in
     "set air camera audio_volume"*)  : ;;
     "set air camera audio_srate"*)   : ;;
 
+# ── Air: Waybeam (REST API camera, Artosyn mode) ────────────────────────────
+# integrator: proxy these to waybeam's REST API (curl/jq) on $REMOTE_IP.
+
+    "get air waybeam sensor_mode")
+        echo 0
+        emit_values "0\n1\n2"                      # integrator: real sensor mode list
+        ;;
+    "get air waybeam isp_binfile")
+        echo "default.bin"
+        emit_values "default.bin"                  # integrator: list available binfiles
+        ;;
+    "get air waybeam image_rotate180")
+        echo 0                                      # integrator: flip+mirror together, no separate axes
+        ;;
+    "get air waybeam video_size")
+        echo "1920x1080"
+        emit_values "1280x720\n1920x1080"           # integrator: real supported sizes
+        ;;
+    "get air waybeam video_resilience")
+        echo 0
+        emit_values "0\n1\n2"                       # integrator: real resilience levels
+        ;;
+    "get air waybeam audio_enabled")
+        echo 0
+        ;;
+
+    "set air waybeam sensor_mode"*)      : ;;
+    "set air waybeam isp_binfile"*)      : ;;
+    "set air waybeam image_rotate180"*)  : ;;
+    "set air waybeam video_size"*)       : ;;
+    "set air waybeam video_resilience"*) : ;;
+    "set air waybeam audio_enabled"*)    : ;;
+
 # ── Air: Telemetry ───────────────────────────────────────────────────────────
 
     "get air telemetry serial")
@@ -360,6 +393,33 @@ case "$@" in
     "set air aalink SHOW_SIGNAL_BARS"*) : ;;
     "set air aalink"*)                  : ;;
 
+# ── Air: Artosyn ─────────────────────────────────────────────────────────────
+# ar8030-lifecycled's HTTP control API on the air unit ($REMOTE_IP:8899).
+# Bandwidth is lifecycled-persisted (POST /api/v1/bandwidth?mhz=..., survives
+# reconnects); power_mode and channel are live ar8030-linkctl reads/writes
+# via POST /api/v1/linkctl?cmd=<c>&args=<...>. channel's current value/range
+# come from BB_GET_CHAN_INFO (chan_num/work_chan, parsed out of the same
+# ar8030-linkctl status text /api/v1/status already embeds); setting it is
+# `linkctl channel <idx> -s auto -w 5`, a real synchronized retune that also
+# pushes to the connected peer, only effective while linked.
+
+    "get air artosyn bandwidth")
+        echo 20
+        emit_values "1\n2\n5\n10\n20\n40"           # integrator: GET /api/v1/status's bandwidth_mhz
+        ;;
+    "get air artosyn power_mode")
+        echo auto
+        emit_values "auto\nmanual"                  # integrator: POST /api/v1/linkctl?cmd=power-mode&args=
+        ;;
+    "get air artosyn channel")
+        echo 0
+        emit_values "0 41"                          # integrator: parse work_chan=/chan_num= from linkctl status
+        ;;
+
+    "set air artosyn bandwidth"*)   : ;;
+    "set air artosyn power_mode"*)  : ;;
+    "set air artosyn channel"*)     : ;;
+
 # ── GS: WFB-NG ──────────────────────────────────────────────────────────────
 
     "get gs wfbng gs_channel")
@@ -383,6 +443,30 @@ case "$@" in
     "set gs wfbng txpower"*)        : ;;
     "set gs wfbng adaptivelink"*)   : ;;
 
+# ── GS: Artosyn ──────────────────────────────────────────────────────────────
+# ar8030-lifecycled's HTTP control API, this ground unit's own local copy
+# (http://127.0.0.1:8899, always reachable regardless of link state).
+
+    "get gs artosyn status")
+        echo "not configured"       # integrator: GET /api/v1/status (role/state/bandwidth_mhz/paired)
+        ;;
+    "get gs artosyn bandwidth")
+        echo 20
+        emit_values "1\n2\n5\n10\n20\n40"
+        ;;
+    "get gs artosyn power_mode")
+        echo auto
+        emit_values "auto\nmanual"
+        ;;
+    "get gs artosyn channel")
+        echo 0
+        emit_values "0 41"
+        ;;
+
+    "set gs artosyn bandwidth"*)   : ;;
+    "set gs artosyn power_mode"*)  : ;;
+    "set gs artosyn channel"*)     : ;;
+
 # ── GS: System ──────────────────────────────────────────────────────────────
 
     "get gs system rx_codec")
@@ -391,7 +475,7 @@ case "$@" in
         ;;
     "get gs system rx_mode")
         echo wfb
-        emit_values "wfb\napfpv"
+        emit_values "wfb\napfpv\nartosyn"
         ;;
     "get gs system gs_rendering")
         echo 0
