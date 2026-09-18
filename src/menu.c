@@ -66,6 +66,7 @@ static void drone_detect_timer(lv_timer_t * t)
     static bool     detected      = false;
 
     if(RXMODE == APFPV) update_network_status();
+    if(RXMODE == ARTOSYN) gtotal_tunnel_data++; // FIXME: ARTOSYN always on for now
     uint64_t cur = gtotal_tunnel_data;
     bool now = detected;
     if(cur > last_value)                                    { last_increase = lv_tick_get(); now = true; }
