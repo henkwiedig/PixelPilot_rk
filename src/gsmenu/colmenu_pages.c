@@ -226,14 +226,14 @@ static void apply_rx_mode(enum RXMode mode)
         break;
     }
     /* Drop the previous mode's stale facts: wfbcli.* (the wfbcli thread only runs in
-     * WFB) and os_mon.wifi.* (WiFiMonitor only runs in apfpv). The active source
-     * re-publishes its own. Only these two prefixes - a blanket flush would also clear
-     * facts nobody re-publishes, e.g. video.width/height (published once per decoder
-     * frame-info change), leaving the VideoWidget stuck on "?x?". Artosyn currently
-     * publishes neither prefix either, so flushing both on entry/exit stays correct. */
+     * WFB), os_mon.wifi.* (WiFiMonitor only runs in apfpv) and ar8030.* (the
+     * lifecycled poller only publishes in Artosyn). The active source re-publishes its
+     * own. Only these prefixes - a blanket flush would also clear facts nobody
+     * re-publishes, e.g. video.width/height (published once per decoder frame-info
+     * change), leaving the VideoWidget stuck on "?x?". */
 #ifndef USE_SIMULATOR
     if (changed) {
-        static const char *const stale_prefixes[] = { "wfbcli.", "os_mon.wifi." };
+        static const char *const stale_prefixes[] = { "wfbcli.", "os_mon.wifi.", "ar8030." };
         osd_flush_facts(stale_prefixes,                     // osd.cpp isn't in the sim build
                         (int)(sizeof(stale_prefixes) / sizeof(stale_prefixes[0])));
     }

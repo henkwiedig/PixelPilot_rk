@@ -244,6 +244,29 @@ hides by default; add a range for it (`{"range": [-1, 0], "icon_path": "no_signa
 explicit "no signal" icon instead. If an adapter is unplugged entirely, its facts are dropped back
 to undefined, which hides the widget as well.
 
+In Artosyn (AR8030) mode the link figures come from the ground's `ar8030-lifecycled`
+(`GET http://127.0.0.1:8899/api/v1/link`, polled every 500 ms by `src/gsmenu/lifecycled_link.c`
+over plain HTTP - no AR8030 library needed), which reads them from the chip's `BB_GET_1V1_INFO`:
+
+| Fact                   | Type   | Description                                                            |
+|:-----------------------|:-------|:-----------------------------------------------------------------------|
+| `ar8030.signal_level`  | int    | 0..4 signal bars, 0 = no link (see below)                              |
+| `ar8030.rx.snr_db`     | double | receiver SNR, dB (`10 * log10(snr / 36)`)                              |
+| `ar8030.rx.gain`       | int    | receiver AGC gain per antenna path - what the stock UI shows as "RSSI" |
+| `ar8030.rx.ldpc_err`   | int    | share of frames with LDPC decode errors, x10000                        |
+| `ar8030.tx.mcs`        | int    | TX MCS, raw chip value (the stock UI shows it minus 2)                 |
+| `ar8030.tx.freq_mhz`   | int    | TX frequency, MHz                                                      |
+| `ar8030.tx.power`      | int    | TX power target, chip dBm                                              |
+
+All but `signal_level` are tagged `side` = `ground` or `air`; `rx.gain` additionally `path` =
+`a`/`b`. So `ar8030.rx.snr_db{side=ground}` is the video downlink as received on the goggles and
+`{side=air}` the uplink as received by the air unit (the stock UI's G-SNR / S-SNR), and
+`ar8030.tx.mcs{side=air}` is the video MCS. `signal_level` mirrors the stock UI's bars: from the
+video MCS (minus 2) `< 3` -> 1, `3..4` -> 2, `>= 5` -> 4, or 3 while the ground sees frame errors.
+The facts are only published in Artosyn mode; without a link only `signal_level` = 0 remains and
+the per-side facts are dropped to undefined, so widgets hide (`IconSelectorWidget`) or show `?`
+(template widgets - use `"hide_when_undefined": true` to hide them too).
+
 There are many facts based on Mavlink telemetry, see `mavlink.c`. All of them have tags "sysid" and
 "compid", but some have extra tags.
 Currently implemented fact categories are grouped by Mavlink message types:
@@ -389,6 +412,9 @@ to display any fact (as long as datatype matches):
   `%s` - string, `%f` / `%.0f` / `%.4f` - float with optional precision specifier
 * `{"type": "IconTplTextWidget", "template": "...", "icon_path": "foobar.png"}` - displays a
   graphical icon followed by templatized text string
+* both template widgets accept `"hide_when_undefined": true` - the widget is hidden while none of
+  its facts has a value (never published, or flushed) instead of showing `?`; useful for facts that
+  only exist in some setups or RX modes
 * `{"type": "BoxWidget", "width": 100, "height": 100, "color": {"r": 255, "g": 255, "b": 255, "alpha": 128}}` - displays
   a static square. Might be good as a background.
 * `{"type": "BarChartWidget", "width": 100, "height": 100, "window_s": 5, "num_buckets": 10, "stats_kind": "sum/min/max/count/avg"}` - displays
