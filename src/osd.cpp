@@ -928,6 +928,7 @@ public:
         lv_obj_set_style_pad_all(lv_label, 0, LV_PART_MAIN);
         lv_obj_set_style_text_color(lv_label, lv_color_white(), LV_PART_MAIN);
         lv_label_set_text(lv_label, "?");
+        if (hide_when_undefined) setLvVisible(false);
     }
 
     void setFact(uint idx, Fact fact) override {
@@ -944,12 +945,29 @@ public:
 
     virtual void updateLvLabel() {
         if (!lv_label) return;
+        if (hide_when_undefined) {
+            bool any = false;
+            for (const Fact& f : args) any = any || f.isDefined();
+            setLvVisible(any);
+            if (!any) return;
+        }
         auto text = render_tpl();
         lv_label_set_text(lv_label, text->c_str());
     }
 
+    /* "hide_when_undefined": hide the widget while none of its facts has a
+     * value (never published, or flushed) instead of rendering "?" -- for
+     * widgets whose source only exists in some setups/RX modes. */
+    bool hide_when_undefined = false;
+
     std::unique_ptr<std::string> render_tpl() {
         return render_tokens(_tokens, args);
+    }
+
+    virtual void setLvVisible(bool visible) {
+        if (!lv_label) return;
+        if (visible) lv_obj_clear_flag(lv_label, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(lv_label, LV_OBJ_FLAG_HIDDEN);
     }
 
     uint default_precision = 2;
@@ -1104,7 +1122,7 @@ public:
 
 	void createLvObjects(lv_obj_t* parent, int screen_w, int screen_h) override {
 		int ax = absX(screen_w), ay = absY(screen_h);
-		lv_obj_t* icon_obj = lv_image_create(parent);
+		icon_obj = lv_image_create(parent);
 		lv_obj_set_pos(icon_obj, ax, ay - 20);
 		lv_image_set_src(icon_obj, icon_path.c_str());
 
@@ -1115,10 +1133,19 @@ public:
 		lv_obj_set_style_pad_all(lv_label, 0, LV_PART_MAIN);
 		lv_obj_set_style_text_color(lv_label, lv_color_white(), LV_PART_MAIN);
 		lv_label_set_text(lv_label, "?");
+		if (hide_when_undefined) setLvVisible(false);
+	}
+
+	void setLvVisible(bool visible) override {
+		TplTextWidget::setLvVisible(visible);
+		if (!icon_obj) return;
+		if (visible) lv_obj_clear_flag(icon_obj, LV_OBJ_FLAG_HIDDEN);
+		else lv_obj_add_flag(icon_obj, LV_OBJ_FLAG_HIDDEN);
 	}
 
 protected:
 	std::string icon_path;
+	lv_obj_t* icon_obj = nullptr;
 };
 
 class BoxWidget: public Widget {
@@ -2832,11 +2859,15 @@ static Widget* buildWidget(const json& widget_j, const std::filesystem::path& as
 		return new IconSelectorWidget(x, y, ranges_and_icons, assets_dir);
 	} else if (type == "TplTextWidget") {
 		auto tpl = cfgGet<std::string>(widget_j, "template");
-		return new TplTextWidget(x, y, tpl, (uint)matchers.size());
+		auto *w = new TplTextWidget(x, y, tpl, (uint)matchers.size());
+		w->hide_when_undefined = cfgGet<bool>(widget_j, "hide_when_undefined", false);
+		return w;
 	} else if (type == "IconTplTextWidget") {
 		auto tpl = cfgGet<std::string>(widget_j, "template");
 		auto icon_path = cfgGet<std::string>(widget_j, "icon_path");
-		return new IconTplTextWidget(x, y, lvIconPath(assets_dir, icon_path), tpl, (uint)matchers.size());
+		auto *w = new IconTplTextWidget(x, y, lvIconPath(assets_dir, icon_path), tpl, (uint)matchers.size());
+		w->hide_when_undefined = cfgGet<bool>(widget_j, "hide_when_undefined", false);
+		return w;
 	} else if (type == "DvrStatusWidget") {
 		needFacts(matchers, 1, 1);
 		auto text = cfgGet<std::string>(widget_j, "text");

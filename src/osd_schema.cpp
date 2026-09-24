@@ -14,10 +14,12 @@ static std::vector<Field> videoFields() {
 const std::vector<WidgetType>& types() {
 	static const std::vector<WidgetType> list = {
 		{"TplTextWidget", "Values",
-		 {{"template", "Text", Kind::Template}},
+		 {{"template", "Text", Kind::Template},
+		  {"hide_when_undefined", "Hide without value", Kind::Bool}},
 		 0, -1, R"j({"template": "", "facts": []})j", true, false},
 		{"IconTplTextWidget", "Icon + values",
-		 {{"icon_path", "Icon", Kind::Icon}, {"template", "Text", Kind::Template}},
+		 {{"icon_path", "Icon", Kind::Icon}, {"template", "Text", Kind::Template},
+		  {"hide_when_undefined", "Hide without value", Kind::Bool}},
 		 0, -1, R"j({"icon_path": "memory.png", "template": "", "facts": []})j", true, false},
 		{"TextWidget", "Fixed text",
 		 {{"text", "Text", Kind::Text}},
