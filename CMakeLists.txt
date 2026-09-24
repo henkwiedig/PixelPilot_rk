@@ -56,6 +56,8 @@ set(SIMULATOR_SOURCES
         src/gsmenu/gs_scripts.c
         src/gsmenu/gs_connection_checker.h
         src/gsmenu/gs_connection_checker.c
+        src/gsmenu/lifecycled_link.h
+        src/gsmenu/lifecycled_link.c
         src/gsmenu/styles.h
         src/gsmenu/styles.c
         src/lvosd.h
@@ -83,6 +85,8 @@ set(LIB_SOURCE_FILES
         src/gsmenu/gs_scripts.c
         src/gsmenu/gs_connection_checker.h
         src/gsmenu/gs_connection_checker.c
+        src/gsmenu/lifecycled_link.h
+        src/gsmenu/lifecycled_link.c
         src/gsmenu/styles.h
         src/gsmenu/styles.c
         src/gsmenu/column_stack.h
