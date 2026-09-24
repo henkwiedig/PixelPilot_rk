@@ -11,6 +11,7 @@
 #include "gsmenu/colmenu.h"
 #include "gsmenu/colmenu_pages.h"
 #include "gsmenu/gs_connection_checker.h" /* update_network_status() */
+#include "gsmenu/lifecycled_link.h"      /* lifecycled_link_connected() */
 #include "lvosd.h"
 
 /* Focused by input.cpp's toggle_screen() to open the menu. Was in the old ui.c. */
@@ -51,13 +52,19 @@ int menu_is_recording(void)
     return dvr_enabled;
 }
 
-/* Drone detection: watch the tunnel-data counter; when it's flowing the drone
- * is present and its pages become active, otherwise they grey out. Mirrors the
- * old ui.c:check_connection_timer, but drives the column menu.
+/* Drone detection: when the drone is present its pages become active,
+ * otherwise they grey out. Mirrors the old ui.c:check_connection_timer, but
+ * drives the column menu.
  *
- * Two modes: in WFB the WFB CLI thread fills gtotal_tunnel_data from tunnel
- * traffic; in APFPV nothing does, so we refresh it here from the wlx wifi
- * interface's RX bytes (update_network_status), same as the old timer. */
+ * WFB and APFPV watch a traffic counter -- the WFB CLI thread fills
+ * gtotal_tunnel_data from tunnel traffic; in APFPV nothing does, so we refresh
+ * it here from the wlx wifi interface's RX bytes (update_network_status), same
+ * as the old timer -- and count the drone present while it keeps increasing.
+ *
+ * Artosyn asks the ground's ar8030-lifecycled instead (lifecycled_link.c): the
+ * AR8030 reports the radio link itself, and no counter fits -- video (bb port
+ * 2) stops whenever the air's encoder does, although the air pages still work,
+ * and the ar_net0 tunnel is mostly idle. */
 static void drone_detect_timer(lv_timer_t * t)
 {
     (void)t;
@@ -65,14 +72,17 @@ static void drone_detect_timer(lv_timer_t * t)
     static uint32_t last_increase = 0;
     static bool     detected      = false;
 
-    if(RXMODE == APFPV) update_network_status();
-    if(RXMODE == ARTOSYN) gtotal_tunnel_data++; // FIXME: ARTOSYN always on for now
-    uint64_t cur = gtotal_tunnel_data;
     bool now = detected;
-    if(cur > last_value)                                    { last_increase = lv_tick_get(); now = true; }
-    else if(cur < last_value)                               { now = false; }   /* reset/wrap */
-    else if(detected && lv_tick_elaps(last_increase) > 2000){ now = false; }   /* timeout    */
-    last_value = cur;
+    if(RXMODE == ARTOSYN) {
+        now = lifecycled_link_connected();
+    } else {
+        if(RXMODE == APFPV) update_network_status();
+        uint64_t cur = gtotal_tunnel_data;
+        if(cur > last_value)                                    { last_increase = lv_tick_get(); now = true; }
+        else if(cur < last_value)                               { now = false; }   /* reset/wrap */
+        else if(detected && lv_tick_elaps(last_increase) > 2000){ now = false; }   /* timeout    */
+        last_value = cur;
+    }
 
     if(now != detected) {
         detected = now;
