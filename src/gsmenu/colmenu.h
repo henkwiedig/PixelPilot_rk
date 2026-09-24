@@ -44,6 +44,7 @@ typedef struct colmenu_item {
     void (*on_change)(const char * value);  /* domain hook after a set (optional)*/
     void (*on_live)(const char * value);    /* SLIDER: fired live while dragging  */
     void (*on_activate)(void);              /* COLMENU_ACTION                    */
+    bool (*available)(void);                /* optional: hide the row when false (e.g. hardware absent) */
 } colmenu_item_t;
 
 /* Handle passed to a dynamic page's build() so it can emit rows at runtime. */

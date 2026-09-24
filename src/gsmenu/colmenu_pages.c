@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
+#include <unistd.h>
 #include "colmenu.h"
 #include "colmenu_pages.h"
 #include "helper.h"       /* show_restart_notice(), find_first_focusable_obj() */
@@ -558,14 +559,29 @@ static const colmenu_item_t restream_items[] = {
 };
 static const colmenu_page_t sys_restream_page = { "Restream", "gs", "system", restream_items, 2 };
 
+/* System → Fan: goggle fan control through the board's gs-fan helper (VRX
+ * Pro), which runs the control loop; boards without one don't show this.
+ * Auto follows the hotter of the SoC/GPU temperature; moving the speed slider
+ * switches to Manual. */
+static bool gs_fan_available(void)
+{
+    return access("/usr/bin/gs-fan", X_OK) == 0;
+}
+static const colmenu_item_t sys_fan_items[] = {
+    { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_REFRESH, .label="Mode",          .param="fan_mode" },
+    { .kind=COLMENU_SLIDER,   .icon=LV_SYMBOL_REFRESH, .label="Speed (%)",     .param="fan_speed" },
+};
+static const colmenu_page_t sys_fan_page = { "Fan", "gs", "system", sys_fan_items, 2 };
+
 static const colmenu_item_t system_items[] = {
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_WIFI,  .label="Receiver", .sub=&sys_receiver_page },
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_AUDIO, .label="Audio",    .sub=&sys_audio_page },
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_IMAGE, .label="Display",  .sub=&sys_display_page },
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_VIDEO, .label="DVR",      .sub=&sys_dvr_page },
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_WIFI,  .label="Restream", .sub=&sys_restream_page },
+    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_REFRESH, .label="Fan",    .sub=&sys_fan_page, .available=gs_fan_available },
 };
-static const colmenu_page_t system_page = { "System", "gs", "system", system_items, 5 };
+static const colmenu_page_t system_page = { "System", "gs", "system", system_items, 6 };
 
 /* WiFi. The WiFi page shows the live connection (get gs wifi ssid) — entering the
  * connected network gives Disconnect / Forget. "Networks" lists only AVAILABLE
