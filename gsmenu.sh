@@ -258,12 +258,33 @@ case "$@" in
         echo 0
         ;;
 
+    "get air waybeam image_ev")
+        echo 0
+        emit_values "-1\n-0.7\n-0.3\n0\n+0.3\n+0.7\n+1"   # integrator: /api/v1/iq exposure.auto.compensation vs. its tuned baseline
+        ;;
+    "get air waybeam image_saturation")
+        echo auto
+        emit_values "auto\n0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10"   # integrator: saturation op_type / manual.saturation
+        ;;
+    "get air waybeam image_sharpness")
+        echo auto
+        emit_values "auto\n0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10"   # integrator: sharpen op_type / scaled manual curves
+        ;;
+    "get air waybeam image_contrast")
+        echo auto
+        emit_values "auto\n0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10"   # integrator: csc.contr (auto = 50)
+        ;;
+
     "set air waybeam sensor_mode"*)      : ;;
     "set air waybeam isp_binfile"*)      : ;;
     "set air waybeam image_rotate180"*)  : ;;
     "set air waybeam video_size"*)       : ;;
     "set air waybeam video_resilience"*) : ;;
     "set air waybeam audio_enabled"*)    : ;;
+    "set air waybeam image_ev"*)         : ;;
+    "set air waybeam image_saturation"*) : ;;
+    "set air waybeam image_sharpness"*)  : ;;
+    "set air waybeam image_contrast"*)   : ;;
 
 # ── Air: Telemetry ───────────────────────────────────────────────────────────
 

@@ -406,8 +406,16 @@ static const colmenu_item_t wb_image_items[] = {
      * mirror only ever get set together (flip+mirror == a 180deg rotation), so
      * this is one switch, not two independent ones. */
     { .kind=COLMENU_SWITCH, .label="Rotate 180°", .param="image_rotate180" },
+    /* Live ISP tuning via waybeam's /api/v1/iq/set -- NOT persisted: the sensor
+     * tuning file's values come back whenever waybeam restarts or the air unit
+     * reboots. EV steps are relative to the tuning file's own AE target;
+     * saturation/sharpness/contrast are 0-10 or auto (see gsmenu.sh). */
+    { .kind=COLMENU_DROPDOWN, .label="EV",         .param="image_ev" },
+    { .kind=COLMENU_DROPDOWN, .label="Saturation", .param="image_saturation" },
+    { .kind=COLMENU_DROPDOWN, .label="Sharpness",  .param="image_sharpness" },
+    { .kind=COLMENU_DROPDOWN, .label="Contrast",   .param="image_contrast" },
 };
-static const colmenu_page_t wb_image_page = { "Image", "air", "waybeam", wb_image_items, 1 };
+static const colmenu_page_t wb_image_page = { "Image", "air", "waybeam", wb_image_items, 5 };
 static const colmenu_item_t wb_video_items[] = {
     { .kind=COLMENU_DROPDOWN, .label="Size",       .param="video_size" },
     /* No manual bitrate control -- waybeam's rate control is fully adaptive
