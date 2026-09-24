@@ -395,29 +395,29 @@ case "$@" in
 
 # ── Air: Artosyn ─────────────────────────────────────────────────────────────
 # ar8030-lifecycled's HTTP control API on the air unit ($REMOTE_IP:8899).
-# Bandwidth is lifecycled-persisted (POST /api/v1/bandwidth?mhz=..., survives
-# reconnects); power_mode and channel are live ar8030-linkctl reads/writes
-# via POST /api/v1/linkctl?cmd=<c>&args=<...>. channel's current value/range
-# come from BB_GET_CHAN_INFO (chan_num/work_chan, parsed out of the same
-# ar8030-linkctl status text /api/v1/status already embeds); setting it is
-# `linkctl channel <idx> -s auto -w 5`, a real synchronized retune that also
-# pushes to the connected peer, only effective while linked.
+# All three are lifecycled-persisted:
+#   bandwidth  GET /api/v1/status .bandwidth_mhz, POST /api/v1/bandwidth?mhz=N
+#   power      GET /api/v1/power (.power, .power_levels -- the air side's own
+#              levels), POST /api/v1/power?level=<mW|auto>; shown as "N mW"
+#   channel    owned by the air unit: GET /api/v1/channel (.channel,
+#              .table_mhz), POST /api/v1/channel?chan=<index|auto>; shown as
+#              "auto" or "<index> (<MHz> MHz)", set takes the first word
 
     "get air artosyn bandwidth")
         echo 20
         emit_values "1\n2\n5\n10\n20\n40"           # integrator: GET /api/v1/status's bandwidth_mhz
         ;;
-    "get air artosyn power_mode")
-        echo auto
-        emit_values "auto\nmanual"                  # integrator: POST /api/v1/linkctl?cmd=power-mode&args=
+    "get air artosyn power")
+        echo "400 mW"
+        emit_values "400 mW\n200 mW\n100 mW\n25 mW"  # integrator: GET /api/v1/power's power/power_levels
         ;;
     "get air artosyn channel")
-        echo 0
-        emit_values "0 41"                          # integrator: parse work_chan=/chan_num= from linkctl status
+        echo "25 (5805 MHz)"
+        emit_values "auto\n24 (5770 MHz)\n25 (5805 MHz)\n26 (5878 MHz)"  # integrator: GET /api/v1/channel's channel/table_mhz
         ;;
 
     "set air artosyn bandwidth"*)   : ;;
-    "set air artosyn power_mode"*)  : ;;
+    "set air artosyn power"*)       : ;;
     "set air artosyn channel"*)     : ;;
 
 # ── GS: WFB-NG ──────────────────────────────────────────────────────────────
@@ -448,24 +448,19 @@ case "$@" in
 # (http://127.0.0.1:8899, always reachable regardless of link state).
 
     "get gs artosyn status")
-        echo "not configured"       # integrator: GET /api/v1/status (role/state/bandwidth_mhz/paired)
+        echo "not configured"       # integrator: GET /api/v1/status (role/state/bandwidth_mhz/power/paired)
         ;;
     "get gs artosyn bandwidth")
         echo 20
         emit_values "1\n2\n5\n10\n20\n40"
         ;;
-    "get gs artosyn power_mode")
-        echo auto
-        emit_values "auto\nmanual"
-        ;;
-    "get gs artosyn channel")
-        echo 0
-        emit_values "0 41"
+    "get gs artosyn power")
+        echo "500 mW"
+        emit_values "auto\n500 mW\n200 mW\n100 mW\n25 mW"  # integrator: GET /api/v1/power (ground levels)
         ;;
 
     "set gs artosyn bandwidth"*)   : ;;
-    "set gs artosyn power_mode"*)  : ;;
-    "set gs artosyn channel"*)     : ;;
+    "set gs artosyn power"*)       : ;;
 
 # ── GS: System ──────────────────────────────────────────────────────────────
 

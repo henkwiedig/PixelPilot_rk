@@ -313,17 +313,15 @@ static const colmenu_item_t air_aalink_items[] = {
 static const colmenu_page_t air_aalink_page = { "AALink", "air", "aalink", air_aalink_items, 11 };
 
 static const colmenu_item_t air_artosyn_items[] = {
-    /* Bandwidth is ar8030-lifecycled's own persisted setting (survives
-     * reconnects); Power Mode and Channel are live ar8030-linkctl reads/
-     * writes, not lifecycled-persisted. Channel's current value/range come
-     * from BB_GET_CHAN_INFO (0..chan_num-1, chan_num from the live device --
-     * a fixed range here would go stale if the channel table ever changes);
-     * setting it is a real synchronized retune (BB_SET_CHAN + BB_SET_REMOTE
-     * push to the connected peer, see ar8030-linkctl/main.c's cmd_channel),
-     * not a blind local change, but only takes effect while linked. */
-    { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Bandwidth",   .param="bandwidth" },
-    { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Power Mode", .param="power_mode" },
-    { .kind=COLMENU_SLIDER,   .icon=LV_SYMBOL_SETTINGS, .label="Channel",    .param="channel" },
+    /* All three are ar8030-lifecycled's own persisted settings (survive
+     * reboots). Channel is owned by the air unit (AP): "auto" or an entry of
+     * the chip's own channel table ("<index> (<MHz> MHz)", listed by
+     * gsmenu.sh from the live device, so it can't go stale); changing it
+     * retunes both ends together over the live link. Output Power offers
+     * this side's own levels (air: 400/200/100/25 mW). */
+    { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Bandwidth",    .param="bandwidth" },
+    { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Output Power", .param="power" },
+    { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Channel",      .param="channel" },
 };
 static const colmenu_page_t air_artosyn_page = { "Artosyn", "air", "artosyn", air_artosyn_items, 3 };
 
@@ -502,12 +500,13 @@ static const colmenu_page_t gs_wfbng_page = { "WFB-NG", "gs", "wfbng", gs_wfbng_
  * radio's own state, queryable/settable whether or not the air unit is
  * currently linked. */
 static const colmenu_item_t gs_artosyn_items[] = {
-    { .kind=COLMENU_VALUE,    .icon=LV_SYMBOL_WIFI,     .label="Status",     .param="status" },
-    { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Bandwidth",  .param="bandwidth" },
-    { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Power Mode", .param="power_mode" },
-    { .kind=COLMENU_SLIDER,   .icon=LV_SYMBOL_SETTINGS, .label="Channel",    .param="channel" },
+    /* No channel here: the air unit owns it (air_artosyn_page). Output
+     * Power offers the ground's own levels (auto/500/200/100/25 mW). */
+    { .kind=COLMENU_VALUE,    .icon=LV_SYMBOL_WIFI,     .label="Status",       .param="status" },
+    { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Bandwidth",    .param="bandwidth" },
+    { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Output Power", .param="power" },
 };
-static const colmenu_page_t gs_artosyn_page = { "Artosyn", "gs", "artosyn", gs_artosyn_items, 4 };
+static const colmenu_page_t gs_artosyn_page = { "Artosyn", "gs", "artosyn", gs_artosyn_items, 3 };
 
 /* System → Receiver / Display / DVR */
 static const colmenu_item_t sys_receiver_items[] = {
