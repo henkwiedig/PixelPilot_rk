@@ -20,6 +20,10 @@ public:
     // Adds power supply sensor (currently supported is ina226 via ina2xx kernel driver)
     void addPower(const std::string &sensor_type, const std::string &hwmon_id);
     std::size_t discoverPower();
+    // Adds a supply voltage sensor on a Linux IIO ADC channel behind a divider:
+    // published mV = raw * in_voltage_scale * multiplier + offset_mv
+    void addIioVoltage(const std::string &raw_path, int multiplier, int offset_mv,
+                       const std::string &name);
     // Adds temperature sensor
     void addTemperature(const std::string &thermal_zone);
     std::size_t discoverTemperature();

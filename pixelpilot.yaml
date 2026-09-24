@@ -60,8 +60,15 @@ os_sensors:
   power:
     # Monitor power supply voltage and current (advanced: requires INA226 sensor to be installed)
     # It can be several, but normally you just install one to monitor battery
-    - type: ina226  # currently the only type supported
+    - type: ina226  # INA226 via the ina2xx kernel driver: voltage, current and power
       hwmon_id: hwmon3  # /sys/class/hwmon/{hwmon_id}/name should be ina226
+    # Or supply voltage only, from a SoC ADC channel behind a resistor divider
+    # (published mV = raw * in_voltage_scale * multiplier + offset_mv), e.g. Caddx VRX Pro:
+    # - type: iio
+    #   path: /sys/bus/iio/devices/iio:device0/in_voltage5_raw
+    #   multiplier: 16
+    #   offset_mv: -300
+    #   name: vrx  # `sensor` tag, default: the file name
   temperature:
     # Monitor Radxa chip temperatures, see /sys/class/thermal/thermal_zone*/
     - thermal_zone: thermal_zone0  # CPU on Radxa
