@@ -491,10 +491,13 @@ void *__DISPLAY_THREAD__(void *param)
 		if(enable_osd) {
 			ret = pthread_mutex_lock(&osd_mutex);
 			assert(!ret);
-			if (enable_live_colortrans)
-				ret = set_drm_object_property(output_list->video_request, &output_list->osd_plane, "FB_ID", output_list->osd_bufs[output_list->osd_buf_switch].gl_fb_id);
-			else 
-				ret = set_drm_object_property(output_list->video_request, &output_list->osd_plane, "FB_ID", output_list->osd_bufs[output_list->osd_buf_switch].fb);
+			// gl_fb_id is 0 until the OSD GL pass has run on this buffer, and
+			// always 0 without a GPU (OSD GL init failed): FB_ID=0 on an
+			// enabled plane makes every commit fail with EINVAL, so show the
+			// untransformed OSD instead.
+			struct modeset_buf *osd_buf = &output_list->osd_bufs[output_list->osd_buf_switch];
+			uint32_t osd_fb = (enable_live_colortrans && osd_buf->gl_fb_id) ? osd_buf->gl_fb_id : osd_buf->fb;
+			ret = set_drm_object_property(output_list->video_request, &output_list->osd_plane, "FB_ID", osd_fb);
 			assert(ret>0);
 		}
 		int commit_ret = drmModeAtomicCommit(drm_fd, output_list->video_request, flags, NULL);
