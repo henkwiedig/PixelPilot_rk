@@ -33,7 +33,7 @@ typedef struct {
     bool   has_snr;   /* snr_db is null when the chip doesn't report it (e.g. the air's peer) */
     long   ldpc_err;
     long   gain_a, gain_b;
-    long   tx_mcs, tx_power, tx_freq_khz;
+    long   tx_mcs, tx_chan, tx_power, tx_freq_khz;
 } link_side_t;
 
 typedef struct {
@@ -41,6 +41,8 @@ typedef struct {
     bool        is_dev;    /* lifecycled's role: ground = dev, so self = ground */
     bool        has_quality;
     long        signal_level;
+    bool        has_distance;
+    long        distance_m;  /* link distance, metres (BB_GET_DISTC_RESULT) */
     link_side_t self, peer;
 } link_info_t;
 
@@ -79,6 +81,7 @@ static bool parse_side(const char *buf, const char *key, link_side_t *s)
     s->has_snr = get_num(obj, end, "snr_db", &s->snr_db);
     if (get_num(obj, end, "ldpc_err", &v))    s->ldpc_err = (long)v;
     if (get_num(obj, end, "tx_mcs", &v))      s->tx_mcs = (long)v;
+    if (get_num(obj, end, "tx_chan", &v))     s->tx_chan = (long)v;
     if (get_num(obj, end, "tx_power", &v))    s->tx_power = (long)v;
     if (get_num(obj, end, "tx_freq_khz", &v)) s->tx_freq_khz = (long)v;
     const char *g = find_key(obj, end, "gain");
@@ -120,6 +123,11 @@ static bool poll_once(link_info_t *info)
                 ok              = true;
                 info->connected = strstr(buf, "\"state\":\"connected\"") != NULL;
                 info->is_dev    = strstr(buf, "\"role\":\"dev\"") != NULL;
+                double dist;
+                if (get_num(buf, NULL, "distance_m", &dist)) { /* null without a link */
+                    info->has_distance = true;
+                    info->distance_m   = (long)dist;
+                }
                 const char *q   = find_key(buf, NULL, "quality");
                 double      lvl;
                 if (q && *q == '{' && get_num(q, NULL, "signal_level", &lvl)) {
@@ -156,6 +164,7 @@ static void add_side_facts(void *batch, const link_side_t *s, const char *side)
         osd_add_int_fact(batch, "ar8030.rx.gain", tags, 2, s->gain_b);
     }
     osd_add_int_fact(batch, "ar8030.tx.mcs", tags, 1, s->tx_mcs);
+    osd_add_int_fact(batch, "ar8030.tx.chan", tags, 1, s->tx_chan);
     osd_add_int_fact(batch, "ar8030.tx.freq_mhz", tags, 1, s->tx_freq_khz / 1000);
     osd_add_int_fact(batch, "ar8030.tx.power", tags, 1, s->tx_power);
 }
@@ -166,6 +175,7 @@ static void add_side_facts(void *batch, const link_side_t *s, const char *side)
 static void publish_facts(const link_info_t *info)
 {
     static bool had_quality = false;
+    static bool had_distance = false;
     const char *self_side = info->is_dev ? "ground" : "air";
     const char *peer_side = info->is_dev ? "air" : "ground";
 
@@ -175,13 +185,21 @@ static void publish_facts(const link_info_t *info)
         add_side_facts(batch, &info->self, self_side);
         add_side_facts(batch, &info->peer, peer_side);
     }
+    if (info->has_distance) {
+        osd_add_int_fact(batch, "ar8030.distance_m", NULL, 0, info->distance_m);
+    }
     osd_publish_batch(batch);
 
     if (had_quality && !info->has_quality) {
         static const char *const prefixes[] = { "ar8030.rx.", "ar8030.tx." };
         osd_flush_facts(prefixes, 2);
     }
-    had_quality = info->has_quality;
+    if (had_distance && !info->has_distance) {
+        static const char *const prefixes[] = { "ar8030.distance_m" };
+        osd_flush_facts(prefixes, 1);
+    }
+    had_quality  = info->has_quality;
+    had_distance = info->has_distance;
 }
 #endif
 
