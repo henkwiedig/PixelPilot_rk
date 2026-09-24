@@ -2,6 +2,7 @@
 #define OS_MON_H
 
 #include <memory>
+#include <string>
 #include <vector>
 
 class ISensor {
@@ -24,6 +25,9 @@ public:
     // published mV = raw * in_voltage_scale * multiplier + offset_mv
     void addIioVoltage(const std::string &raw_path, int multiplier, int offset_mv,
                        const std::string &name);
+    // Adds a PWM fan's duty cycle (os_mon.fan.duty, %) -- the pwmchip is found by its platform
+    // device name, e.g. "fe6e0000.pwm"
+    void addPwmFan(const std::string &device, int channel, const std::string &name);
     // Adds temperature sensor
     void addTemperature(const std::string &thermal_zone);
     std::size_t discoverTemperature();
