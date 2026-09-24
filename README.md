@@ -255,10 +255,12 @@ over plain HTTP - no AR8030 library needed), which reads them from the chip's `B
 | `ar8030.rx.gain`       | int    | receiver AGC gain per antenna path - what the stock UI shows as "RSSI" |
 | `ar8030.rx.ldpc_err`   | int    | share of frames with LDPC decode errors, x10000                        |
 | `ar8030.tx.mcs`        | int    | TX MCS, raw chip value (the stock UI shows it minus 2)                 |
+| `ar8030.tx.chan`       | int    | TX channel, index into the chip's channel table                        |
 | `ar8030.tx.freq_mhz`   | int    | TX frequency, MHz                                                      |
 | `ar8030.tx.power`      | int    | TX power target, chip dBm                                              |
+| `ar8030.distance_m`    | int    | link distance, metres (the chip's ranging, as the stock UI's "%1m")    |
 
-All but `signal_level` are tagged `side` = `ground` or `air`; `rx.gain` additionally `path` =
+All but `signal_level` and `distance_m` are tagged `side` = `ground` or `air`; `rx.gain` additionally `path` =
 `a`/`b`. So `ar8030.rx.snr_db{side=ground}` is the video downlink as received on the goggles and
 `{side=air}` the uplink as received by the air unit (the stock UI's G-SNR / S-SNR), and
 `ar8030.tx.mcs{side=air}` is the video MCS. `signal_level` mirrors the stock UI's bars: from the

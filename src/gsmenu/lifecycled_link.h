@@ -11,7 +11,8 @@
  * A background thread polls every 500 ms while in Artosyn mode, started on
  * the first call; call it from the drone-detection timer only in Artosyn
  * mode, so other modes never start the thread. Each poll also publishes the
- * ar8030.* OSD facts (signal level, per-side SNR/gain/MCS -- see README).
+ * ar8030.* OSD facts (signal level, per-side SNR/gain/MCS, link distance --
+ * see README).
  * Returns true while lifecycled reports "state":"connected"; false while it
  * reports anything else, is unreachable or its last answer is older than
  * ~2 s. */
