@@ -349,6 +349,7 @@ When enabled, following facts become available:
 | `os_mon.power.voltage`   | double | Power supply voltage, mV                                        |
 | `os_mon.power.current`   | double | Current measurement, mA                                         |
 | `os_mon.power.power`     | double | Power (roughly `voltage * current`), uW (microwatt)             |
+| `os_mon.fan.duty`        | uint   | PWM fan duty cycle, % (0 while the PWM channel is disabled)     |
 
 * temperature facts are tagged with `name` and `sensor` of the sensor/chipset
 * power facts are tagged with `sensor` - ID of the sensor (`hwmonN`, see `/sys/class/hwmon/`,
@@ -402,6 +403,43 @@ on the same ADC is the button ladder (`adc_input.cpp`). To show it, e.g.:
 ```
 
 Filter by the `sensor` tag whenever more than one power sensor may publish.
+
+##### Fan speed from a PWM channel (`fan` sensor)
+
+A fan driven by a sysfs PWM channel can publish its duty cycle:
+
+```yaml
+os_sensors:
+  fan:
+    - type: pwm              # the only type so far
+      device: fe6e0000.pwm   # platform device of the pwmchip (robust against pwmchipN renumbering)
+      channel: 0             # pwmN under that chip (default 0)
+      name: vrx              # `sensor` tag of the fact (default: the device name)
+```
+
+Once a second it reads `period`, `duty_cycle` and `enable` of that channel and publishes
+`os_mon.fan.duty` (percent, 0 while disabled) tagged `sensor=<name>`. Nothing is published until
+the channel is exported — this only reads it; whatever drives the fan (on the Caddx VRX Pro the
+board's `gs-fan` loop, set from the menu under System → Fan) owns it.
+
+The VRX Pro's own layout shows it with the Material `mode_fan` icon on one row with the SoC and
+GPU temperature (`temperature` sensors `thermal_zone0`/`thermal_zone1`, filtered by their `name`
+tag `soc-thermal`/`gpu-thermal`, as `%.0f°C/%.0f°C` in a second widget at `x: -250`):
+
+```json
+{
+    "name": "Fan speed",
+    "type": "IconTplTextWidget",
+    "x": -100,
+    "y": 185,
+    "icon_path": "mode_fan.png",
+    "template": "%d%%",
+    "hide_when_undefined": true,
+    "facts": [
+        {"name": "os_mon.fan.duty", "tags": {"sensor": "vrx"}}
+    ]
+}
+```
 
 #### Widgets
 

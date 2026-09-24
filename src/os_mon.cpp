@@ -360,6 +360,73 @@ private:
 };
 
 /**
+ * PWM-driven fan: publishes the duty cycle of a sysfs PWM channel as `os_mon.fan.duty`
+ * (percent, 0-100, 0 while the channel is disabled) tagged `sensor=<name>`.
+ *
+ * The chip is found by its platform device (e.g. `fe6e0000.pwm`, the Caddx VRX Pro fan) rather
+ * than a pwmchipN number, which depends on probe order. Resolved on every run(): the channel
+ * only appears once whatever drives the fan (the VRX Pro's gs-fan) has exported it, and until
+ * then nothing is published.
+ */
+class PwmFanSensor : public ISensor {
+public:
+    PwmFanSensor(const std::string &device, int channel, const std::string &name)
+        : device(device), channel(channel), name(name) {}
+    virtual ~PwmFanSensor() = default;
+
+    void run() override {
+        std::filesystem::path pwm = find_channel();
+        if (pwm.empty()) {
+            return;
+        }
+        auto period = read_long(pwm / "period");
+        auto duty = read_long(pwm / "duty_cycle");
+        auto enable = read_long(pwm / "enable");
+        if (!period || !duty || !enable || *period <= 0) {
+            return;
+        }
+        long pct = *enable ? std::lround(100.0 * *duty / *period) : 0;
+
+        osd_tag tags[1];
+        strcpy(tags[0].key, "sensor");
+        strncpy(tags[0].val, name.c_str(), sizeof(tags[0].val) - 1);
+        tags[0].val[sizeof(tags[0].val) - 1] = '\0';
+        osd_publish_int_fact("os_mon.fan.duty", tags, 1, pct);
+    }
+
+    bool is_valid() override {
+        return true; // the channel may be exported later, see run()
+    }
+
+private:
+    std::string device;
+    int channel;
+    std::string name;
+
+    std::filesystem::path find_channel() const {
+        std::error_code ec;
+        for (const auto &chip : std::filesystem::directory_iterator("/sys/class/pwm", ec)) {
+            auto dev = std::filesystem::canonical(chip.path() / "device", ec);
+            if (ec || dev.filename() != device) {
+                continue;
+            }
+            auto pwm = chip.path() / ("pwm" + std::to_string(channel));
+            return std::filesystem::exists(pwm / "duty_cycle") ? pwm : std::filesystem::path();
+        }
+        return {};
+    }
+
+    static std::optional<long> read_long(const std::filesystem::path &path) {
+        std::ifstream file(path);
+        long value;
+        if (file >> value) {
+            return value;
+        }
+        return std::nullopt;
+    }
+};
+
+/**
  * @brief Represents a temperature sensor interface for reading temperature data from SysFS.
  * 
  * The TemperatureSensor class provides methods to initialize the sensor using the 
@@ -480,6 +547,10 @@ std::size_t OsSensors::discoverPower() {
 	std::size_t before = sensors.size();
 	PowerSensor::detect(sensors);
 	return sensors.size() - before;
+}
+
+void OsSensors::addPwmFan(const std::string &device, int channel, const std::string &name) {
+    sensors.push_back(std::make_shared<PwmFanSensor>(device, channel, name));
 }
 
 void OsSensors::addTemperature(const std::string &thermal_zone) {

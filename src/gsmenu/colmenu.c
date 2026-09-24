@@ -456,6 +456,19 @@ static int option_index(const char * options, const char * value)
 
 static void build_page(colstack_t * cs, lv_obj_t * body, const colmenu_page_t * pg);
 
+/* Whether a row is shown: the current RX mode must match its mode_mask and
+ * its available() hook (hardware present, ...) must not say no. */
+static bool item_shown(const colmenu_item_t * it)
+{
+    if(it->mode_mask) {
+        int mode_bit = (RXMODE == APFPV)   ? COLMENU_MODE_APFPV
+                      : (RXMODE == ARTOSYN) ? COLMENU_MODE_ARTOSYN
+                      :                       COLMENU_MODE_WFB;
+        if(!(it->mode_mask & mode_bit)) return false;
+    }
+    return !it->available || it->available();
+}
+
 /* A page is worth a loading spinner if entering it hits the backend: dynamic
  * pages (may scan/list) or any item that reads a value via gsmenu.sh. Pages made
  * only of labels/submenus/actions build instantly, so skip the spinner+thread. */
@@ -526,7 +539,7 @@ static void * page_load_thread(void * arg)
     g_prefetching = true;   /* colmenu_get records get failures instead of showing */
     for(int i = 0; i < pg->count; i++) {
         const colmenu_item_t * it = &pg->items[i];
-        if(!item_reads_value(it->kind) || !it->param) continue;
+        if(!item_reads_value(it->kind) || !it->param || !item_shown(it)) continue;
         if(__atomic_load_n(&pl->cancel, __ATOMIC_ACQUIRE)) break;   /* user cancelled */
         /* publish what's loading before the (slow) read so the poll can show it */
         __atomic_store_n(&pl->prog_label, it->label ? it->label : it->param, __ATOMIC_RELEASE);
@@ -733,7 +746,7 @@ static void submenu_builder(colstack_t * cs, lv_obj_t * body, void * user)
 
     int total = 0;
     for(int i = 0; i < pg->count; i++)
-        if(item_reads_value(pg->items[i].kind) && pg->items[i].param) total++;
+        if(item_reads_value(pg->items[i].kind) && pg->items[i].param && item_shown(&pg->items[i])) total++;
     if(total == 0) { build_page(cs, body, pg); return; }
 
     page_load_t * pl = calloc(1, sizeof(*pl));
@@ -984,13 +997,8 @@ static void build_page(colstack_t * cs, lv_obj_t * body, const colmenu_page_t * 
     for(int i = 0; i < pg->count; i++) {
         const colmenu_item_t * it = &pg->items[i];
 
-        /* Skip items that don't match the current RX mode. */
-        if(it->mode_mask) {
-            int mode_bit = (RXMODE == APFPV)   ? COLMENU_MODE_APFPV
-                          : (RXMODE == ARTOSYN) ? COLMENU_MODE_ARTOSYN
-                          :                       COLMENU_MODE_WFB;
-            if(!(it->mode_mask & mode_bit)) continue;
-        }
+        /* Skip items that don't match the current RX mode or hardware. */
+        if(!item_shown(it)) continue;
 
         switch(it->kind) {
         case COLMENU_LABEL:

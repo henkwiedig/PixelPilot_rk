@@ -1755,6 +1755,19 @@ int main(int argc, char **argv)
 					}
 				}
 			}
+			if (config["os_sensors"]["fan"]) {
+				for (const auto& fan : config["os_sensors"]["fan"]) {
+					std::string type = fan["type"] ? fan["type"].as<std::string>() : "pwm";
+					if (type != "pwm" || !fan["device"]) {
+						spdlog::error("os_sensors.fan: only `type: pwm` with a `device` is supported");
+						continue;
+					}
+					std::string device = fan["device"].as<std::string>();
+					os_sensors.addPwmFan(device,
+					                     fan["channel"] ? fan["channel"].as<int>() : 0,
+					                     fan["name"] ? fan["name"].as<std::string>() : device);
+				}
+			}
 			if (config["os_sensors"]["temperature"]) {
 				auto temperature = config["os_sensors"]["temperature"];
 				if(temperature.IsScalar() && temperature.as<std::string>() == "auto") {
