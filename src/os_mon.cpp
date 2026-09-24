@@ -5,6 +5,10 @@
 #include <string>
 #include <optional>
 #include <filesystem>
+#include <deque>
+#include <numeric>
+#include <cmath>
+#include <cstring>
 
 #include "spdlog/spdlog.h"
 
@@ -281,6 +285,81 @@ protected:
 };
 
 /**
+ * @brief Supply voltage from a Linux IIO ADC channel behind a resistor divider.
+ *
+ * For boards without an INA226 that measure their input voltage on a SoC ADC -- e.g. the Caddx
+ * VRX Pro, whose stock ar_ldy_gnd reads SARADC channel 5
+ * (/sys/bus/iio/devices/iio:device0/in_voltage5_raw) and shows `mV * 16 - 300` as "G-Volt".
+ *
+ * Every run() reads `raw` and the sibling `in_voltage_scale` (mV per LSB, IIO ABI), averages the
+ * last 10 samples like stock does, applies `mv * multiplier + offset_mv` (clamped at 0) and
+ * publishes it as `os_mon.power.voltage` in mV tagged `sensor=<name>` -- the same fact the INA226
+ * sensor publishes, so existing OSD widgets show it. No current/power: a divider can't tell.
+ */
+class IioVoltageSensor : public ISensor {
+public:
+    explicit IioVoltageSensor(const std::string &raw_path, int multiplier, int offset_mv,
+                              const std::string &name)
+        : raw_path(raw_path), multiplier(multiplier), offset_mv(offset_mv), name(name) {
+        scale_path = this->raw_path.parent_path() / "in_voltage_scale";
+        is_valid_sensor = std::filesystem::exists(this->raw_path) &&
+                          std::filesystem::exists(scale_path);
+        if (!is_valid_sensor) {
+            spdlog::error("IIO voltage sensor {}: {} or {} missing! Sensor is disabled.", name,
+                          this->raw_path.string(), scale_path.string());
+        }
+    }
+    virtual ~IioVoltageSensor() = default;
+
+    void run() override {
+        if (!is_valid_sensor) {
+            return;
+        }
+        auto raw = read_double(raw_path);
+        auto scale = read_double(scale_path);
+        if (!raw.has_value() || !scale.has_value()) {
+            return;
+        }
+        window.push_back(*raw * *scale);
+        if (window.size() > WINDOW) {
+            window.pop_front();
+        }
+        double avg_mv = std::accumulate(window.begin(), window.end(), 0.0) / window.size();
+        long mv = std::lround(avg_mv * multiplier + offset_mv);
+
+        osd_tag tags[1];
+        strcpy(tags[0].key, "sensor");
+        strncpy(tags[0].val, name.c_str(), sizeof(tags[0].val) - 1);
+        tags[0].val[sizeof(tags[0].val) - 1] = '\0';
+        osd_publish_int_fact("os_mon.power.voltage", tags, 1, mv > 0 ? mv : 0);
+    }
+
+    bool is_valid() override {
+      return is_valid_sensor;
+    }
+
+private:
+    static constexpr std::size_t WINDOW = 10;
+    std::filesystem::path raw_path;
+    std::filesystem::path scale_path;
+    int multiplier;
+    int offset_mv;
+    std::string name;
+    bool is_valid_sensor;
+    std::deque<double> window;
+
+    static std::optional<double> read_double(const std::filesystem::path &path) {
+        std::ifstream file(path);
+        double value;
+        if (file >> value) {
+            return value;
+        }
+        spdlog::error("Unable to read IIO value from {}", path.string());
+        return std::nullopt;
+    }
+};
+
+/**
  * @brief Represents a temperature sensor interface for reading temperature data from SysFS.
  * 
  * The TemperatureSensor class provides methods to initialize the sensor using the 
@@ -390,6 +469,11 @@ std::size_t OsSensors::discoverCPU() {
 
 void OsSensors::addPower(const std::string &sensor_name, const std::string &hwmon_id) {
     sensors.push_back(std::make_shared<PowerSensor>(sensor_name, hwmon_id));
+}
+
+void OsSensors::addIioVoltage(const std::string &raw_path, int multiplier, int offset_mv,
+                               const std::string &name) {
+    sensors.push_back(std::make_shared<IioVoltageSensor>(raw_path, multiplier, offset_mv, name));
 }
 
 std::size_t OsSensors::discoverPower() {

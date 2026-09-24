@@ -326,11 +326,57 @@ When enabled, following facts become available:
 | `os_mon.power.power`     | double | Power (roughly `voltage * current`), uW (microwatt)             |
 
 * temperature facts are tagged with `name` and `sensor` of the sensor/chipset
-* power facts are tagged with `sensor` - ID of the sensor (`hwmonN`, see `/sys/class/hwmon/`)
+* power facts are tagged with `sensor` - ID of the sensor (`hwmonN`, see `/sys/class/hwmon/`,
+  or the `name` of an `iio` sensor, see below)
 
 See [os_monitor_demo_osd.json](os_monitor_demo_osd.json) for examples.
 
 NOTE: power sensor (ina226) should be installed and configured separately!
+
+##### Supply voltage from an ADC (`iio` power sensor)
+
+Boards without an INA226 often measure their input voltage on one of the SoC's own ADC channels
+behind a resistor divider. Such a channel can be added as a `power` sensor of type `iio`:
+
+```yaml
+os_sensors:
+  power:
+    - type: iio
+      path: /sys/bus/iio/devices/iio:device0/in_voltage5_raw
+      multiplier: 16     # resistor divider ratio (default 1)
+      offset_mv: -300    # added after scaling, e.g. a diode drop (default 0)
+      name: vrx          # `sensor` tag of the fact (default: the file name, `in_voltage5_raw`)
+```
+
+Once a second it reads `path` and the `in_voltage_scale` file next to it (mV per LSB, Linux IIO
+ABI), averages the last 10 samples and publishes
+
+```
+os_mon.power.voltage = raw * in_voltage_scale * multiplier + offset_mv    (mV, clamped at 0)
+```
+
+tagged `sensor=<name>`. Only `os_mon.power.voltage` is published — a divider can't measure current
+or power. A missing `path` or `in_voltage_scale` disables the sensor with an error in the log.
+
+Caddx VRX Pro: stock firmware reads the goggles' supply on SARADC channel 5 and shows
+`mV * 16 - 300` as "G-Volt" — exactly the example above (≈ 9.01 V on a 9 V bench supply). Channel 6
+on the same ADC is the button ladder (`adc_input.cpp`). To show it, e.g.:
+
+```json
+{
+    "name": "Goggle supply voltage",
+    "type": "IconTplTextWidget",
+    "x": -250,
+    "y": 125,
+    "icon_path": "head_mounted_device.png",
+    "template": "%.2fV",
+    "facts": [
+        {"name": "os_mon.power.voltage", "tags": {"sensor": "vrx"}, "convert": "x / 1000"}
+    ]
+}
+```
+
+Filter by the `sensor` tag whenever more than one power sensor may publish.
 
 #### Widgets
 

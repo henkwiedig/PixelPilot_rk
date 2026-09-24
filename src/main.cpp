@@ -59,6 +59,7 @@ extern "C" {
 #include "scheduling_helper.hpp"
 #include "time_util.h"
 #include "os_mon.hpp"
+#include <filesystem>
 #include "pixelpilot_config.h"
 #include <iostream>
 #include "WiFiMonitor.hpp"
@@ -1736,6 +1737,16 @@ int main(int argc, char **argv)
 				} else {
 					for (const auto& power_sensor : power) {
 						std::string type = power_sensor["type"].as<std::string>();
+						if (type == "iio") {
+							std::string path = power_sensor["path"].as<std::string>();
+							os_sensors.addIioVoltage(
+								path,
+								power_sensor["multiplier"] ? power_sensor["multiplier"].as<int>() : 1,
+								power_sensor["offset_mv"] ? power_sensor["offset_mv"].as<int>() : 0,
+								power_sensor["name"] ? power_sensor["name"].as<std::string>()
+													 : std::filesystem::path(path).filename().string());
+							continue;
+						}
 						std::string hwmon_id = power_sensor["hwmon_id"].as<std::string>();
 						os_sensors.addPower(type, hwmon_id);
 					}
