@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include "colmenu.h"
 #include "colmenu_pages.h"
+#include "datetime_dialog.h"
 #include "helper.h"       /* show_restart_notice(), find_first_focusable_obj() */
 #include "../menu.h"      /* MenuAction, screens */
 #include "../main.h"      /* sig_handler() — graceful shutdown / restart */
@@ -573,6 +574,23 @@ static const colmenu_item_t sys_fan_items[] = {
 };
 static const colmenu_page_t sys_fan_page = { "Fan", "gs", "system", sys_fan_items, 2 };
 
+/* System → Date & Time: every board has an RTC (rtc0: the VRX Pro's battery-
+ * backed HYM8563, the Radxa boards' RK817), so no availability gate. Region/City
+ * set /etc/localtime via gsmenu.sh; a Region change rebuilds the page so City
+ * lists that region's zones (and "Now" follows the new zone). */
+#ifndef USE_SIMULATOR
+static void on_datetime_done(bool changed) { if(changed) colmenu_rescan(); }
+static void open_datetime(void)            { datetime_dialog_open(on_datetime_done); }
+static void on_tz_change(const char * value) { (void)value; colmenu_rescan(); }
+static const colmenu_item_t sys_datetime_items[] = {
+    { .kind=COLMENU_VALUE,    .icon=LV_SYMBOL_BELL,     .label="Now",               .param="datetime" },
+    { .kind=COLMENU_ACTION,   .icon=LV_SYMBOL_EDIT,     .label="Set date & time",   .on_activate=open_datetime },
+    { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_GPS,      .label="Region",            .param="tz_region", .on_change=on_tz_change },
+    { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_GPS,      .label="City",              .param="tz_city",   .on_change=on_tz_change },
+};
+static const colmenu_page_t sys_datetime_page = { "Date & Time", "gs", "system", sys_datetime_items, 4 };
+#endif
+
 static const colmenu_item_t system_items[] = {
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_WIFI,  .label="Receiver", .sub=&sys_receiver_page },
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_AUDIO, .label="Audio",    .sub=&sys_audio_page },
@@ -580,8 +598,12 @@ static const colmenu_item_t system_items[] = {
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_VIDEO, .label="DVR",      .sub=&sys_dvr_page },
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_WIFI,  .label="Restream", .sub=&sys_restream_page },
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_REFRESH, .label="Fan",    .sub=&sys_fan_page, .available=gs_fan_available },
+#ifndef USE_SIMULATOR
+    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_BELL,  .label="Date & Time", .sub=&sys_datetime_page },
+#endif
 };
-static const colmenu_page_t system_page = { "System", "gs", "system", system_items, 6 };
+static const colmenu_page_t system_page = { "System", "gs", "system", system_items,
+                                            sizeof(system_items) / sizeof(system_items[0]) };
 
 /* WiFi. The WiFi page shows the live connection (get gs wifi ssid) — entering the
  * connected network gives Disconnect / Forget. "Networks" lists only AVAILABLE
