@@ -2027,6 +2027,22 @@ static GstPad* dvr_request_tee_pad(GstElement* tee) {
 #endif
 }
 
+// Switch the splitmuxsink's mp4mux to fragmented output so a recording that is
+// never finalized (crash, power loss) stays playable up to the last fragment
+// instead of lacking its moov entirely. With first-moov-then-finalise (1.20+) a
+// clean EOS still rewrites the file into a regular mp4; on 1.18 the property is
+// missing and the file simply stays fragmented (still playable). The muxer
+// instance is reused across size-splits, so setting it once covers all parts.
+static void dvr_set_fragmented_mux(GstElement* sms) {
+    GstElement* mux = nullptr;
+    g_object_get(sms, "muxer", &mux, NULL);
+    if (!mux) return;
+    g_object_set(mux, "fragment-duration", 1000u, NULL); // ms
+    if (g_object_class_find_property(G_OBJECT_GET_CLASS(mux), "fragment-mode"))
+        gst_util_set_object_arg(G_OBJECT(mux), "fragment-mode", "first-moov-then-finalise");
+    gst_object_unref(mux);
+}
+
 void GstRtpReceiver::set_dvr_config(int64_t max_size_bytes, std::function<std::string()> base_path_fn) {
     std::lock_guard<std::mutex> lk(m_dvr_cfg_mutex);
     m_dvr_max_size = max_size_bytes > 0 ? max_size_bytes : 0;
@@ -2135,6 +2151,7 @@ void GstRtpReceiver::dvr_add_record_bin() {
     GstElement* sms = gst_bin_get_by_name(GST_BIN(bin), "dvr_sms");
     if (sms) {
         g_object_set(sms, "async-handling", TRUE, NULL);
+        dvr_set_fragmented_mux(sms);
         g_object_set_data_full(G_OBJECT(sms), "dvr-base", g_strdup(base.c_str()), g_free);
         g_signal_connect(sms, "format-location", G_CALLBACK(&GstRtpReceiver::dvr_format_location), nullptr);
         gst_object_unref(sms);
@@ -2346,6 +2363,7 @@ void GstRtpReceiver::dvr_add_reenc_bin() {
     GstElement* sms = gst_bin_get_by_name(GST_BIN(bin), "dvr_reenc_sms");
     if (sms) {
         g_object_set(sms, "async-handling", TRUE, NULL);
+        dvr_set_fragmented_mux(sms);
         g_object_set_data_full(G_OBJECT(sms), "dvr-base", g_strdup(base.c_str()), g_free);
         g_signal_connect(sms, "format-location", G_CALLBACK(&GstRtpReceiver::dvr_format_location), nullptr);
         gst_object_unref(sms);
