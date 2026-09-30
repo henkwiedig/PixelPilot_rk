@@ -29,6 +29,8 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <sys/mman.h>
+#include <rga/im2d.h>
+#include <rga/rga.h>
 
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -124,6 +126,8 @@ static void frame_timing_store(uint64_t pts_us, const struct timing_sei_v1 &sei)
 	frame_timing_next = (frame_timing_next + 1) % kFrameTimingSlots;
 }
 
+static void publish_latency_facts(const FrameTiming &f, uint64_t scanout_us);
+
 static bool frame_timing_take(uint64_t pts_us, FrameTiming *out) {
 	std::lock_guard<std::mutex> lk(frame_timing_mutex);
 	for (FrameTiming &slot : frame_timing) {
@@ -147,6 +151,12 @@ static std::atomic<bool> mpp_reinit_pending{false};
 bool mavlink_dvr_on_arm = false;
 bool osd_custom_message = false;
 bool disable_vsync = false;
+// --front-buffer: the video plane scans out one fixed buffer and every
+// decoded frame is copied into it by RGA as soon as it leaves the decoder,
+// instead of being flipped to at the next vblank. Lowest latency (no wait
+// for the display at all), at the price of tearing where the raster happens
+// to be during the copy.
+bool front_buffer_mode = false;
 bool disable_gregidr = false;
 uint32_t refresh_frequency_ms = 1000;
 
@@ -199,6 +209,91 @@ bool enable_live_colortrans = false;
 float live_colortrans_offset = -0.15f;
 float live_colortrans_gain = 2.5f;
 gamma_lut_controller lut_ctrl;
+
+// The one buffer the video plane scans out in --front-buffer mode. Same
+// kind of DRM dumb buffer as the decoder's own, so RGA copies between them
+// exactly as the DVR's copy path already does.
+static struct {
+	uint32_t handle;
+	int prime_fd = -1;
+	uint32_t fb_id;
+	uint32_t hor_stride, ver_stride;
+} front_buf;
+// Set by the frame thread after each copy, for the display thread's
+// no-video / video-resumed bookkeeping (guarded by video_mutex).
+static bool front_frame_ready = false;
+
+static void front_buffer_free() {
+	if (front_buf.fb_id) drmModeRmFB(drm_fd, front_buf.fb_id);
+	if (front_buf.prime_fd >= 0) close(front_buf.prime_fd);
+	if (front_buf.handle) {
+		struct drm_mode_destroy_dumb dmd = {};
+		dmd.handle = front_buf.handle;
+		ioctl(drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dmd);
+	}
+	front_buf.handle = 0;
+	front_buf.prime_fd = -1;
+	front_buf.fb_id = 0;
+}
+
+static bool front_buffer_alloc(uint32_t width, uint32_t height, uint32_t hor_stride, uint32_t ver_stride) {
+	front_buffer_free();
+	struct drm_mode_create_dumb dmcd = {};
+	dmcd.bpp = 8;
+	dmcd.width = hor_stride;
+	dmcd.height = ver_stride * 2; // as the decoder buffers: NV12 fits in w x 1.5h
+	if (ioctl(drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &dmcd)) return false;
+	front_buf.handle = dmcd.handle;
+
+	struct drm_prime_handle dph = {};
+	dph.handle = dmcd.handle;
+	dph.fd = -1;
+	if (ioctl(drm_fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &dph)) { front_buffer_free(); return false; }
+	front_buf.prime_fd = dph.fd;
+
+	// Black until the first frame lands, rather than whatever the memory held.
+	struct drm_mode_map_dumb dmmd = {};
+	dmmd.handle = dmcd.handle;
+	if (!ioctl(drm_fd, DRM_IOCTL_MODE_MAP_DUMB, &dmmd)) {
+		void *map = mmap(NULL, dmcd.size, PROT_WRITE, MAP_SHARED, drm_fd, dmmd.offset);
+		if (map != MAP_FAILED) {
+			memset(map, 16, (size_t)hor_stride * ver_stride);                        // Y
+			memset((uint8_t *)map + (size_t)hor_stride * ver_stride, 128, (size_t)hor_stride * ver_stride / 2); // UV
+			munmap(map, dmcd.size);
+		}
+	}
+
+	uint32_t handles[4] = {dmcd.handle, dmcd.handle, 0, 0};
+	uint32_t pitches[4] = {hor_stride, hor_stride, 0, 0};
+	uint32_t offsets[4] = {0, hor_stride * ver_stride, 0, 0};
+	if (drmModeAddFB2(drm_fd, width, height, DRM_FORMAT_NV12, handles, pitches, offsets, &front_buf.fb_id, 0)) {
+		front_buffer_free();
+		return false;
+	}
+	front_buf.hor_stride = hor_stride;
+	front_buf.ver_stride = ver_stride;
+	return true;
+}
+
+// Copies a decoded frame into the scanned-out buffer. Returns the time the
+// copy finished -- from then on the frame is on the glass, wherever the
+// raster is -- or 0 on failure.
+static uint64_t front_buffer_show(int src_fd) {
+	rga_buffer_t src = wrapbuffer_fd_t(src_fd, output_list->video_frm_width, output_list->video_frm_height,
+	                                   decoded_hor_stride, decoded_ver_stride, RK_FORMAT_YCbCr_420_SP);
+	rga_buffer_t dst = wrapbuffer_fd_t(front_buf.prime_fd, output_list->video_frm_width,
+	                                   output_list->video_frm_height, front_buf.hor_stride,
+	                                   front_buf.ver_stride, RK_FORMAT_YCbCr_420_SP);
+	if (imcopy(src, dst) != IM_STATUS_SUCCESS) {
+		static uint64_t last_warn_ms = 0;
+		if (get_time_ms() - last_warn_ms > 1000) {
+			last_warn_ms = get_time_ms();
+			spdlog::warn("front buffer: RGA copy failed");
+		}
+		return 0;
+	}
+	return get_time_us();
+}
 
 void init_buffer(MppFrame frame) {
 	output_list->video_frm_width = mpp_frame_get_width(frame);
@@ -315,7 +410,19 @@ void init_buffer(MppFrame frame) {
 	ret = mpi.mpi->control(mpi.ctx, MPP_DEC_SET_EXT_BUF_GROUP, mpi.frm_grp);
 	ret = mpi.mpi->control(mpi.ctx, MPP_DEC_SET_INFO_CHANGE_READY, NULL);
 
-	ret = modeset_perform_modeset(drm_fd, output_list, output_list->video_request, &output_list->video_plane, mpi.frame_to_drm[0].fb_id, output_list->video_frm_width, output_list->video_frm_height, video_zpos);
+	uint32_t first_fb = mpi.frame_to_drm[0].fb_id;
+	if (front_buffer_mode) {
+		if (fmt != MPP_FMT_YUV420SP) {
+			spdlog::warn("front buffer: 10-bit video is not supported, falling back to page flips");
+			front_buffer_mode = false;
+		} else if (!front_buffer_alloc(output_list->video_frm_width, output_list->video_frm_height, hor_stride, ver_stride)) {
+			spdlog::warn("front buffer: allocation failed, falling back to page flips");
+			front_buffer_mode = false;
+		} else {
+			first_fb = front_buf.fb_id;
+		}
+	}
+	ret = modeset_perform_modeset(drm_fd, output_list, output_list->video_request, &output_list->video_plane, first_fb, output_list->video_frm_width, output_list->video_frm_height, video_zpos);
 	assert(ret >= 0);
 
 	// Both recorders take their dimensions/codec straight from the parsed
@@ -425,6 +532,24 @@ void *__FRAME_THREAD__(void *param)
 
 					ts = ats;
 
+					if (front_buffer_mode) {
+						// Copy straight into the scanned-out buffer, before the
+						// decoder gets this buffer back (mpp_frame_deinit below).
+						uint64_t shown_us = front_buffer_show(info.fd);
+						if (shown_us) {
+							if (timing.pts_us) publish_latency_facts(timing, shown_us);
+							osd_publish_uint_fact("video.displayed_frame", NULL, 0, 1);
+							osd_publish_uint_fact("video.decode_and_handover_ms", NULL, 0,
+							                      (shown_us - feed_data_ts) / 1000);
+						}
+						ret = pthread_mutex_lock(&video_mutex);
+						assert(!ret);
+						front_frame_ready = true;
+						ret = pthread_cond_signal(&video_cond);
+						assert(!ret);
+						ret = pthread_mutex_unlock(&video_mutex);
+						assert(!ret);
+					} else {
 					// send DRM FB to display thread
 					ret = pthread_mutex_lock(&video_mutex);
 					assert(!ret);
@@ -436,6 +561,7 @@ void *__FRAME_THREAD__(void *param)
 					assert(!ret);
 					ret = pthread_mutex_unlock(&video_mutex);
 					assert(!ret);
+					}
 
 					if (frame_proc != nullptr &&
 					    decoded_hor_stride > 0 && decoded_ver_stride > 0) {
@@ -583,7 +709,7 @@ void *__DISPLAY_THREAD__(void *param)
 		
 		ret = pthread_mutex_lock(&video_mutex);
 		assert(!ret);
-		while (output_list->video_fb_id==0 && !osd_update_ready) {
+		while (output_list->video_fb_id==0 && !osd_update_ready && !front_frame_ready) {
 			pthread_cond_wait(&video_cond, &video_mutex);
 			assert(!ret);
 			if (output_list->video_fb_id == 0 && frm_eos) {
@@ -594,6 +720,8 @@ void *__DISPLAY_THREAD__(void *param)
 		}
 		fb_id = output_list->video_fb_id;
 		osd_update = osd_update_ready;
+		const bool front_frame = front_frame_ready;
+		front_frame_ready = false;
 		FrameTiming timing = timing_for_display;
 		timing_for_display.pts_us = 0;
 		if (fb_id == 0) timing.pts_us = 0;
@@ -623,6 +751,20 @@ void *__DISPLAY_THREAD__(void *param)
 				modeset_set_video_geometry(output_list, output_list->video_request, 0, video_zpos);
 				video_showing_black = false;
 				flags = DRM_MODE_ATOMIC_ALLOW_MODESET;
+			}
+		} else if (front_frame) {
+			// --front-buffer: the frame thread already put this frame on
+			// screen. The plane only needs touching when it comes back from
+			// the no-video backdrop; otherwise commit only if the OSD changed.
+			last_video_frame_ms = get_time_ms();
+			if (video_showing_black) {
+				ret = set_drm_object_property(output_list->video_request, &output_list->video_plane, "FB_ID", front_buf.fb_id);
+				assert(ret>0);
+				modeset_set_video_geometry(output_list, output_list->video_request, 0, video_zpos);
+				video_showing_black = false;
+				flags = DRM_MODE_ATOMIC_ALLOW_MODESET;
+			} else if (!osd_update) {
+				continue;
 			}
 		} else if (output_list->black_video_fb &&
 		           (get_time_ms() - last_video_frame_ms) > NO_VIDEO_BLACK_MS) {
@@ -685,9 +827,11 @@ void *__DISPLAY_THREAD__(void *param)
 			drain_flip_events((flags & DRM_MODE_ATOMIC_NONBLOCK) ? 0 : 50);
 		else
 			drain_flip_events(0);
-		osd_publish_uint_fact("video.displayed_frame", NULL, 0, 1);
-		uint64_t decode_and_handover_display_ms=(get_time_us()-decoding_pts)/1000;
-		osd_publish_uint_fact("video.decode_and_handover_ms", NULL, 0, decode_and_handover_display_ms);
+		if (!front_buffer_mode) { // the frame thread publishes these in --front-buffer mode
+			osd_publish_uint_fact("video.displayed_frame", NULL, 0, 1);
+			uint64_t decode_and_handover_display_ms=(get_time_us()-decoding_pts)/1000;
+			osd_publish_uint_fact("video.decode_and_handover_ms", NULL, 0, decode_and_handover_display_ms);
+		}
 	}
 end:	
 	spdlog::info("Display thread done.");
@@ -1480,6 +1624,9 @@ void printHelp() {
     "\n"
     "    --disable-vsync        - Disable VSYNC commits\n"
     "\n"
+    "    --front-buffer         - Scan out one fixed buffer and RGA-copy each decoded frame\n"
+    "                             into it: no wait for vblank, at the cost of tearing\n"
+    "\n"
     "    --disable-gregidr      - Disable last-hop probing and IDR requests\n"
     "\n"
     "    --live-colortrans      - Apply colortrans LUT to live display via DRM gamma\n"	
@@ -1743,6 +1890,11 @@ int main(int argc, char **argv)
 		continue;
 	}
 
+	__OnArgument("--front-buffer") {
+		front_buffer_mode = true;
+		continue;
+	}
+
 	__OnArgument("--disable-gregidr") {
 		disable_gregidr = true;
 		continue;
@@ -1972,6 +2124,7 @@ int main(int argc, char **argv)
 	}
 
 	spdlog::info("disable_vsync: {}", disable_vsync);
+	spdlog::info("front_buffer: {}", front_buffer_mode);
 
 	if (enable_osd == 0 ) {
 		video_zpos = 4;

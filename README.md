@@ -292,6 +292,11 @@ averaged rather than published per frame on purpose: a widget redrawn at the dis
 copies the whole OSD plane each time, and on the RK3568 that much memory traffic made the screen
 flicker black.
 
+With `--front-buffer` the video plane scans out one fixed buffer and each decoded frame is copied
+into it by RGA as soon as it leaves the decoder - no wait for vblank, at the cost of tearing. The
+"scan-out" point is then the end of that copy, so `display_ms` is the copy time (~4.5 ms for 1080p
+on the RK3568); on a 60 Hz output this took capture -> display from 66 to 51 ms median.
+
 There are many facts based on Mavlink telemetry, see `mavlink.c`. All of them have tags "sysid" and
 "compid", but some have extra tags.
 Currently implemented fact categories are grouped by Mavlink message types:
