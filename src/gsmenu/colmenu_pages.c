@@ -536,8 +536,11 @@ static const colmenu_item_t sys_display_items[] = {
     { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Resolution",     .param="resolution", .on_change=notify_restart },
     { .kind=COLMENU_SLIDER,   .icon=LV_SYMBOL_SETTINGS, .label="Video scale factor", .precision=2, .param="video_scale", .on_change=on_video_scale, .on_live=on_video_scale },
     { .kind=COLMENU_SWITCH,   .icon=LV_SYMBOL_SETTINGS, .label="Live Colortrans", .param="gs_live_colortrans", .on_change=on_live_colortrans },
+    /* --front-buffer: RGA copy into the scanned-out buffer, no vblank wait,
+     * may tear. The buffer is set up with the decoder, so it needs a restart. */
+    { .kind=COLMENU_SWITCH,   .icon=LV_SYMBOL_SETTINGS, .label="Front Buffer",   .param="gs_front_buffer", .on_change=notify_restart },
 };
-static const colmenu_page_t sys_display_page = { "Display", "gs", "system", sys_display_items, 5 };
+static const colmenu_page_t sys_display_page = { "Display", "gs", "system", sys_display_items, 6 };
 static const colmenu_item_t sys_dvr_items[] = {
     { .kind=COLMENU_SWITCH,   .label="Enabled",           .param="rec_enabled",          .on_change=on_rec_enabled },
     { .kind=COLMENU_DROPDOWN, .label="Mode",              .param="dvr_mode",             .on_change=on_dvr_mode },
