@@ -129,7 +129,9 @@ set(LIB_SOURCE_FILES
         src/WiFiMonitor.cpp
         src/scheduling_helper.hpp
         src/gstrtpreceiver.cpp
-        src/gstrtpreceiver.h)
+        src/gstrtpreceiver.h
+        src/timing_sei.h
+        src/timing_sei.c)
 set(SOURCE_FILES
   ${LIB_SOURCE_FILES}
   src/main.cpp

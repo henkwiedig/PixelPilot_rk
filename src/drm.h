@@ -80,7 +80,8 @@ struct modeset_output {
 	uint32_t black_video_handle;
 	uint32_t black_video_size;
 
-    // Used to calculate latency
+    // Used to calculate latency: when the frame's packet was fed to the
+    // decoder, CLOCK_MONOTONIC in microseconds (it is also the MPP pts)
     uint64_t decoding_pts;
 	int video_poc;
 
