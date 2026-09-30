@@ -20,6 +20,7 @@
 #include <atomic>
 #include <queue>
 #include <mutex>
+#include <poll.h>
 #include <condition_variable>
 
 #include <arpa/inet.h>
@@ -58,6 +59,7 @@ extern "C" {
 #include "gstrtpreceiver.h"
 #include "scheduling_helper.hpp"
 #include "time_util.h"
+#include "timing_sei.h"
 #include "os_mon.hpp"
 #include <filesystem>
 #include "pixelpilot_config.h"
@@ -96,6 +98,43 @@ struct modeset_output *output_list;
 int frm_eos = 0;
 int drm_fd = 0;
 pthread_mutex_t video_mutex;
+
+// Per-frame timing from ar8030-transport-rx's timing SEI (timing_sei.h).
+// The feed side files it under the packet's MPP pts; the frame thread picks
+// it up again by the decoded frame's pts and hands it to the display
+// thread with the frame (under video_mutex, as timing_for_display), which
+// attaches it to the page flip and publishes the latency facts from the
+// flip event's vblank timestamp.
+struct FrameTiming {
+	uint64_t pts_us;       // fed to the decoder (also the MPP pts)
+	uint64_t decoded_us;   // decode_get_frame() handed the frame out
+	struct timing_sei_v1 sei;
+};
+static const int kFrameTimingSlots = 32;   // well above any decoder queue depth
+static FrameTiming frame_timing[kFrameTimingSlots];
+static std::mutex frame_timing_mutex;
+static int frame_timing_next;
+static FrameTiming timing_for_display;     // guarded by video_mutex; pts_us 0 = none
+
+// Round robin: the oldest entry is overwritten, which only ever loses the
+// timing of a frame the decoder dropped anyway.
+static void frame_timing_store(uint64_t pts_us, const struct timing_sei_v1 &sei) {
+	std::lock_guard<std::mutex> lk(frame_timing_mutex);
+	frame_timing[frame_timing_next] = {pts_us, 0, sei};
+	frame_timing_next = (frame_timing_next + 1) % kFrameTimingSlots;
+}
+
+static bool frame_timing_take(uint64_t pts_us, FrameTiming *out) {
+	std::lock_guard<std::mutex> lk(frame_timing_mutex);
+	for (FrameTiming &slot : frame_timing) {
+		if (slot.pts_us == pts_us) {
+			*out = slot;
+			slot.pts_us = 0;
+			return true;
+		}
+	}
+	return false;
+}
 pthread_cond_t video_cond;
 extern bool osd_update_ready;
 extern bool gsmenu_enabled;
@@ -370,6 +409,11 @@ void *__FRAME_THREAD__(void *param)
 				if (buffer && !discard) {
 					output_list->video_poc = mpp_frame_get_poc(frame);
 					uint64_t feed_data_ts =  mpp_frame_get_pts(frame);
+					FrameTiming timing;
+					if (frame_timing_take(feed_data_ts, &timing))
+						timing.decoded_us = (uint64_t)ats.tv_sec * 1000000 + ats.tv_nsec / 1000;
+					else
+						timing.pts_us = 0;
 
 					MppBufferInfo info;
 					ret = mpp_buffer_info_get(buffer, &info);
@@ -387,6 +431,7 @@ void *__FRAME_THREAD__(void *param)
 					output_list->video_fb_id = mpi.frame_to_drm[i].fb_id;
                     //output_list->video_fb_index=i;
                     output_list->decoding_pts=feed_data_ts;
+					timing_for_display = timing;
 					ret = pthread_cond_signal(&video_cond);
 					assert(!ret);
 					ret = pthread_mutex_unlock(&video_mutex);
@@ -415,6 +460,108 @@ void *__FRAME_THREAD__(void *param)
 	return nullptr;
 }
 
+
+// A page flip carrying a frame with timing (see FrameTiming): the flip
+// event's vblank timestamp is when that frame starts being scanned out.
+struct FlipTiming {
+	bool in_use;
+	FrameTiming frame;
+};
+static const int kFlipTimingSlots = 8;
+static FlipTiming flip_timing[kFlipTimingSlots];
+static int flip_timing_next;
+
+// Per-frame latency, published as averages a few times a second. Every
+// widget showing one of these facts is redrawn when it changes, and the
+// OSD flush copies the whole 1920x1080 ARGB plane (8 MB): at the display's
+// frame rate that memory traffic starved scan-out and the screen flickered
+// black. Averages over LATENCY_PUBLISH_US are also what can be read on
+// screen; the worst frame is kept separately, over a whole second.
+static const uint64_t LATENCY_PUBLISH_US = 200000;
+
+enum LatencyField {
+	LAT_CAPTURE_TO_DISPLAY, LAT_AIR, LAT_GROUND, LAT_SYNC, LAT_PIPELINE, LAT_DECODE, LAT_DISPLAY,
+	LAT_ENCODE, LAT_LINK, LAT_FIELDS
+};
+static const char *const kLatencyFacts[LAT_FIELDS] = {
+	"video.latency.capture_to_display_ms", "video.latency.air_ms", "video.latency.ground_ms",
+	"video.latency.sync_uncertainty_ms", "video.latency.pipeline_ms", "video.latency.decode_ms",
+	"video.latency.display_ms", "video.latency.encode_ms", "video.latency.link_ms",
+};
+
+static void publish_latency_facts(const FrameTiming &f, uint64_t scanout_us) {
+	const struct timing_sei_v1 &t = f.sei;
+	const double capture_to_display_ms = ((double)scanout_us - (double)t.capture_ground_us) / 1000.0;
+	if (capture_to_display_ms < 0 || capture_to_display_ms > 5000)
+		return; // clock mapping not settled (or an air reboot mid-flight): no number beats a wrong one
+
+	double v[LAT_FIELDS];
+	v[LAT_CAPTURE_TO_DISPLAY] = capture_to_display_ms;
+	v[LAT_AIR] = ((double)t.rx_done_ground_us - (double)t.capture_ground_us) / 1000.0;
+	v[LAT_GROUND] = capture_to_display_ms - v[LAT_AIR];
+	v[LAT_SYNC] = t.sync_uncertainty_us / 1000.0;
+	// The ground segment split up. All on this machine's clock, so none of
+	// it carries the sync uncertainty: rx done -> fed to MPP (RTP +
+	// GStreamer), fed -> decoded frame out (hardware decode + MPP's own
+	// queueing), decoded -> scan-out (handover + waiting for the flip).
+	v[LAT_PIPELINE] = ((double)f.pts_us - (double)t.rx_done_ground_us) / 1000.0;
+	v[LAT_DECODE] = ((double)f.decoded_us - (double)f.pts_us) / 1000.0;
+	v[LAT_DISPLAY] = ((double)scanout_us - (double)f.decoded_us) / 1000.0;
+	const bool have_encode = t.flags & TIMING_SEI_FLAG_ENCODE;
+	v[LAT_ENCODE] = t.encode_us / 1000.0;
+	v[LAT_LINK] = v[LAT_AIR] - v[LAT_ENCODE];
+
+	static double sum[LAT_FIELDS];
+	static unsigned n = 0, n_encode = 0;
+	static uint64_t window_start_us = 0;
+	for (int i = 0; i < LAT_FIELDS; i++)
+		if (have_encode || (i != LAT_ENCODE && i != LAT_LINK)) sum[i] += v[i];
+	n++;
+	if (have_encode) n_encode++;
+
+	if (scanout_us - window_start_us >= LATENCY_PUBLISH_US) {
+		for (int i = 0; i < LAT_FIELDS; i++) {
+			const unsigned cnt = (i == LAT_ENCODE || i == LAT_LINK) ? n_encode : n;
+			if (cnt) osd_publish_double_fact(kLatencyFacts[i], NULL, 0, sum[i] / cnt);
+			sum[i] = 0;
+		}
+		osd_publish_uint_fact("video.frames_lost", NULL, 0, t.frames_lost);
+		n = n_encode = 0;
+		window_start_us = scanout_us;
+	}
+
+	// Worst frame of each second: a latency spike lasts a frame or two,
+	// which an average hides.
+	static double max_ms = 0;
+	static uint64_t max_start_us = 0;
+	if (capture_to_display_ms > max_ms) max_ms = capture_to_display_ms;
+	if (scanout_us - max_start_us >= 1000000) {
+		osd_publish_double_fact("video.latency.capture_to_display_max_ms", NULL, 0, max_ms);
+		max_ms = 0;
+		max_start_us = scanout_us;
+	}
+}
+
+static void on_page_flip(int fd, unsigned int sequence, unsigned int tv_sec, unsigned int tv_usec, void *user_data) {
+	(void)fd; (void)sequence;
+	FlipTiming *ft = (FlipTiming *)user_data;
+	if (!ft || !ft->in_use) return;
+	ft->in_use = false;
+	publish_latency_facts(ft->frame, (uint64_t)tv_sec * 1000000 + tv_usec);
+}
+
+// Reads whatever page-flip events have arrived, waiting up to timeout_ms
+// for the first one.
+static void drain_flip_events(int timeout_ms) {
+	struct pollfd pfd = {drm_fd, POLLIN, 0};
+	drmEventContext ev = {};
+	ev.version = 2;
+	ev.page_flip_handler = on_page_flip;
+	while (poll(&pfd, 1, timeout_ms) > 0 && (pfd.revents & POLLIN)) {
+		drmHandleEvent(drm_fd, &ev);
+		timeout_ms = 0;
+	}
+}
 
 void *__DISPLAY_THREAD__(void *param)
 {
@@ -447,8 +594,11 @@ void *__DISPLAY_THREAD__(void *param)
 		}
 		fb_id = output_list->video_fb_id;
 		osd_update = osd_update_ready;
+		FrameTiming timing = timing_for_display;
+		timing_for_display.pts_us = 0;
+		if (fb_id == 0) timing.pts_us = 0;
 
-        uint64_t decoding_pts=fb_id != 0 ? output_list->decoding_pts : get_time_ms();
+        uint64_t decoding_pts=fb_id != 0 ? output_list->decoding_pts : get_time_us();
 		output_list->video_fb_id=0;
 		osd_update_ready = false;
 		ret = pthread_mutex_unlock(&video_mutex);
@@ -500,7 +650,19 @@ void *__DISPLAY_THREAD__(void *param)
 			ret = set_drm_object_property(output_list->video_request, &output_list->osd_plane, "FB_ID", osd_fb);
 			assert(ret>0);
 		}
-		int commit_ret = drmModeAtomicCommit(drm_fd, output_list->video_request, flags, NULL);
+		// A frame with timing asks for the flip event, whose vblank timestamp
+		// is the moment it starts being scanned out. Only then: without the
+		// timing SEI nothing changes here.
+		FlipTiming *ft = NULL;
+		if (timing.pts_us) {
+			ft = &flip_timing[flip_timing_next];
+			flip_timing_next = (flip_timing_next + 1) % kFlipTimingSlots;
+			ft->in_use = true;
+			ft->frame = timing;
+			flags |= DRM_MODE_PAGE_FLIP_EVENT;
+		}
+		int commit_ret = drmModeAtomicCommit(drm_fd, output_list->video_request, flags, ft);
+		if (ft && commit_ret) ft->in_use = false;
 		ret = pthread_mutex_unlock(&osd_mutex);
 		assert(!ret);
 		if (commit_ret) {
@@ -516,8 +678,15 @@ void *__DISPLAY_THREAD__(void *param)
 				}
 			}
 		}
+		// A blocking commit has already flipped, so its event is waiting; a
+		// NONBLOCK one (--disable-vsync) must not be waited for here -- its
+		// event is picked up on a later pass, with its own timestamp.
+		if (ft && !commit_ret)
+			drain_flip_events((flags & DRM_MODE_ATOMIC_NONBLOCK) ? 0 : 50);
+		else
+			drain_flip_events(0);
 		osd_publish_uint_fact("video.displayed_frame", NULL, 0, 1);
-		uint64_t decode_and_handover_display_ms=get_time_ms()-decoding_pts;
+		uint64_t decode_and_handover_display_ms=(get_time_us()-decoding_pts)/1000;
 		osd_publish_uint_fact("video.decode_and_handover_ms", NULL, 0, decode_and_handover_display_ms);
 	}
 end:	
@@ -851,12 +1020,15 @@ extern "C" {
 }
 
 int decoder_stalled_count=0;
-bool feed_packet_to_decoder(MppPacket *packet,void* data_p,int data_len){
+// pts_us is when the packet is fed, CLOCK_MONOTONIC microseconds, and
+// unique per packet: it comes back out on the decoded frame, where it both
+// measures decode + handover and finds the frame's timing SEI again.
+bool feed_packet_to_decoder(MppPacket *packet,void* data_p,int data_len,uint64_t pts_us){
     mpp_packet_set_data(packet, data_p);
     mpp_packet_set_size(packet, data_len);
     mpp_packet_set_pos(packet, data_p);
     mpp_packet_set_length(packet, data_len);
-    mpp_packet_set_pts(packet,(RK_S64) get_time_ms());
+    mpp_packet_set_pts(packet,(RK_S64) pts_us);
     // Feed the data to mpp until either timeout (in which case the decoder might have stalled)
     // or success
     uint64_t data_feed_begin = get_time_ms();
@@ -1131,7 +1303,15 @@ void read_gstreamerpipe_stream(MppPacket *packet, int gst_udp_port, const char *
 		bytes_received += frame->size();
 		uint64_t now = get_time_ms();
 		osd_publish_uint_fact("gstreamer.received_bytes", NULL, 0, frame->size());
-        const bool fed_ok = feed_packet_to_decoder(packet,frame->data(),frame->size());
+        static uint64_t last_pts_us = 0;
+        uint64_t pts_us = get_time_us();
+        if (pts_us <= last_pts_us) pts_us = last_pts_us + 1;
+        last_pts_us = pts_us;
+        struct timing_sei_v1 sei;
+        if (timing_sei_parse(frame->data(), (uint32_t)frame->size(), &sei) &&
+            (sei.flags & TIMING_SEI_FLAG_SYNC_VALID))
+            frame_timing_store(pts_us, sei);
+        const bool fed_ok = feed_packet_to_decoder(packet,frame->data(),frame->size(),pts_us);
         if (!fed_ok) {
             stall_count++;
             if (stall_count >= 3 && (now - last_stall_idr_ms) > 500) {

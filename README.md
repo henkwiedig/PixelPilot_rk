@@ -269,6 +269,29 @@ The facts are only published in Artosyn mode; without a link only `signal_level`
 the per-side facts are dropped to undefined, so widgets hide (`IconSelectorWidget`) or show `?`
 (template widgets - use `"hide_when_undefined": true` to hide them too).
 
+With `ar8030-transport-rx` as the source, every access unit carries a timing SEI (capture time of
+the frame on this machine's clock, see `src/timing_sei.h`). PixelPilot follows each frame through
+the decoder to the page flip and publishes, as averages over 200 ms:
+
+| Fact                                        | Type   | Description                                                      |
+|:--------------------------------------------|:-------|:-----------------------------------------------------------------|
+| `video.latency.capture_to_display_ms`       | double | sensor capture to start of scan-out (flip event vblank)          |
+| `video.latency.capture_to_display_max_ms`   | double | worst single frame of the last second                            |
+| `video.latency.air_ms`                      | double | capture to frame reassembled on the ground                       |
+| `video.latency.encode_ms`                   | double | capture to encode done (from the waybeam sidecar)                |
+| `video.latency.link_ms`                     | double | `air_ms` minus `encode_ms`                                       |
+| `video.latency.ground_ms`                   | double | reassembled to scan-out                                          |
+| `video.latency.pipeline_ms`                 | double | reassembled to fed to the decoder (RTP, GStreamer)               |
+| `video.latency.decode_ms`                   | double | fed to the decoder to decoded frame out                          |
+| `video.latency.display_ms`                  | double | decoded frame out to scan-out                                    |
+| `video.latency.sync_uncertainty_ms`         | double | bound of the air/ground clock mapping (`air`/`ground` split only)|
+| `video.frames_lost`                         | uint   | frames that never reached the ground whole                       |
+
+`pipeline`, `decode` and `display` are measured on the goggle's own clock only. The facts are
+averaged rather than published per frame on purpose: a widget redrawn at the display frame rate
+copies the whole OSD plane each time, and on the RK3568 that much memory traffic made the screen
+flicker black.
+
 There are many facts based on Mavlink telemetry, see `mavlink.c`. All of them have tags "sysid" and
 "compid", but some have extra tags.
 Currently implemented fact categories are grouped by Mavlink message types:

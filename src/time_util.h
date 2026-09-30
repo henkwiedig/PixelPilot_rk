@@ -22,6 +22,18 @@ uint64_t get_time_ms() {
     return spec.tv_sec * 1000 + spec.tv_nsec / 1e6;
 }
 
+/**
+ * @return microseconds, CLOCK_MONOTONIC -- the clock DRM page-flip events
+ * and the ar8030 timing SEI (timing_sei.h) are stamped with
+ */
+uint64_t get_time_us() {
+    struct timespec spec;
+    if (clock_gettime(1, &spec) == -1) { /* 1 is CLOCK_MONOTONIC */
+        abort();
+    }
+    return (uint64_t)spec.tv_sec * 1000000 + (uint64_t)spec.tv_nsec / 1000;
+}
+
 void print_time_ms(const char* tag,uint64_t ms){
     printf("%s %dms\n",tag,(int)ms);
 }
