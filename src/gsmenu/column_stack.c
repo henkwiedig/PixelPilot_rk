@@ -347,6 +347,14 @@ static void item_key_cb(lv_event_t * e)
                     idx++;
                 }
                 free(opts);
+                /* No options (e.g. no ISP bin files on the air unit): say so, and
+                 * keep the column escapable — with nothing focusable in it the
+                 * group is empty and Back never reaches item_key_cb, which locks
+                 * the menu. */
+                if(idx == 0) {
+                    colstack_add_title(cs, body, "No options available");
+                    colstack_ensure_escapable(cs);
+                }
                 colstack_autofit(cs);
                 if(sel_row) {
                     lv_group_focus_obj(sel_row);            /* open on current value */
