@@ -687,15 +687,35 @@ public:
 		return last_count > 0 ? static_cast<double>(last_sum) / last_count : 0.0;
 	}
 
+	// Sum of the closed buckets starting in the last `last_ms`, divided by the
+	// time they cover: a closed bucket spans exactly [its start, the next
+	// bucket's start). Dividing the in-window sum by last_ms instead read up to
+	// one bucket low, a sawtooth (steady 100 fps showed 80..101 with 200 ms
+	// buckets). The newest bucket is still filling until bucket_size has
+	// passed, and covers up to now after that. With values sparser than the
+	// window, the newest closed bucket is used even if it starts before it.
 	double rate_per_second_over_last_ms(uint last_ms) const {
-		long min = std::numeric_limits<long>::max();
-		long max = std::numeric_limits<long>::min();
-		long last_sum;
-		int last_count;
-		calculate_stats_in_window(last_ms, last_sum, last_count, min, max);
+		if (buckets.empty() || last_ms == 0) return 0.0;
+		auto now = std::chrono::steady_clock::now();
+		long long current_time = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
 
-		double elapsed_seconds = static_cast<double>(last_ms) / 1000.0;
-		return elapsed_seconds > 0 ? static_cast<double>(last_sum) / elapsed_seconds : 0.0;
+		auto it = buckets.rbegin();
+		long long span_end = current_time;
+		if (current_time - it->timestamp < bucket_size) {
+			span_end = it->timestamp;
+			++it;
+		}
+		if (it == buckets.rend())  // nothing closed yet
+			return static_cast<double>(buckets.back().sum) * 1000.0 / last_ms;
+
+		long sum = 0;
+		long long span_start = span_end;
+		do {
+			sum += it->sum;
+			span_start = it->timestamp;
+			++it;
+		} while (it != buckets.rend() && current_time - it->timestamp <= last_ms);
+		return static_cast<double>(sum) * 1000.0 / std::max(span_end - span_start, 1LL);
 	}
 
 	void get_stats_over_last_ms(uint last_ms, long& min, long& max, double& average) const {
@@ -1515,7 +1535,7 @@ public:
 			// replace the value with its increment rate per-second
 			ulong num_frames = fact.getUintValue(); // should be always '1'
 			fps.add(num_frames);
-			args[idx] = Fact(FactMeta("video_fps"), (ulong)fps.rate_per_second_over_last_ms(1000));
+			args[idx] = Fact(FactMeta("video_fps"), (ulong)std::lround(fps.rate_per_second_over_last_ms(1000)));
 		} else {
 			args[idx] = fact;
 		}
