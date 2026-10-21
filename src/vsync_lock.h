@@ -29,6 +29,14 @@
 // the median frame, without capture timestamps). The target latency is the
 // median plus the 99th percentile of the deviations from it, over the last
 // ~10 s.
+//
+// The capture timestamps come mapped onto this clock by the receiver's
+// clock sync, and that mapping steps whenever the sync moves to another
+// probe: by a millisecond or so on the bench, more over the AR8030 in
+// flight, where the round trip swings. Every step would move all due times
+// at once (dropped or repeated frames) and kick the phase off by as much.
+// The camera ticks perfectly regularly, so the lock takes the steps out
+// (stable_capture()) and works on a step-free capture time.
 class VsyncLock {
 public:
 	// period_us: the display mode's nominal refresh period. guard_us: how
@@ -40,8 +48,10 @@ public:
 	void reset_from_signal();
 
 	// Frame thread: a decoded frame was handed to the display at t_us;
-	// capture_us is its capture time on this clock, 0 if unknown.
-	void frame_ready(uint64_t t_us, uint64_t capture_us);
+	// capture_us is its capture time on this clock, 0 if unknown. Returns
+	// the capture time with the clock mapping's steps taken out, for
+	// due_us() (0 if unknown).
+	uint64_t frame_ready(uint64_t t_us, uint64_t capture_us);
 	// Frame thread: the display never showed a frame (a newer one replaced it
 	// before its commit).
 	void frame_dropped();
@@ -57,8 +67,9 @@ public:
 	}
 	// A vblank was seen (page flip event or vblank wait).
 	void vblank(uint32_t seq, uint64_t t_us);
-	// A commit aimed at target_seq went out at landed_seq.
-	void commit_landed(uint32_t target_seq, uint32_t landed_seq);
+	// A commit aimed at target_seq went out at landed_seq. woke_us and
+	// commit_us: how long after the deadline the thread woke and committed.
+	void commit_landed(uint32_t target_seq, uint32_t landed_seq, uint64_t woke_us, uint64_t commit_us);
 	// Waits for the next vblank when there is nothing to commit, so the
 	// vblank timeline stays fresh. false: no vblank (CRTC off).
 	bool wait_vblank();
@@ -82,6 +93,7 @@ private:
 
 	void set_ppm(int ppm);
 	void update_margin();
+	uint64_t stable_capture(uint64_t capture_us, uint64_t t_us);
 	bool vblank_known() const { return last_vbl_us_ != 0; }
 
 	int drm_fd_ = -1;
@@ -105,6 +117,17 @@ private:
 	int sample_count_ = 0;
 	unsigned drops_ = 0;
 
+	// Clock mapping steps taken out of the capture times, under mutex_.
+	static const int kIntervals = 15;
+	uint64_t last_capture_us_ = 0;
+	double intervals_[kIntervals];  // the last capture intervals (ring)
+	int interval_next_ = 0;
+	int interval_count_ = 0;
+	int64_t capture_corr_us_ = 0;   // added to the mapped capture times
+	uint64_t last_step_us_ = 0;
+	unsigned steps_ = 0;
+	double largest_step_us_ = 0;
+
 	// Each frame's phase against its window's median (ring), for the margin.
 	double deviations_[kDeviations];
 	int deviation_next_ = 0;
@@ -113,6 +136,7 @@ private:
 	// Commit lead, adapted to missed commits.
 	unsigned lead_us_ = 2000;
 	uint64_t last_miss_us_ = 0;
+	uint64_t last_lead_step_us_ = 0;
 	uint64_t last_lead_relax_us_ = 0;
 	unsigned misses_ = 0;
 
@@ -136,6 +160,7 @@ private:
 	int lock_ticks_ = 0;
 	uint64_t last_tick_us_ = 0;
 	unsigned last_ratio_ = 0;
+	int summary_ticks_ = 0;  // ticks since the last logged summary
 };
 
 #endif

@@ -39,12 +39,22 @@ static const double kLockMs = 1.0, kUnlockMs = 3.0;
 static const int kLockTicks = 4;
 
 // The commit lead grows by a step whenever a commit misses its vblank (a
-// miss repeats a frame) and creeps back, after a long time without one, to
-// no less than where it started: VOP2 made every vblank at 2 ms on the VRX
-// Pro, and its first misses came at 1.6 ms.
+// miss repeats a frame), at most one step a second: starting the DVR's
+// re-encode missed 11 vblanks within a second in flight, which is load, not
+// a lead too short. It comes back a step per 10 s without a miss, to no less
+// than where it started: VOP2 made every vblank at 2 ms on the VRX Pro, and
+// its first misses came at 1.6 ms.
 static const unsigned kMinLeadUs = 2000, kMaxLeadUs = 6000;
-static const unsigned kLeadStepUs = 250, kLeadRelaxStepUs = 50;
-static const uint64_t kLeadRelaxUs = 600000000;
+static const unsigned kLeadStepUs = 250, kLeadRelaxStepUs = 250;
+static const uint64_t kLeadStepGapUs = 1000000, kLeadRelaxUs = 10000000;
+
+// A capture interval off a whole number of camera frames by more than
+// kStepUs is a step in the clock mapping: the camera itself is regular to a
+// few us. The clock sync moves at most once per probe (500 ms), so one step
+// per kStepGapUs is taken out: when the camera changes its rate, only its
+// first interval passes for a step, and the median period soon follows.
+static const double kStepUs = 300;
+static const uint64_t kStepGapUs = 400000;
 
 static uint64_t monotonic_us() {
 	struct timespec ts;
@@ -109,17 +119,57 @@ void VsyncLock::set_ppm(int ppm) {
 	}
 }
 
-void VsyncLock::frame_ready(uint64_t t_us, uint64_t capture_us) {
+// q-quantile, partially reordering v.
+static double quantile(std::vector<double> &v, double q) {
+	const size_t i = (size_t)(q * (v.size() - 1));
+	std::nth_element(v.begin(), v.begin() + i, v.end());
+	return v[i];
+}
+
+// Under mutex_.
+uint64_t VsyncLock::stable_capture(uint64_t capture_us, uint64_t t_us) {
+	if (!capture_us)
+		return 0;
+	if (last_capture_us_) {
+		const double d = (double)(int64_t)(capture_us - last_capture_us_);
+		if (interval_count_ >= 5) {
+			// The camera's frame period: the median interval, which lost
+			// frames and the steps themselves don't move.
+			std::vector<double> iv(intervals_, intervals_ + interval_count_);
+			const double period = quantile(iv, 0.5);
+			const double k = std::round(d / period);
+			const double off = d - k * period;
+			if (k >= 1 && k <= 8 && std::fabs(off) > kStepUs && t_us - last_step_us_ >= kStepGapUs) {
+				capture_corr_us_ -= (int64_t)std::llround(off);
+				last_step_us_ = t_us;
+				steps_++;
+				largest_step_us_ = std::max(largest_step_us_, std::fabs(off));
+			}
+		}
+		if (d > 0 && d < 1e6) {
+			intervals_[interval_next_] = d;
+			interval_next_ = (interval_next_ + 1) % kIntervals;
+			if (interval_count_ < kIntervals)
+				interval_count_++;
+		}
+	}
+	last_capture_us_ = capture_us;
+	return (uint64_t)((int64_t)capture_us + capture_corr_us_);
+}
+
+uint64_t VsyncLock::frame_ready(uint64_t t_us, uint64_t capture_us) {
 	std::lock_guard<std::mutex> lk(mutex_);
+	const uint64_t stable_us = stable_capture(capture_us, t_us);
 	if (!vblank_known())
-		return;
+		return stable_us;
 	double phase = std::fmod((double)(int64_t)(t_us - last_vbl_us_), period_us_);
 	if (phase < 0)
 		phase += period_us_;
-	samples_[sample_next_] = {t_us, capture_us, phase};
+	samples_[sample_next_] = {t_us, stable_us, phase};
 	sample_next_ = (sample_next_ + 1) % kSamples;
 	if (sample_count_ < kSamples)
 		sample_count_++;
+	return stable_us;
 }
 
 void VsyncLock::frame_dropped() {
@@ -166,15 +216,18 @@ void VsyncLock::vblank(uint32_t seq, uint64_t t_us) {
 	last_vbl_us_ = t_us;
 }
 
-void VsyncLock::commit_landed(uint32_t target_seq, uint32_t landed_seq) {
+void VsyncLock::commit_landed(uint32_t target_seq, uint32_t landed_seq, uint64_t woke_us, uint64_t commit_us) {
 	if (!target_seq || landed_seq <= target_seq)
 		return;
 	misses_++;
-	last_miss_us_ = monotonic_us();
-	if (lead_us_ < kMaxLeadUs) {
+	const uint64_t now = monotonic_us();
+	last_miss_us_ = now;
+	if (lead_us_ < kMaxLeadUs && now - last_lead_step_us_ >= kLeadStepGapUs) {
 		lead_us_ = std::min(lead_us_ + kLeadStepUs, kMaxLeadUs);
-		spdlog::info("vsync lock: commit missed its vblank by {}, lead now {:.2f} ms",
-		             landed_seq - target_seq, lead_us_ / 1000.0);
+		last_lead_step_us_ = now;
+		spdlog::info("vsync lock: commit missed its vblank by {} (woke {:.2f} ms, committed {:.2f} ms "
+		             "after its deadline), lead now {:.2f} ms",
+		             landed_seq - target_seq, woke_us / 1000.0, commit_us / 1000.0, lead_us_ / 1000.0);
 	}
 }
 
@@ -191,13 +244,6 @@ bool VsyncLock::wait_vblank() {
 		return false;
 	vblank(vbl.reply.sequence, (uint64_t)vbl.reply.tval_sec * 1000000 + vbl.reply.tval_usec);
 	return true;
-}
-
-// q-quantile, partially reordering v.
-static double quantile(std::vector<double> &v, double q) {
-	const size_t i = (size_t)(q * (v.size() - 1));
-	std::nth_element(v.begin(), v.begin() + i, v.end());
-	return v[i];
 }
 
 // The late frames' margin over the median: kSpreadQuantile of the
@@ -421,6 +467,24 @@ void VsyncLock::tick(uint64_t now_us) {
 	}
 
 	const char *state = locked_ ? "locked" : ratio ? "locking" : win.size() >= 20 ? "free" : "idle";
+	// For the log (support packages): a summary every ~10 s.
+	if (++summary_ticks_ >= kRateTicks) {
+		summary_ticks_ = 0;
+		unsigned steps;
+		double largest_step_us;
+		{
+			std::lock_guard<std::mutex> lk(mutex_);
+			steps = steps_;
+			largest_step_us = largest_step_us_;
+			steps_ = 0;
+			largest_step_us_ = 0;
+		}
+		spdlog::info("vsync lock: {} {} ppm, err {:+.1f} ms, margin {:.1f} wait {:.1f} lead {:.2f} ms; "
+		             "last 10 s: {:.0f} drops, {:.0f} misses, {} clock steps (largest {:.1f} ms)",
+		             state, ppm_, err_ms, margin_us_ / 1000, wait_ms, lead_us_ / 1000.0, rate_drops,
+		             rate_misses, steps, largest_step_us / 1000);
+	}
+
 	void *batch = osd_batch_init(9);
 	osd_add_str_fact(batch, "video.sync.state", NULL, 0, state);
 	osd_add_bool_fact(batch, "video.sync.locked", NULL, 0, locked_);
