@@ -138,8 +138,18 @@ char * colmenu_get(const char * type, const char * page, const char * param, cha
     snprintf(cmd, sizeof(cmd), "gsmenu.sh get %s %s %s 2>%s", type, page, param, errf);
     FILE * fp = popen(cmd, "r");
     if(!fp) { unlink(errf); return NULL; }
-    char buf[1024];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    /* Read it all: dynamic option lists (e.g. 48 sensor bins) run past 1 KiB,
+     * and a fixed buffer cut the list off mid-name. */
+    size_t cap = 1024, n = 0, r;
+    char * buf = malloc(cap);
+    if(!buf) { pclose(fp); unlink(errf); return NULL; }
+    while((r = fread(buf + n, 1, cap - 1 - n, fp)) > 0) {
+        n += r;
+        if(n < cap - 1) continue;
+        char * nb = realloc(buf, cap * 2);
+        if(!nb) break;
+        buf = nb; cap *= 2;
+    }
     buf[n] = '\0';
     int status = pclose(fp);
     int rc = (status == -1) ? -1 : WEXITSTATUS(status);
@@ -154,13 +164,11 @@ char * colmenu_get(const char * type, const char * page, const char * param, cha
         free(eout);
     }
     unlink(errf);
-    if(rc != 0 || n == 0) return NULL;   /* Unknown / error / empty → no value */
+    if(rc != 0 || n == 0) { free(buf); return NULL; }   /* Unknown / error / empty → no value */
     char * rs = strchr(buf, '\x1e');
-    char * val;
-    if(rs) { *rs = '\0'; if(opts) { *opts = strdup(rs + 1); strip_nl(*opts); } val = strdup(buf); }
-    else   { val = strdup(buf); }
-    strip_nl(val);
-    return val;
+    if(rs) { *rs = '\0'; if(opts) { *opts = strdup(rs + 1); strip_nl(*opts); } }
+    strip_nl(buf);
+    return buf;
 }
 
 /* ── command execution + error reporting ───────────────────────────────────── */
