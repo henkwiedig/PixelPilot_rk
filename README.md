@@ -297,6 +297,22 @@ into it by RGA as soon as it leaves the decoder - no wait for vblank, at the cos
 "scan-out" point is then the end of that copy, so `display_ms` is the copy time (~4.5 ms for 1080p
 on the RK3568); on a 60 Hz output this took capture -> display from 66 to 51 ms median.
 
+With `--vsync-lock` the display thread flips once per refresh, a lead before the vblank, and trims
+the HDMI refresh rate (kernel debugfs `vsync_adjust`, +-1000 ppm) so that every frame goes out
+after the same capture -> scan-out latency (see `src/vsync_lock.h`). It publishes, twice a second:
+
+| Fact                         | Type   | Description                                                                |
+|:-----------------------------|:-------|:---------------------------------------------------------------------------|
+| `video.sync.state`           | string | `locked`, `locking`, `free` (video rate not lockable), `idle` (no video)   |
+| `video.sync.locked`          | bool   | the phase holds                                                            |
+| `video.sync.ppm`             | int    | the refresh rate trim                                                      |
+| `video.sync.error_ms`        | double | phase error                                                                |
+| `video.sync.wait_ms`         | double | the median frame's wait from decoded to its vblank                         |
+| `video.sync.margin_ms`       | double | how far the late frames (99th percentile) lag the median                   |
+| `video.sync.lead_ms`         | double | commit lead before the vblank                                              |
+| `video.sync.drops_per_s`     | double | frames never shown (late for their vblank), over the last 10 s             |
+| `video.sync.misses_per_s`    | double | commits that missed their vblank, over the last 10 s                       |
+
 There are many facts based on Mavlink telemetry, see `mavlink.c`. All of them have tags "sysid" and
 "compid", but some have extra tags.
 Currently implemented fact categories are grouped by Mavlink message types:
@@ -484,7 +500,8 @@ to display any fact (as long as datatype matches):
   its facts has a value (never published, or flushed) instead of showing `?`; useful for facts that
   only exist in some setups or RX modes
 * `{"type": "BoxWidget", "width": 100, "height": 100, "color": {"r": 255, "g": 255, "b": 255, "alpha": 128}}` - displays
-  a static square. Might be good as a background.
+  a static square. Might be good as a background. With facts and `"hide_when_undefined": true` it is
+  hidden while none of them has a value, like the template widgets on it.
 * `{"type": "BarChartWidget", "width": 100, "height": 100, "window_s": 5, "num_buckets": 10, "stats_kind": "sum/min/max/count/avg"}` - displays
  a simple bar chart for the single fact's statistics. Each bar represents
  either minimum or maximum or sum or count or average of the fact over time interval. Can be used to show

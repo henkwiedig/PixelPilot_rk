@@ -78,6 +78,7 @@ private:
 	static const int kDeviations = 600;
 	static const uint64_t kTickUs = 500000;
 	static const uint64_t kWindowUs = 2000000;
+	static const int kRateTicks = 20;  // drops and misses per second over ~10 s
 
 	void set_ppm(int ppm);
 	void update_margin();
@@ -114,6 +115,14 @@ private:
 	uint64_t last_miss_us_ = 0;
 	uint64_t last_lead_relax_us_ = 0;
 	unsigned misses_ = 0;
+
+	// The last kRateTicks ticks' drops and misses, for their rates.
+	struct TickCounts {
+		unsigned drops, misses;
+		double dt_s;
+	};
+	TickCounts rate_ticks_[kRateTicks] = {};
+	int rate_next_ = 0;
 
 	// Controller.
 	int ppm_ = 0;
