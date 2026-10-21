@@ -131,7 +131,9 @@ set(LIB_SOURCE_FILES
         src/gstrtpreceiver.cpp
         src/gstrtpreceiver.h
         src/timing_sei.h
-        src/timing_sei.c)
+        src/timing_sei.c
+        src/vsync_lock.h
+        src/vsync_lock.cpp)
 set(SOURCE_FILES
   ${LIB_SOURCE_FILES}
   src/main.cpp

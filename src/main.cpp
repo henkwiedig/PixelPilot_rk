@@ -62,6 +62,7 @@ extern "C" {
 #include "scheduling_helper.hpp"
 #include "time_util.h"
 #include "timing_sei.h"
+#include "vsync_lock.h"
 #include "os_mon.hpp"
 #include <filesystem>
 #include "pixelpilot_config.h"
@@ -118,6 +119,18 @@ static std::mutex frame_timing_mutex;
 static int frame_timing_next;
 static FrameTiming timing_for_display;     // guarded by video_mutex; pts_us 0 = none
 
+// --vsync-lock: the decoded frames waiting for their flip, oldest first,
+// guarded by video_mutex. More than one can wait: the link delivers in
+// bursts, so a frame can come in before the one ahead of it has gone out.
+struct PacedFrame {
+	int fb_id;
+	uint64_t decoding_pts;
+	FrameTiming timing;
+};
+static const int kPacedFrames = 4;
+static PacedFrame paced_frames[kPacedFrames];
+static int paced_head, paced_count;
+
 // Round robin: the oldest entry is overwritten, which only ever loses the
 // timing of a frame the decoder dropped anyway.
 static void frame_timing_store(uint64_t pts_us, const struct timing_sei_v1 &sei) {
@@ -157,6 +170,11 @@ bool disable_vsync = false;
 // for the display at all), at the price of tearing where the raster happens
 // to be during the copy.
 bool front_buffer_mode = false;
+// --vsync-lock: one paced page flip per refresh, and the refresh rate trimmed
+// so the frames arrive just before their flip (vsync_lock.h).
+bool vsync_lock_mode = false;
+static unsigned vsync_lock_guard_us = 1000;
+static VsyncLock vsync_lock;
 bool disable_gregidr = false;
 uint32_t refresh_frequency_ms = 1000;
 
@@ -553,14 +571,28 @@ void *__FRAME_THREAD__(void *param)
 					// send DRM FB to display thread
 					ret = pthread_mutex_lock(&video_mutex);
 					assert(!ret);
+					if (vsync_lock_mode) {
+						if (paced_count == kPacedFrames) {
+							paced_head = (paced_head + 1) % kPacedFrames;
+							paced_count--;
+							vsync_lock.frame_dropped();
+						}
+						paced_frames[(paced_head + paced_count) % kPacedFrames] = {
+							(int)mpi.frame_to_drm[i].fb_id, feed_data_ts, timing};
+						paced_count++;
+					} else {
 					output_list->video_fb_id = mpi.frame_to_drm[i].fb_id;
                     //output_list->video_fb_index=i;
                     output_list->decoding_pts=feed_data_ts;
 					timing_for_display = timing;
+					}
 					ret = pthread_cond_signal(&video_cond);
 					assert(!ret);
 					ret = pthread_mutex_unlock(&video_mutex);
 					assert(!ret);
+					if (vsync_lock_mode)
+						vsync_lock.frame_ready((uint64_t)ats.tv_sec * 1000000 + ats.tv_nsec / 1000,
+						                       timing.pts_us ? timing.sei.capture_ground_us : 0);
 					}
 
 					if (frame_proc != nullptr &&
@@ -668,8 +700,16 @@ static void publish_latency_facts(const FrameTiming &f, uint64_t scanout_us) {
 	}
 }
 
+// The latest page flip event: the vblank it went out at.
+static bool flip_seen;
+static uint32_t flip_seq;
+static uint64_t flip_us;
+
 static void on_page_flip(int fd, unsigned int sequence, unsigned int tv_sec, unsigned int tv_usec, void *user_data) {
-	(void)fd; (void)sequence;
+	(void)fd;
+	flip_seen = true;
+	flip_seq = sequence;
+	flip_us = (uint64_t)tv_sec * 1000000 + tv_usec;
 	FlipTiming *ft = (FlipTiming *)user_data;
 	if (!ft || !ft->in_use) return;
 	ft->in_use = false;
@@ -689,19 +729,123 @@ static void drain_flip_events(int timeout_ms) {
 	}
 }
 
-void *__DISPLAY_THREAD__(void *param)
-{
-	int ret;
-	SchedulingHelper::set_thread_params_max_realtime("DISPLAY_THREAD",SchedulingHelper::PRIORITY_REALTIME_MID);
-	pthread_setname_np(pthread_self(), "__DISPLAY");
-
-	// Show a full-screen black frame on the video plane once no video has arrived
-	// for a while (also true at startup), so straight-alpha OSD blends over black
-	// instead of an empty CRTC. Both planes stay in each commit, so the modeset
-	// that (re)attaches the black frame doesn't reset the OSD plane.
-	static const uint64_t NO_VIDEO_BLACK_MS = 5000;
+// The video plane and the no-video backdrop, shared by both flip loops.
+struct DisplayPlaneState {
 	uint64_t last_video_frame_ms = 0;
 	bool video_showing_black = false;
+};
+
+enum class PlaneChange {
+	None,     // nothing on the video plane that needs a vsynced flip
+	Flip,     // a decoded frame
+	Modeset,  // the plane's geometry changes, to or from the backdrop
+};
+
+// Puts the video plane into output_list->video_request: a decoded frame, the
+// --front-buffer buffer coming back from the backdrop, or a full-screen black
+// frame once no video has arrived for a while (also true at startup), so
+// straight-alpha OSD blends over black instead of an empty CRTC. Both planes
+// stay in each commit, so the modeset that (re)attaches the black frame
+// doesn't reset the OSD plane.
+static PlaneChange set_video_plane(DisplayPlaneState &st, int fb_id, bool front_frame) {
+	static const uint64_t NO_VIDEO_BLACK_MS = 5000;
+	int ret;
+
+	if (fb_id != 0) {
+		ret = set_drm_object_property(output_list->video_request, &output_list->video_plane, "FB_ID", fb_id);
+		assert(ret>0);
+		st.last_video_frame_ms = get_time_ms();
+		if (st.video_showing_black) {
+			// Video resumed: restore the real (aspect-scaled) geometry.
+			modeset_set_video_geometry(output_list, output_list->video_request, 0, video_zpos);
+			st.video_showing_black = false;
+			return PlaneChange::Modeset;
+		}
+		return PlaneChange::Flip;
+	}
+	if (front_frame) {
+		// --front-buffer: the frame thread already put this frame on
+		// screen. The plane only needs touching when it comes back from
+		// the no-video backdrop.
+		st.last_video_frame_ms = get_time_ms();
+		if (st.video_showing_black) {
+			ret = set_drm_object_property(output_list->video_request, &output_list->video_plane, "FB_ID", front_buf.fb_id);
+			assert(ret>0);
+			modeset_set_video_geometry(output_list, output_list->video_request, 0, video_zpos);
+			st.video_showing_black = false;
+			return PlaneChange::Modeset;
+		}
+		return PlaneChange::None;
+	}
+	if (output_list->black_video_fb &&
+	    (get_time_ms() - st.last_video_frame_ms) > NO_VIDEO_BLACK_MS) {
+		// Re-asserted each idle commit so a stray modeset elsewhere can't
+		// leave the video plane empty.
+		ret = set_drm_object_property(output_list->video_request, &output_list->video_plane, "FB_ID", output_list->black_video_fb);
+		assert(ret>0);
+		modeset_set_video_geometry(output_list, output_list->video_request, 1, video_zpos);
+		if (!st.video_showing_black) {
+			st.video_showing_black = true;
+			return PlaneChange::Modeset;   // (re)attach the video plane
+		}
+	}
+	return PlaneChange::None;
+}
+
+// Puts the OSD plane into output_list->video_request and holds osd_mutex
+// until unlock_osd_plane() after the commit, so the OSD thread can't swap
+// its buffers in between.
+static void set_osd_plane() {
+	if (!enable_osd)
+		return;
+	int ret = pthread_mutex_lock(&osd_mutex);
+	assert(!ret);
+	// gl_fb_id is 0 until the OSD GL pass has run on this buffer, and
+	// always 0 without a GPU (OSD GL init failed): FB_ID=0 on an
+	// enabled plane makes every commit fail with EINVAL, so show the
+	// untransformed OSD instead.
+	struct modeset_buf *osd_buf = &output_list->osd_bufs[output_list->osd_buf_switch];
+	uint32_t osd_fb = (enable_live_colortrans && osd_buf->gl_fb_id) ? osd_buf->gl_fb_id : osd_buf->fb;
+	ret = set_drm_object_property(output_list->video_request, &output_list->osd_plane, "FB_ID", osd_fb);
+	assert(ret>0);
+}
+
+static void unlock_osd_plane() {
+	if (!enable_osd)
+		return;
+	int ret = pthread_mutex_unlock(&osd_mutex);
+	assert(!ret);
+}
+
+// A frame with timing asks for the flip event, whose vblank timestamp is the
+// moment it starts being scanned out.
+static FlipTiming *flip_timing_slot(const FrameTiming &timing) {
+	FlipTiming *ft = &flip_timing[flip_timing_next];
+	flip_timing_next = (flip_timing_next + 1) % kFlipTimingSlots;
+	ft->in_use = true;
+	ft->frame = timing;
+	return ft;
+}
+
+static void report_commit_error(int commit_ret, uint32_t flags) {
+	if (commit_ret == -EBUSY && (flags & DRM_MODE_ATOMIC_NONBLOCK)) {
+		// Previous flip still pending — this frame is dropped.
+		spdlog::debug("Atomic commit EBUSY, frame dropped");
+		return;
+	}
+	static uint64_t last_commit_warn_ms = 0;
+	uint64_t warn_now = get_time_ms();
+	if (warn_now - last_commit_warn_ms > 1000) {
+		last_commit_warn_ms = warn_now;
+		spdlog::warn("drmModeAtomicCommit failed: {}", commit_ret);
+	}
+}
+
+// Flips as the frames come: a blocking, vsynced commit per decoded frame
+// (NONBLOCK with --disable-vsync) and per OSD update.
+static void display_loop_immediate() {
+	DisplayPlaneState st;
+	int ret;
 
 	while (!frm_eos) {
 		int fb_id;
@@ -715,7 +859,7 @@ void *__DISPLAY_THREAD__(void *param)
 			if (output_list->video_fb_id == 0 && frm_eos) {
 				ret = pthread_mutex_unlock(&video_mutex);
 				assert(!ret);
-				goto end;
+				return;
 			}
 		}
 		fb_id = output_list->video_fb_id;
@@ -736,90 +880,31 @@ void *__DISPLAY_THREAD__(void *param)
 		drmModeAtomicFree(output_list->video_request);
 		output_list->video_request = drmModeAtomicAlloc();
 
-		// show DRM FB in plane
+		// Steady-state flips only update plane FB_IDs — no modeset is
+		// needed, so commit with flags=0 (blocking, vsynced) instead of
+		// ALLOW_MODESET, which permits heavier driver validation paths.
+		const PlaneChange change = set_video_plane(st, fb_id, front_frame);
 		uint32_t flags = DRM_MODE_ATOMIC_NONBLOCK;
-		if (fb_id != 0) {
-			// Steady-state flips only update plane FB_IDs — no modeset is
-			// needed, so commit with flags=0 (blocking, vsynced) instead of
-			// ALLOW_MODESET, which permits heavier driver validation paths.
+		if (change == PlaneChange::Flip)
 			flags = disable_vsync ? DRM_MODE_ATOMIC_NONBLOCK : 0;
-			ret = set_drm_object_property(output_list->video_request, &output_list->video_plane, "FB_ID", fb_id);
-			assert(ret>0);
-			last_video_frame_ms = get_time_ms();
-			if (video_showing_black) {
-				// Video resumed: restore the real (aspect-scaled) geometry.
-				modeset_set_video_geometry(output_list, output_list->video_request, 0, video_zpos);
-				video_showing_black = false;
-				flags = DRM_MODE_ATOMIC_ALLOW_MODESET;
-			}
-		} else if (front_frame) {
-			// --front-buffer: the frame thread already put this frame on
-			// screen. The plane only needs touching when it comes back from
-			// the no-video backdrop; otherwise commit only if the OSD changed.
-			last_video_frame_ms = get_time_ms();
-			if (video_showing_black) {
-				ret = set_drm_object_property(output_list->video_request, &output_list->video_plane, "FB_ID", front_buf.fb_id);
-				assert(ret>0);
-				modeset_set_video_geometry(output_list, output_list->video_request, 0, video_zpos);
-				video_showing_black = false;
-				flags = DRM_MODE_ATOMIC_ALLOW_MODESET;
-			} else if (!osd_update) {
-				continue;
-			}
-		} else if (output_list->black_video_fb &&
-		           (get_time_ms() - last_video_frame_ms) > NO_VIDEO_BLACK_MS) {
-			// No video for a while (or startup): show the full-screen black
-			// backdrop under the OSD. Re-asserted each idle commit so a stray
-			// modeset elsewhere can't leave the video plane empty.
-			ret = set_drm_object_property(output_list->video_request, &output_list->video_plane, "FB_ID", output_list->black_video_fb);
-			assert(ret>0);
-			modeset_set_video_geometry(output_list, output_list->video_request, 1, video_zpos);
-			if (!video_showing_black) {
-				video_showing_black = true;
-				flags = DRM_MODE_ATOMIC_ALLOW_MODESET;   // (re)attach the video plane
-			}
-		}
+		else if (change == PlaneChange::Modeset)
+			flags = DRM_MODE_ATOMIC_ALLOW_MODESET;
+		else if (front_frame && !osd_update)
+			continue; // --front-buffer: commit only if the OSD changed
 
-		if(enable_osd) {
-			ret = pthread_mutex_lock(&osd_mutex);
-			assert(!ret);
-			// gl_fb_id is 0 until the OSD GL pass has run on this buffer, and
-			// always 0 without a GPU (OSD GL init failed): FB_ID=0 on an
-			// enabled plane makes every commit fail with EINVAL, so show the
-			// untransformed OSD instead.
-			struct modeset_buf *osd_buf = &output_list->osd_bufs[output_list->osd_buf_switch];
-			uint32_t osd_fb = (enable_live_colortrans && osd_buf->gl_fb_id) ? osd_buf->gl_fb_id : osd_buf->fb;
-			ret = set_drm_object_property(output_list->video_request, &output_list->osd_plane, "FB_ID", osd_fb);
-			assert(ret>0);
-		}
-		// A frame with timing asks for the flip event, whose vblank timestamp
-		// is the moment it starts being scanned out. Only then: without the
+		set_osd_plane();
+		// Only a frame with timing asks for the flip event: without the
 		// timing SEI nothing changes here.
 		FlipTiming *ft = NULL;
 		if (timing.pts_us) {
-			ft = &flip_timing[flip_timing_next];
-			flip_timing_next = (flip_timing_next + 1) % kFlipTimingSlots;
-			ft->in_use = true;
-			ft->frame = timing;
+			ft = flip_timing_slot(timing);
 			flags |= DRM_MODE_PAGE_FLIP_EVENT;
 		}
 		int commit_ret = drmModeAtomicCommit(drm_fd, output_list->video_request, flags, ft);
 		if (ft && commit_ret) ft->in_use = false;
-		ret = pthread_mutex_unlock(&osd_mutex);
-		assert(!ret);
-		if (commit_ret) {
-			if (commit_ret == -EBUSY && (flags & DRM_MODE_ATOMIC_NONBLOCK)) {
-				// Previous flip still pending — this frame is dropped.
-				spdlog::debug("Atomic commit EBUSY, frame dropped");
-			} else {
-				static uint64_t last_commit_warn_ms = 0;
-				uint64_t warn_now = get_time_ms();
-				if (warn_now - last_commit_warn_ms > 1000) {
-					last_commit_warn_ms = warn_now;
-					spdlog::warn("drmModeAtomicCommit failed: {}", commit_ret);
-				}
-			}
-		}
+		unlock_osd_plane();
+		if (commit_ret)
+			report_commit_error(commit_ret, flags);
 		// A blocking commit has already flipped, so its event is waiting; a
 		// NONBLOCK one (--disable-vsync) must not be waited for here -- its
 		// event is picked up on a later pass, with its own timestamp.
@@ -833,7 +918,96 @@ void *__DISPLAY_THREAD__(void *param)
 			osd_publish_uint_fact("video.decode_and_handover_ms", NULL, 0, decode_and_handover_display_ms);
 		}
 	}
-end:	
+}
+
+static void sleep_until_us(uint64_t t_us) {
+	struct timespec ts = {(time_t)(t_us / 1000000), (long)(t_us % 1000000) * 1000};
+	while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {}
+}
+
+// --vsync-lock: one commit per refresh, vsync_lock.lead_us() before the
+// vblank, with the newest frame and the OSD together (vsync_lock.h).
+static void display_loop_paced() {
+	DisplayPlaneState st;
+	int ret;
+
+	while (!frm_eos) {
+		uint32_t target_seq;
+		uint64_t vblank_us;
+		sleep_until_us(vsync_lock.next_deadline(get_time_us(), &target_seq, &vblank_us));
+		vsync_lock.tick(get_time_us());
+
+		// This vblank's frame: the newest one due by then (any older ones
+		// missed theirs); one due later keeps waiting.
+		const uint64_t due_by_us = vblank_us + (uint64_t)(vsync_lock.period_us() / 2);
+		PacedFrame shown = {};
+		ret = pthread_mutex_lock(&video_mutex);
+		assert(!ret);
+		while (paced_count) {
+			const PacedFrame &f = paced_frames[paced_head];
+			const uint64_t due = vsync_lock.due_us(f.timing.pts_us ? f.timing.sei.capture_ground_us : 0);
+			if (due > due_by_us)
+				break;
+			if (shown.fb_id)
+				vsync_lock.frame_dropped();
+			shown = f;
+			paced_head = (paced_head + 1) % kPacedFrames;
+			paced_count--;
+		}
+		const bool osd_update = osd_update_ready;
+		osd_update_ready = false;
+		ret = pthread_mutex_unlock(&video_mutex);
+		assert(!ret);
+		const int fb_id = shown.fb_id;
+		const FrameTiming &timing = shown.timing;
+		const uint64_t decoding_pts = shown.decoding_pts;
+
+		if (fb_id == 0 && !osd_update) {
+			// Nothing new for this vblank: still follow the vblanks.
+			if (!vsync_lock.wait_vblank())
+				usleep((useconds_t)vsync_lock.period_us()); // CRTC off
+			continue;
+		}
+
+		drmModeAtomicFree(output_list->video_request);
+		output_list->video_request = drmModeAtomicAlloc();
+		// A modeset is blocking; any other commit is a NONBLOCK flip, and
+		// its event says which vblank it made.
+		const PlaneChange change = set_video_plane(st, fb_id, false);
+		const uint32_t flags = DRM_MODE_PAGE_FLIP_EVENT |
+			(change == PlaneChange::Modeset ? DRM_MODE_ATOMIC_ALLOW_MODESET : DRM_MODE_ATOMIC_NONBLOCK);
+		set_osd_plane();
+		FlipTiming *ft = timing.pts_us ? flip_timing_slot(timing) : NULL;
+		flip_seen = false;
+		int commit_ret = drmModeAtomicCommit(drm_fd, output_list->video_request, flags, ft);
+		if (commit_ret) {
+			if (ft) ft->in_use = false;
+			unlock_osd_plane();
+			report_commit_error(commit_ret, flags);
+			continue;
+		}
+		drain_flip_events(50);
+		unlock_osd_plane();
+		if (flip_seen) {
+			vsync_lock.vblank(flip_seq, flip_us);
+			vsync_lock.commit_landed(target_seq, flip_seq);
+		}
+		if (fb_id != 0) {
+			osd_publish_uint_fact("video.displayed_frame", NULL, 0, 1);
+			osd_publish_uint_fact("video.decode_and_handover_ms", NULL, 0, (get_time_us() - decoding_pts) / 1000);
+		}
+	}
+}
+
+void *__DISPLAY_THREAD__(void *param)
+{
+	SchedulingHelper::set_thread_params_max_realtime("DISPLAY_THREAD",SchedulingHelper::PRIORITY_REALTIME_MID);
+	pthread_setname_np(pthread_self(), "__DISPLAY");
+
+	if (vsync_lock_mode)
+		display_loop_paced();
+	else
+		display_loop_immediate();
 	spdlog::info("Display thread done.");
 	return nullptr;
 }
@@ -842,6 +1016,15 @@ end:
 
 int signal_flag = 0;
 int return_value = 0;
+
+// SIGTERM ends pixelpilot without any cleanup (pixelpilot.sh takes the
+// exit status 143 as "stop"): put the refresh rate back first.
+static void vsync_lock_sigterm(int signum)
+{
+	vsync_lock.reset_from_signal();
+	signal(signum, SIG_DFL);
+	raise(signum);
+}
 
 void sig_handler(int signum)
 {
@@ -1627,6 +1810,12 @@ void printHelp() {
     "    --front-buffer         - Scan out one fixed buffer and RGA-copy each decoded frame\n"
     "                             into it: no wait for vblank, at the cost of tearing\n"
     "\n"
+    "    --vsync-lock           - One paced page flip per refresh, and the refresh rate\n"
+    "                             trimmed (kernel debugfs vsync_adjust) so the frames arrive\n"
+    "                             just before their flip: no judder, short constant wait\n"
+    "\n"
+    "    --vsync-lock-guard <ms> - How early the late frames should be ready (Default: 1.0)\n"
+    "\n"
     "    --disable-gregidr      - Disable last-hop probing and IDR requests\n"
     "\n"
     "    --live-colortrans      - Apply colortrans LUT to live display via DRM gamma\n"	
@@ -1895,6 +2084,16 @@ int main(int argc, char **argv)
 		continue;
 	}
 
+	__OnArgument("--vsync-lock") {
+		vsync_lock_mode = true;
+		continue;
+	}
+
+	__OnArgument("--vsync-lock-guard") {
+		vsync_lock_guard_us = (unsigned)(atof(__ArgValue) * 1000);
+		continue;
+	}
+
 	__OnArgument("--disable-gregidr") {
 		disable_gregidr = true;
 		continue;
@@ -2125,6 +2324,11 @@ int main(int argc, char **argv)
 
 	spdlog::info("disable_vsync: {}", disable_vsync);
 	spdlog::info("front_buffer: {}", front_buffer_mode);
+	if (vsync_lock_mode && (front_buffer_mode || disable_vsync)) {
+		spdlog::warn("--vsync-lock needs vsynced page flips: off with --front-buffer or --disable-vsync");
+		vsync_lock_mode = false;
+	}
+	spdlog::info("vsync_lock: {}", vsync_lock_mode);
 
 	if (enable_osd == 0 ) {
 		video_zpos = 4;
@@ -2156,6 +2360,12 @@ int main(int argc, char **argv)
 		fprintf(stderr,
 				"cannot initialize display. Is display connected? Is --screen-mode correct?\n");
 		return -2;
+	}
+	if (vsync_lock_mode) {
+		const drmModeModeInfo &m = output_list->mode;
+		vsync_lock.init(drm_fd, output_list->crtc_index, (double)m.htotal * m.vtotal * 1000.0 / m.clock,
+		                vsync_lock_guard_us);
+		signal(SIGTERM, vsync_lock_sigterm);
 	}
 
 	// One consolidated line describing the session, so a log capturing only
@@ -2310,6 +2520,8 @@ int main(int argc, char **argv)
 
 	ret = pthread_join(tid_display, NULL);
 	assert(!ret);	
+	if (vsync_lock_mode)
+		vsync_lock.shutdown();
 	
 	ret = pthread_cond_destroy(&video_cond);
 	assert(!ret);
