@@ -36,6 +36,7 @@
 #include <xf86drmMode.h>
 #include <drm_fourcc.h>
 #include <linux/videodev2.h>
+#include <linux/dma-buf.h>
 #include <rockchip/rk_mpi.h>
 #include <nlohmann/json.hpp>
 #include <yaml-cpp/yaml.h>
@@ -126,6 +127,7 @@ struct PacedFrame {
 	int fb_id;
 	uint64_t decoding_pts;
 	FrameTiming timing;
+	uint64_t capture_us;  // VsyncLock::frame_ready()'s, for due_us()
 };
 static const int kPacedFrames = 4;
 static PacedFrame paced_frames[kPacedFrames];
@@ -569,6 +571,9 @@ void *__FRAME_THREAD__(void *param)
 						assert(!ret);
 					} else {
 					// send DRM FB to display thread
+					const uint64_t capture_us = !vsync_lock_mode ? 0 :
+						vsync_lock.frame_ready((uint64_t)ats.tv_sec * 1000000 + ats.tv_nsec / 1000,
+						                       timing.pts_us ? timing.sei.capture_ground_us : 0);
 					ret = pthread_mutex_lock(&video_mutex);
 					assert(!ret);
 					if (vsync_lock_mode) {
@@ -578,7 +583,7 @@ void *__FRAME_THREAD__(void *param)
 							vsync_lock.frame_dropped();
 						}
 						paced_frames[(paced_head + paced_count) % kPacedFrames] = {
-							(int)mpi.frame_to_drm[i].fb_id, feed_data_ts, timing};
+							(int)mpi.frame_to_drm[i].fb_id, feed_data_ts, timing, capture_us};
 						paced_count++;
 					} else {
 					output_list->video_fb_id = mpi.frame_to_drm[i].fb_id;
@@ -590,9 +595,6 @@ void *__FRAME_THREAD__(void *param)
 					assert(!ret);
 					ret = pthread_mutex_unlock(&video_mutex);
 					assert(!ret);
-					if (vsync_lock_mode)
-						vsync_lock.frame_ready((uint64_t)ats.tv_sec * 1000000 + ats.tv_nsec / 1000,
-						                       timing.pts_us ? timing.sei.capture_ground_us : 0);
 					}
 
 					if (frame_proc != nullptr &&
@@ -920,6 +922,28 @@ static void display_loop_immediate() {
 	}
 }
 
+// The toolchain's kernel headers predate it (Linux 6.0).
+#ifndef DMA_BUF_IOCTL_EXPORT_SYNC_FILE
+struct dma_buf_export_sync_file {
+	__u32 flags;
+	__s32 fd;
+};
+#define DMA_BUF_IOCTL_EXPORT_SYNC_FILE _IOWR(DMA_BUF_BASE, 2, struct dma_buf_export_sync_file)
+#endif
+
+// An already signalled fence, as a sync_file fd (-1 if the kernel has no
+// way to export one): the fences a reader of an idle dma-buf waits for.
+static int signalled_fence_fd() {
+	int buf_fd = -1;
+	if (!output_list->black_video_handle ||
+	    drmPrimeHandleToFD(drm_fd, output_list->black_video_handle, DRM_CLOEXEC, &buf_fd))
+		return -1;
+	struct dma_buf_export_sync_file arg = {DMA_BUF_SYNC_READ, -1};
+	const int ret = ioctl(buf_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &arg);
+	close(buf_fd);
+	return ret ? -1 : arg.fd;
+}
+
 static void sleep_until_us(uint64_t t_us) {
 	struct timespec ts = {(time_t)(t_us / 1000000), (long)(t_us % 1000000) * 1000};
 	while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {}
@@ -931,11 +955,33 @@ static void display_loop_paced() {
 	DisplayPlaneState st;
 	int ret;
 
+	// The DVR re-encode reads each decoded frame, and the OSD it blends in,
+	// on the GPU, and Panfrost marks every buffer of a GPU job as written,
+	// so a flip of either waited for the GPU pass: a missed vblank about
+	// every 1.5 s while recording, whatever the lead. Only the decoder
+	// writes a decoded frame, and only the CPU the OSD (without
+	// --live-colortrans, whose OSD the GPU does render), both done before
+	// they are handed over, so those planes get an explicit, already
+	// signalled fence, which makes the kernel skip the implicit ones.
+	int in_fence = signalled_fence_fd();
+	if (in_fence >= 0) {
+		drmModeAtomicReq *probe = drmModeAtomicAlloc();
+		if (set_drm_object_property(probe, &output_list->video_plane, "IN_FENCE_FD", in_fence) < 0) {
+			close(in_fence);
+			in_fence = -1;
+		}
+		drmModeAtomicFree(probe);
+	}
+	if (in_fence < 0)
+		spdlog::warn("vsync lock: no signalled fence, flips wait for the GPU reading the frames and the OSD");
+
 	while (!frm_eos) {
 		uint32_t target_seq;
 		uint64_t vblank_us;
-		sleep_until_us(vsync_lock.next_deadline(get_time_us(), &target_seq, &vblank_us));
-		vsync_lock.tick(get_time_us());
+		const uint64_t deadline_us = vsync_lock.next_deadline(get_time_us(), &target_seq, &vblank_us);
+		sleep_until_us(deadline_us);
+		const uint64_t woke_us = get_time_us();
+		vsync_lock.tick(woke_us);
 
 		// This vblank's frame: the newest one due by then (any older ones
 		// missed theirs); one due later keeps waiting.
@@ -945,7 +991,7 @@ static void display_loop_paced() {
 		assert(!ret);
 		while (paced_count) {
 			const PacedFrame &f = paced_frames[paced_head];
-			const uint64_t due = vsync_lock.due_us(f.timing.pts_us ? f.timing.sei.capture_ground_us : 0);
+			const uint64_t due = vsync_lock.due_us(f.capture_us);
 			if (due > due_by_us)
 				break;
 			if (shown.fb_id)
@@ -976,9 +1022,16 @@ static void display_loop_paced() {
 		const PlaneChange change = set_video_plane(st, fb_id, false);
 		const uint32_t flags = DRM_MODE_PAGE_FLIP_EVENT |
 			(change == PlaneChange::Modeset ? DRM_MODE_ATOMIC_ALLOW_MODESET : DRM_MODE_ATOMIC_NONBLOCK);
+		if (fb_id != 0 && in_fence >= 0)
+			set_drm_object_property(output_list->video_request, &output_list->video_plane,
+			                        "IN_FENCE_FD", in_fence);
+		if (enable_osd && !enable_live_colortrans && in_fence >= 0)
+			set_drm_object_property(output_list->video_request, &output_list->osd_plane,
+			                        "IN_FENCE_FD", in_fence);
 		set_osd_plane();
 		FlipTiming *ft = timing.pts_us ? flip_timing_slot(timing) : NULL;
 		flip_seen = false;
+		const uint64_t commit_us = get_time_us();
 		int commit_ret = drmModeAtomicCommit(drm_fd, output_list->video_request, flags, ft);
 		if (commit_ret) {
 			if (ft) ft->in_use = false;
@@ -990,7 +1043,7 @@ static void display_loop_paced() {
 		unlock_osd_plane();
 		if (flip_seen) {
 			vsync_lock.vblank(flip_seq, flip_us);
-			vsync_lock.commit_landed(target_seq, flip_seq);
+			vsync_lock.commit_landed(target_seq, flip_seq, woke_us - deadline_us, commit_us - deadline_us);
 		}
 		if (fb_id != 0) {
 			osd_publish_uint_fact("video.displayed_frame", NULL, 0, 1);
