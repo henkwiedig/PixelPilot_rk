@@ -1170,11 +1170,32 @@ protected:
 
 class BoxWidget: public Widget {
 public:
-	BoxWidget(int pos_x, int pos_y, uint w, uint h, double r, double g, double b, double a):
-		Widget(pos_x, pos_y), w(w), h(h), r(r), g(g), b(b), a(a) {};
+	BoxWidget(int pos_x, int pos_y, uint w, uint h, double r, double g, double b, double a, uint num_args):
+		Widget(pos_x, pos_y, num_args), w(w), h(h), r(r), g(g), b(b), a(a) {};
+
+	// "hide_when_undefined": hide the box while none of its facts has a
+	// value, like the template widgets it is the background of.
+	bool hide_when_undefined = false;
+
+	void setFact(uint idx, Fact fact) override {
+		Widget::setFact(idx, fact);
+		dirty = true;
+	}
+
+	void tick() override {
+		if (!dirty || !box)
+			return;
+		dirty = false;
+		if (!hide_when_undefined)
+			return;
+		bool any = false;
+		for (const Fact& f : args) any = any || f.isDefined();
+		if (any) lv_obj_clear_flag(box, LV_OBJ_FLAG_HIDDEN);
+		else lv_obj_add_flag(box, LV_OBJ_FLAG_HIDDEN);
+	}
 
 	void createLvObjects(lv_obj_t* parent, int screen_w, int screen_h) override {
-		lv_obj_t* box = lv_obj_create(parent);
+		box = lv_obj_create(parent);
 		lv_obj_set_pos(box, absX(screen_w), absY(screen_h));
 		lv_obj_set_size(box, w, h);
 		lv_obj_set_style_bg_color(box, lv_color_make(
@@ -1184,11 +1205,16 @@ public:
 		lv_obj_set_style_radius(box, 0, LV_PART_MAIN);
 		lv_obj_set_style_pad_all(box, 0, LV_PART_MAIN);
 		lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+		if (hide_when_undefined) {
+			lv_obj_add_flag(box, LV_OBJ_FLAG_HIDDEN);
+			dirty = true;
+		}
 	}
 
 private:
 	uint w, h;
 	double r, g, b, a;
+	lv_obj_t* box = nullptr;
 };
 
 // Warning border that fades in proportionally as a signal drops below a
@@ -2916,7 +2942,9 @@ static Widget* buildWidget(const json& widget_j, const std::filesystem::path& as
 		auto g = cfgNum<double>(color_j, "g", 0, 1);
 		auto b = cfgNum<double>(color_j, "b", 0, 1);
 		auto a = cfgNum<double>(color_j, "alpha", 0, 1, 1.0);
-		return new BoxWidget(x, y, width, height, r, g, b, a);
+		auto *w = new BoxWidget(x, y, width, height, r, g, b, a, (uint)matchers.size());
+		w->hide_when_undefined = cfgGet<bool>(widget_j, "hide_when_undefined", false);
+		return w;
 	} else if (type == "SignalWarningWidget") {
 		needFacts(matchers, 1, 64);
 		double threshold = cfgGet<double>(widget_j, "threshold");

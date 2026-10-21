@@ -411,14 +411,25 @@ void VsyncLock::tick(uint64_t now_us) {
 	              target_lat_us_ / 1000, ppm_, ff_valid_ ? ff_ppm_ : 0.0, integ_ppm_, lead_us_, period_us_,
 	              drops, misses);
 
-	void *batch = osd_batch_init(8);
+	rate_ticks_[rate_next_] = {drops, misses, dt_s};
+	rate_next_ = (rate_next_ + 1) % kRateTicks;
+	double rate_drops = 0, rate_misses = 0, rate_s = 0;
+	for (const TickCounts &t : rate_ticks_) {
+		rate_drops += t.drops;
+		rate_misses += t.misses;
+		rate_s += t.dt_s;
+	}
+
+	const char *state = locked_ ? "locked" : ratio ? "locking" : win.size() >= 20 ? "free" : "idle";
+	void *batch = osd_batch_init(9);
+	osd_add_str_fact(batch, "video.sync.state", NULL, 0, state);
 	osd_add_bool_fact(batch, "video.sync.locked", NULL, 0, locked_);
 	osd_add_int_fact(batch, "video.sync.ppm", NULL, 0, ppm_);
 	osd_add_double_fact(batch, "video.sync.error_ms", NULL, 0, ratio ? err_ms : 0);
 	osd_add_double_fact(batch, "video.sync.margin_ms", NULL, 0, margin_us_ / 1000);
 	osd_add_double_fact(batch, "video.sync.wait_ms", NULL, 0, wait_ms);
 	osd_add_double_fact(batch, "video.sync.lead_ms", NULL, 0, lead_us_ / 1000.0);
-	osd_add_double_fact(batch, "video.sync.drops_per_s", NULL, 0, dt_s > 0 ? drops / dt_s : 0);
-	osd_add_double_fact(batch, "video.sync.misses_per_s", NULL, 0, dt_s > 0 ? misses / dt_s : 0);
+	osd_add_double_fact(batch, "video.sync.drops_per_s", NULL, 0, rate_s > 0 ? rate_drops / rate_s : 0);
+	osd_add_double_fact(batch, "video.sync.misses_per_s", NULL, 0, rate_s > 0 ? rate_misses / rate_s : 0);
 	osd_publish_batch(batch);
 }
