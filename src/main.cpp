@@ -176,6 +176,7 @@ bool front_buffer_mode = false;
 // so the frames arrive just before their flip (vsync_lock.h).
 bool vsync_lock_mode = false;
 static unsigned vsync_lock_guard_us = 1000;
+static const char *vsync_lock_dump = nullptr;
 static VsyncLock vsync_lock;
 bool disable_gregidr = false;
 uint32_t refresh_frequency_ms = 1000;
@@ -1042,6 +1043,7 @@ static void display_loop_paced() {
 		drain_flip_events(50);
 		unlock_osd_plane();
 		if (flip_seen) {
+			vsync_lock.dump_vblank(flip_seq, flip_us, shown.capture_us);
 			vsync_lock.vblank(flip_seq, flip_us);
 			vsync_lock.commit_landed(target_seq, flip_seq, woke_us - deadline_us, commit_us - deadline_us);
 		}
@@ -1869,6 +1871,9 @@ void printHelp() {
     "\n"
     "    --vsync-lock-guard <ms> - How early the late frames should be ready (Default: 1.0)\n"
     "\n"
+    "    --vsync-lock-dump <path> - Write every frame's, vblank's and controller tick's timing\n"
+    "                             to path (strftime template, e.g. /media/dvr/vsync_%Y%m%d_%H%M%S.txt)\n"
+    "\n"
     "    --disable-gregidr      - Disable last-hop probing and IDR requests\n"
     "\n"
     "    --live-colortrans      - Apply colortrans LUT to live display via DRM gamma\n"	
@@ -2139,6 +2144,11 @@ int main(int argc, char **argv)
 
 	__OnArgument("--vsync-lock") {
 		vsync_lock_mode = true;
+		continue;
+	}
+
+	__OnArgument("--vsync-lock-dump") {
+		vsync_lock_dump = __ArgValue;
 		continue;
 	}
 
@@ -2419,6 +2429,8 @@ int main(int argc, char **argv)
 		vsync_lock.init(drm_fd, output_list->crtc_index, (double)m.htotal * m.vtotal * 1000.0 / m.clock,
 		                vsync_lock_guard_us);
 		signal(SIGTERM, vsync_lock_sigterm);
+		if (vsync_lock_dump)
+			vsync_lock.open_dump(vsync_lock_dump);
 	}
 
 	// One consolidated line describing the session, so a log capturing only
