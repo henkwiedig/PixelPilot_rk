@@ -157,9 +157,32 @@ uint64_t VsyncLock::stable_capture(uint64_t capture_us, uint64_t t_us) {
 	return (uint64_t)((int64_t)capture_us + capture_corr_us_);
 }
 
+void VsyncLock::open_dump(const char *path_template) {
+	char path[256];
+	const time_t now = time(nullptr);
+	struct tm tm;
+	localtime_r(&now, &tm);
+	if (!strftime(path, sizeof(path), path_template, &tm))
+		return;
+	dump_ = fopen(path, "w");
+	if (dump_)
+		spdlog::info("vsync lock: dumping timings to {}", path);
+	else
+		spdlog::warn("vsync lock: cannot write {}: {}", path, strerror(errno));
+}
+
+void VsyncLock::dump_vblank(uint32_t seq, uint64_t vblank_us, uint64_t capture_us) {
+	if (dump_)
+		fprintf(dump_, "V %u %llu %llu\n", seq, (unsigned long long)vblank_us,
+		        (unsigned long long)capture_us);
+}
+
 uint64_t VsyncLock::frame_ready(uint64_t t_us, uint64_t capture_us) {
 	std::lock_guard<std::mutex> lk(mutex_);
 	const uint64_t stable_us = stable_capture(capture_us, t_us);
+	if (dump_)
+		fprintf(dump_, "F %llu %llu %llu\n", (unsigned long long)t_us, (unsigned long long)capture_us,
+		        (unsigned long long)stable_us);
 	if (!vblank_known())
 		return stable_us;
 	double phase = std::fmod((double)(int64_t)(t_us - last_vbl_us_), period_us_);
@@ -242,7 +265,9 @@ bool VsyncLock::wait_vblank() {
 	vbl.request.sequence = 1;
 	if (drmWaitVBlank(drm_fd_, &vbl))
 		return false;
-	vblank(vbl.reply.sequence, (uint64_t)vbl.reply.tval_sec * 1000000 + vbl.reply.tval_usec);
+	const uint64_t t_us = (uint64_t)vbl.reply.tval_sec * 1000000 + vbl.reply.tval_usec;
+	vblank(vbl.reply.sequence, t_us);
+	dump_vblank(vbl.reply.sequence, t_us, 0);
 	return true;
 }
 
@@ -316,6 +341,7 @@ void VsyncLock::tick(uint64_t now_us) {
 	}
 
 	double err_ms = 0;
+	double lat_p50_ms = 0, lat_p99_ms = 0, lat_max_ms = 0;
 	if (ratio) {
 		// The camera's frame period from the capture timestamps: a trimmed
 		// mean of the intervals, so a lost frame or a step in the clock
@@ -351,7 +377,10 @@ void VsyncLock::tick(uint64_t now_us) {
 			// Each frame belongs to the vblank at capture + target latency:
 			// the median latency, the late frames' margin over it, the guard,
 			// and the commit lead.
+			lat_max_ms = *std::max_element(lat.begin(), lat.end()) / 1000.0;
+			lat_p99_ms = quantile(lat, 0.99) / 1000.0;
 			const double median_lat = quantile(lat, 0.5);
+			lat_p50_ms = median_lat / 1000.0;
 			for (const Sample &x : win) {
 				if (x.t_us <= prev_tick_us || !x.capture_us)
 					continue;
@@ -479,10 +508,18 @@ void VsyncLock::tick(uint64_t now_us) {
 			steps_ = 0;
 			largest_step_us_ = 0;
 		}
-		spdlog::info("vsync lock: {} {} ppm, err {:+.1f} ms, margin {:.1f} wait {:.1f} lead {:.2f} ms; "
+		spdlog::info("vsync lock: {} {} ppm, err {:+.1f} ms, margin {:.1f} wait {:.1f} lead {:.2f} ms, "
+		             "latency p50 {:.1f} p99 {:.1f} max {:.1f} target {:.1f} ms; "
 		             "last 10 s: {:.0f} drops, {:.0f} misses, {} clock steps (largest {:.1f} ms)",
-		             state, ppm_, err_ms, margin_us_ / 1000, wait_ms, lead_us_ / 1000.0, rate_drops,
-		             rate_misses, steps, largest_step_us / 1000);
+		             state, ppm_, err_ms, margin_us_ / 1000, wait_ms, lead_us_ / 1000.0, lat_p50_ms,
+		             lat_p99_ms, lat_max_ms, target_lat_us_ / 1000, rate_drops, rate_misses, steps,
+		             largest_step_us / 1000);
+	}
+
+	if (dump_) {
+		fprintf(dump_, "T %llu %.0f %d %.0f %.0f %u %.0f\n", (unsigned long long)now_us, target_lat_us_, ppm_,
+		        err_ms * 1000, margin_us_, lead_us_, ff_valid_ ? ff_ppm_ : 0.0);
+		fflush(dump_);
 	}
 
 	void *batch = osd_batch_init(9);

@@ -2,6 +2,7 @@
 #define VSYNC_LOCK_H
 
 #include <cstdint>
+#include <cstdio>
 #include <mutex>
 
 // --vsync-lock: paced page flips, and the display phase locked to the video.
@@ -78,6 +79,17 @@ public:
 
 	double period_us() const { return period_us_; }
 	unsigned lead_us() const { return lead_us_; }
+
+	// --vsync-lock-dump: every frame, vblank and controller tick as a line
+	// of text, to work the controller out from a flight. The path goes
+	// through strftime, so each run gets its own file. Lines (times in us):
+	//   F <ready> <capture as mapped> <capture, steps taken out>
+	//   V <vblank seq> <vblank> <capture of the frame it showed, 0: repeat>
+	//   T <now> <target latency> <ppm> <phase error> <margin> <lead> <feed-forward ppm>
+	void open_dump(const char *path_template);
+	// Display thread: the vblank showed the frame captured at capture_us
+	// (frame_ready()'s; 0 if no new frame went out).
+	void dump_vblank(uint32_t seq, uint64_t vblank_us, uint64_t capture_us);
 
 private:
 	struct Sample {
@@ -161,6 +173,7 @@ private:
 	uint64_t last_tick_us_ = 0;
 	unsigned last_ratio_ = 0;
 	int summary_ticks_ = 0;  // ticks since the last logged summary
+	FILE *dump_ = nullptr;
 };
 
 #endif
