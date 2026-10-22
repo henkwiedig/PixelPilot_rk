@@ -177,12 +177,14 @@ void VsyncLock::dump_vblank(uint32_t seq, uint64_t vblank_us, uint64_t capture_u
 		        (unsigned long long)capture_us);
 }
 
-uint64_t VsyncLock::frame_ready(uint64_t t_us, uint64_t capture_us) {
+uint64_t VsyncLock::frame_ready(uint64_t t_us, uint64_t capture_us, uint64_t rx_done_us,
+                                uint64_t fed_us, uint32_t bytes) {
 	std::lock_guard<std::mutex> lk(mutex_);
 	const uint64_t stable_us = stable_capture(capture_us, t_us);
 	if (dump_)
-		fprintf(dump_, "F %llu %llu %llu\n", (unsigned long long)t_us, (unsigned long long)capture_us,
-		        (unsigned long long)stable_us);
+		fprintf(dump_, "F %llu %llu %llu %llu %llu %u\n", (unsigned long long)t_us,
+		        (unsigned long long)capture_us, (unsigned long long)stable_us,
+		        (unsigned long long)rx_done_us, (unsigned long long)fed_us, bytes);
 	if (!vblank_known())
 		return stable_us;
 	double phase = std::fmod((double)(int64_t)(t_us - last_vbl_us_), period_us_);
