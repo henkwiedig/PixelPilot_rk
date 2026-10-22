@@ -51,8 +51,10 @@ public:
 	// Frame thread: a decoded frame was handed to the display at t_us;
 	// capture_us is its capture time on this clock, 0 if unknown. Returns
 	// the capture time with the clock mapping's steps taken out, for
-	// due_us() (0 if unknown).
-	uint64_t frame_ready(uint64_t t_us, uint64_t capture_us);
+	// due_us() (0 if unknown). rx_done_us, fed_us and bytes only go to the
+	// dump (0 if unknown).
+	uint64_t frame_ready(uint64_t t_us, uint64_t capture_us, uint64_t rx_done_us = 0,
+	                     uint64_t fed_us = 0, uint32_t bytes = 0);
 	// Frame thread: the display never showed a frame (a newer one replaced it
 	// before its commit).
 	void frame_dropped();
@@ -83,7 +85,8 @@ public:
 	// --vsync-lock-dump: every frame, vblank and controller tick as a line
 	// of text, to work the controller out from a flight. The path goes
 	// through strftime, so each run gets its own file. Lines (times in us):
-	//   F <ready> <capture as mapped> <capture, steps taken out>
+	//   F <ready> <capture as mapped> <capture, steps taken out> <frame
+	//     complete in rx> <fed to the decoder> <access unit bytes>
 	//   V <vblank seq> <vblank> <capture of the frame it showed, 0: repeat>
 	//   T <now> <target latency> <ppm> <phase error> <margin> <lead> <feed-forward ppm>
 	void open_dump(const char *path_template);

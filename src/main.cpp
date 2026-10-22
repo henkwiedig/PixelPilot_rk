@@ -113,6 +113,7 @@ struct FrameTiming {
 	uint64_t pts_us;       // fed to the decoder (also the MPP pts)
 	uint64_t decoded_us;   // decode_get_frame() handed the frame out
 	struct timing_sei_v1 sei;
+	uint32_t size;         // the access unit, bytes
 };
 static const int kFrameTimingSlots = 32;   // well above any decoder queue depth
 static FrameTiming frame_timing[kFrameTimingSlots];
@@ -135,9 +136,9 @@ static int paced_head, paced_count;
 
 // Round robin: the oldest entry is overwritten, which only ever loses the
 // timing of a frame the decoder dropped anyway.
-static void frame_timing_store(uint64_t pts_us, const struct timing_sei_v1 &sei) {
+static void frame_timing_store(uint64_t pts_us, const struct timing_sei_v1 &sei, uint32_t size) {
 	std::lock_guard<std::mutex> lk(frame_timing_mutex);
-	frame_timing[frame_timing_next] = {pts_us, 0, sei};
+	frame_timing[frame_timing_next] = {pts_us, 0, sei, size};
 	frame_timing_next = (frame_timing_next + 1) % kFrameTimingSlots;
 }
 
@@ -574,7 +575,9 @@ void *__FRAME_THREAD__(void *param)
 					// send DRM FB to display thread
 					const uint64_t capture_us = !vsync_lock_mode ? 0 :
 						vsync_lock.frame_ready((uint64_t)ats.tv_sec * 1000000 + ats.tv_nsec / 1000,
-						                       timing.pts_us ? timing.sei.capture_ground_us : 0);
+						                       timing.pts_us ? timing.sei.capture_ground_us : 0,
+						                       timing.pts_us ? timing.sei.rx_done_ground_us : 0,
+						                       timing.pts_us, timing.pts_us ? timing.size : 0);
 					ret = pthread_mutex_lock(&video_mutex);
 					assert(!ret);
 					if (vsync_lock_mode) {
@@ -1692,7 +1695,7 @@ void read_gstreamerpipe_stream(MppPacket *packet, int gst_udp_port, const char *
         struct timing_sei_v1 sei;
         if (timing_sei_parse(frame->data(), (uint32_t)frame->size(), &sei) &&
             (sei.flags & TIMING_SEI_FLAG_SYNC_VALID))
-            frame_timing_store(pts_us, sei);
+            frame_timing_store(pts_us, sei, (uint32_t)frame->size());
         const bool fed_ok = feed_packet_to_decoder(packet,frame->data(),frame->size(),pts_us);
         if (!fed_ok) {
             stall_count++;
