@@ -112,15 +112,8 @@ set(LIB_SOURCE_FILES
         src/osd.cpp
         src/os_mon.hpp
         src/os_mon.cpp
-        src/osd_gl.cpp
         src/dvr.h
         src/dvr.cpp
-        src/mpp_encoder.h
-        src/mpp_encoder.cpp
-        src/frame_processor.h
-        src/frame_processor.cpp
-        src/frame_colorcorrect.h
-        src/frame_colorcorrect.cpp
         src/mavlink.h
         src/mavlink.c
         src/wfbcli.hpp
@@ -134,6 +127,32 @@ set(LIB_SOURCE_FILES
         src/timing_sei.c
         src/vsync_lock.h
         src/vsync_lock.cpp)
+
+# The video platform:
+#  rockchip  MPP decoder and encoder, RGA, the Mali GPU (the default)
+#  v4l2      a stateful V4L2 memory-to-memory codec (wave5 on the Artosyn
+#            AR9311) and plain DRM/KMS, no GPU
+set(PIXELPILOT_PLATFORM "rockchip" CACHE STRING "Video platform: rockchip or v4l2")
+set_property(CACHE PIXELPILOT_PLATFORM PROPERTY STRINGS rockchip v4l2)
+if(PIXELPILOT_PLATFORM STREQUAL "v4l2")
+  add_compile_definitions(PIXELPILOT_V4L2)
+  list(APPEND LIB_SOURCE_FILES
+        src/v4l2_decoder.h
+        src/v4l2_decoder.cpp
+        src/v4l2_encoder.h
+        src/v4l2_encoder.cpp)
+elseif(PIXELPILOT_PLATFORM STREQUAL "rockchip")
+  list(APPEND LIB_SOURCE_FILES
+        src/osd_gl.cpp
+        src/mpp_encoder.h
+        src/mpp_encoder.cpp
+        src/frame_processor.h
+        src/frame_processor.cpp
+        src/frame_colorcorrect.h
+        src/frame_colorcorrect.cpp)
+else()
+  message(FATAL_ERROR "PIXELPILOT_PLATFORM must be rockchip or v4l2, not ${PIXELPILOT_PLATFORM}")
+endif()
 set(SOURCE_FILES
   ${LIB_SOURCE_FILES}
   src/main.cpp
@@ -155,8 +174,10 @@ else()
   pkg_check_modules(LIBGPIOD REQUIRED libgpiod)
   include_directories(${LIBGPIOD_INCLUDE_DIR})
 
-  find_path(RGA_INCLUDE_DIRS NAMES rga.h rga/rga.h)
-  find_library(RGA_LIBRARIES NAMES rga librga)
+  if(PIXELPILOT_PLATFORM STREQUAL "rockchip")
+    find_path(RGA_INCLUDE_DIRS NAMES rga.h rga/rga.h)
+    find_library(RGA_LIBRARIES NAMES rga librga)
+  endif()
   
   # GStreamer setup
   find_package(PkgConfig REQUIRED)
@@ -180,7 +201,6 @@ else()
   )
   
   target_link_libraries(${PROJECT_NAME}
-      rockchip_mpp
       pthread
       drm
       m
@@ -196,9 +216,10 @@ else()
       PkgConfig::gstreamer-app
       PkgConfig::gstnet
       PkgConfig::gio
-      ${RGA_LIBRARIES}
-      EGL GLESv2 gbm
   )
+  if(PIXELPILOT_PLATFORM STREQUAL "rockchip")
+    target_link_libraries(${PROJECT_NAME} rockchip_mpp ${RGA_LIBRARIES} EGL GLESv2 gbm)
+  endif()
 endif()
 
 if(CMAKE_BUILD_TYPE MATCHES "Debug")

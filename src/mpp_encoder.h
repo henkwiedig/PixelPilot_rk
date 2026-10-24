@@ -12,15 +12,9 @@
 #include <rockchip/rk_mpi.h>
 
 #include "gstrtpreceiver.h"
+#include "encoder_params.h"
 
-enum class EncResolution { Res720p = 0, Res1080p = 1 };
-
-struct MppEncoderParams {
-    VideoCodec codec = VideoCodec::H264;
-    int fps = 30;
-    int bitrate_kbps = 8000;
-    EncResolution resolution = EncResolution::Res1080p;
-};
+typedef EncoderParams MppEncoderParams;
 
 struct EncRpc {
     enum {

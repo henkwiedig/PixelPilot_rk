@@ -25,6 +25,23 @@
 #include <cstdint>
 #include <string>
 
+#ifdef PIXELPILOT_V4L2
+extern "C" {
+#include "drm.h"
+}
+
+// No GPU on this platform: the OSD goes out as LVGL renders it, without the
+// inverse colortrans pass.
+class OsdGl {
+public:
+    bool init(int, uint32_t, uint32_t, float, float) { return true; }
+    void set_params(float, float) {}
+    uint32_t process(struct modeset_buf *) { return 0; }
+    bool ready() const { return false; }
+    void deinit() {}
+};
+#else
+
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
@@ -103,3 +120,5 @@ private:
     PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES_{nullptr};
     PFNEGLGETPLATFORMDISPLAYEXTPROC eglGetPlatformDisplayEXT_{nullptr};
 };
+
+#endif // PIXELPILOT_V4L2

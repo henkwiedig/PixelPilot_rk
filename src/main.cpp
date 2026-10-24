@@ -29,15 +29,19 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <sys/mman.h>
+#ifndef PIXELPILOT_V4L2
 #include <rga/im2d.h>
 #include <rga/rga.h>
+#endif
 
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #include <drm_fourcc.h>
 #include <linux/videodev2.h>
 #include <linux/dma-buf.h>
+#ifndef PIXELPILOT_V4L2
 #include <rockchip/rk_mpi.h>
+#endif
 #include <nlohmann/json.hpp>
 #include <yaml-cpp/yaml.h>
 #include "spdlog/spdlog.h"
@@ -57,9 +61,11 @@ extern "C" {
 #include "osd.hpp"
 #include "wfbcli.hpp"
 #include "dvr.h"
-#include "mpp_encoder.h"
-#include "frame_processor.h"
+#include "video_encoder.h"
 #include "gstrtpreceiver.h"
+#ifdef PIXELPILOT_V4L2
+#include "v4l2_decoder.h"
+#endif
 #include "scheduling_helper.hpp"
 #include "time_util.h"
 #include "timing_sei.h"
@@ -82,6 +88,11 @@ YAML::Node config;
 
 #define MSG_FIFO_NAME "/run/pixelpilot.msg"
 
+#ifdef PIXELPILOT_V4L2
+// The decoder. Its frame buffers are the display's (see v4l2_decoder.h).
+static V4l2Decoder *v4l2_dec = nullptr;
+typedef void *DecoderPacket;
+#else
 struct {
 	MppCtx		  ctx;
 	MppApi		  *mpi;
@@ -95,6 +106,8 @@ struct {
 		uint32_t handle;
 	} frame_to_drm[MAX_FRAMES];
 } mpi;
+typedef MppPacket DecoderPacket;
+#endif
 
 struct timespec frame_stats[1000];
 
@@ -160,7 +173,9 @@ extern bool osd_update_ready;
 extern bool gsmenu_enabled;
 int video_zpos = 1;
 
+#ifndef PIXELPILOT_V4L2
 void set_mpp_decoding_parameters(MppApi * mpi, MppCtx ctx);
+#endif
 static pthread_mutex_t mpp_reinit_mutex = PTHREAD_MUTEX_INITIALIZER;
 static std::atomic<bool> mpp_reinit_pending{false};
 
@@ -194,8 +209,8 @@ char* dvr_template = NULL;
 // Both DVR paths are now recorded in-pipeline by the receiver (raw off the RTP
 // tee; re-encode via an appsrc fed by the MPP encoder below), each muxed with
 // Opus via splitmuxsink. The minimp4 Dvr is retired.
-MppEncoder *reencoder = NULL;
-MppEncoderParams reenc_params;
+VideoEncoder *reencoder = NULL;
+EncoderParams reenc_params;
 DvrMode dvr_mode = DVR_MODE_RAW;
 bool dvr_osd   = false;
 static int video_framerate = -1;
@@ -301,6 +316,10 @@ static bool front_buffer_alloc(uint32_t width, uint32_t height, uint32_t hor_str
 // copy finished -- from then on the frame is on the glass, wherever the
 // raster is -- or 0 on failure.
 static uint64_t front_buffer_show(int src_fd) {
+#ifdef PIXELPILOT_V4L2
+	(void)src_fd;
+	return 0;   // no copy engine: --front-buffer is off on this platform
+#else
 	rga_buffer_t src = wrapbuffer_fd_t(src_fd, output_list->video_frm_width, output_list->video_frm_height,
 	                                   decoded_hor_stride, decoded_ver_stride, RK_FORMAT_YCbCr_420_SP);
 	rga_buffer_t dst = wrapbuffer_fd_t(front_buf.prime_fd, output_list->video_frm_width,
@@ -315,8 +334,21 @@ static uint64_t front_buffer_show(int src_fd) {
 		return 0;
 	}
 	return get_time_us();
+#endif
 }
 
+// A frame that a video frame was just flipped to: the decoder may get the
+// ones before it back (v4l2_decoder.h). MPP recycles its own.
+static inline void video_frame_shown(int fb_id) {
+#ifdef PIXELPILOT_V4L2
+	if (v4l2_dec && fb_id)
+		v4l2_dec->shown((uint32_t)fb_id);
+#else
+	(void)fb_id;
+#endif
+}
+
+#ifndef PIXELPILOT_V4L2
 void init_buffer(MppFrame frame) {
 	output_list->video_frm_width = mpp_frame_get_width(frame);
 	output_list->video_frm_height = mpp_frame_get_height(frame);
@@ -450,7 +482,213 @@ void init_buffer(MppFrame frame) {
 	// Both recorders take their dimensions/codec straight from the parsed
 	// elementary stream (h26xparse -> mp4mux), so no explicit video params here.
 }
+#endif // !PIXELPILOT_V4L2
 
+// Hands a decoded frame to the display thread -- or, with --front-buffer,
+// copies it (from src_fd) into the scanned-out buffer right away. ats: when
+// the decoder handed the frame out; feed_data_ts: its pts, when it was fed.
+static void display_decoded_frame(int fb_id, int src_fd, uint64_t feed_data_ts, const struct timespec &ats)
+{
+	int ret;
+	FrameTiming timing;
+	if (frame_timing_take(feed_data_ts, &timing))
+		timing.decoded_us = (uint64_t)ats.tv_sec * 1000000 + ats.tv_nsec / 1000;
+	else
+		timing.pts_us = 0;
+
+	if (front_buffer_mode) {
+		// Copy straight into the scanned-out buffer, before the
+		// decoder gets this buffer back.
+		uint64_t shown_us = front_buffer_show(src_fd);
+		if (shown_us) {
+			if (timing.pts_us) publish_latency_facts(timing, shown_us);
+			osd_publish_uint_fact("video.displayed_frame", NULL, 0, 1);
+			osd_publish_uint_fact("video.decode_and_handover_ms", NULL, 0,
+			                      (shown_us - feed_data_ts) / 1000);
+		}
+		ret = pthread_mutex_lock(&video_mutex);
+		assert(!ret);
+		front_frame_ready = true;
+		ret = pthread_cond_signal(&video_cond);
+		assert(!ret);
+		ret = pthread_mutex_unlock(&video_mutex);
+		assert(!ret);
+		return;
+	}
+
+	// send DRM FB to display thread
+	const uint64_t capture_us = !vsync_lock_mode ? 0 :
+		vsync_lock.frame_ready((uint64_t)ats.tv_sec * 1000000 + ats.tv_nsec / 1000,
+		                       timing.pts_us ? timing.sei.capture_ground_us : 0,
+		                       timing.pts_us ? timing.sei.rx_done_ground_us : 0,
+		                       timing.pts_us, timing.pts_us ? timing.size : 0);
+	ret = pthread_mutex_lock(&video_mutex);
+	assert(!ret);
+	if (vsync_lock_mode) {
+		if (paced_count == kPacedFrames) {
+			paced_head = (paced_head + 1) % kPacedFrames;
+			paced_count--;
+			vsync_lock.frame_dropped();
+		}
+		paced_frames[(paced_head + paced_count) % kPacedFrames] = {
+			fb_id, feed_data_ts, timing, capture_us};
+		paced_count++;
+	} else {
+		output_list->video_fb_id = fb_id;
+		output_list->decoding_pts = feed_data_ts;
+		timing_for_display = timing;
+	}
+	ret = pthread_cond_signal(&video_cond);
+	assert(!ret);
+	ret = pthread_mutex_unlock(&video_mutex);
+	assert(!ret);
+}
+
+// Decoder error/discard rates over time: these are otherwise completely
+// silent unless they escalate to an (independently rate-limited) IDR
+// request, but a storm of them is exactly the "poor-link period" signal that
+// has correlated with rare RGA/GPU frame-conversion hiccups downstream --
+// worth having in the log to line up against any later "frame conversion
+// failed" error.
+static void count_decoder_health(bool errinfo, bool discard, const struct timespec &ats)
+{
+	static uint64_t win_errinfo = 0, win_discard = 0, win_frames = 0;
+	static time_t win_start = 0;
+	win_frames++;
+	if (errinfo) win_errinfo++;
+	if (discard) win_discard++;
+	if (win_start == 0) win_start = ats.tv_sec;
+	if (ats.tv_sec - win_start >= 5) {
+		if (win_errinfo || win_discard) {
+			spdlog::warn("Decoder health: {} frames, errinfo={} discard={} in last {}s",
+			             win_frames, win_errinfo, win_discard, ats.tv_sec - win_start);
+		}
+		win_errinfo = win_discard = win_frames = 0;
+		win_start = ats.tv_sec;
+	}
+}
+
+#ifdef PIXELPILOT_V4L2
+extern int signal_flag;
+
+// Frames from the old decoder buffers must not be flipped to any more: their
+// framebuffers are about to go.
+static void forget_pending_frames()
+{
+	int ret = pthread_mutex_lock(&video_mutex);
+	assert(!ret);
+	output_list->video_fb_id = 0;
+	timing_for_display.pts_us = 0;
+	paced_head = paced_count = 0;
+	ret = pthread_mutex_unlock(&video_mutex);
+	assert(!ret);
+}
+
+// New decoder buffers (a new stream, or new dimensions): puts the video
+// plane on the new geometry.
+static void init_v4l2_buffers(const V4l2Decoder::Frame &fmt)
+{
+	output_list->video_frm_width = fmt.width;
+	output_list->video_frm_height = fmt.height;
+	decoded_hor_stride = fmt.stride;
+	decoded_ver_stride = fmt.plane_height;
+	spdlog::info("Frame info changed {}({})x{}({})", fmt.width, fmt.stride, fmt.height, fmt.plane_height);
+
+	output_list->video_fb_x = 0;
+	output_list->video_fb_y = 0;
+	output_list->video_fb_width = output_list->mode.hdisplay;
+	output_list->video_fb_height = output_list->mode.vdisplay;
+
+	osd_publish_uint_fact("video.width", NULL, 0, output_list->video_frm_width);
+	osd_publish_uint_fact("video.height", NULL, 0, output_list->video_frm_height);
+
+	// Black until the first frame is flipped to: the new buffers hold
+	// nothing yet. The display thread has its own request in use.
+	const uint32_t first_fb = output_list->black_video_fb ? output_list->black_video_fb : fmt.fb_id;
+	drmModeAtomicReq *req = drmModeAtomicAlloc();
+	int ret = modeset_perform_modeset(drm_fd, output_list, req, &output_list->video_plane, first_fb,
+	                                  output_list->video_frm_width, output_list->video_frm_height, video_zpos);
+	drmModeAtomicFree(req);
+	if (ret < 0)
+		spdlog::error("Video plane: no mode for {}x{}", fmt.width, fmt.height);
+}
+
+// __FRAME_THREAD__
+//
+// - takes the decoder's frames as they come out and hands them to the
+//   display thread (and the DVR re-encoder)
+// - on a new stream format, has the decoder reallocate its frame buffers
+
+void *__FRAME_THREAD__(void *param)
+{
+	SchedulingHelper::set_thread_params_max_realtime("FRAME_THREAD",SchedulingHelper::PRIORITY_REALTIME_MID);
+	pthread_setname_np(pthread_self(), "__FRAME");
+	int idle_after_stop = 0;
+
+	while (!frm_eos) {
+		pthread_mutex_lock(&mpp_reinit_mutex);
+		if (mpp_reinit_pending.load(std::memory_order_acquire) || !v4l2_dec->is_open()) {
+			// Decoder is being reinitialized — release lock and wait
+			pthread_mutex_unlock(&mpp_reinit_mutex);
+			if (signal_flag)
+				break;
+			usleep(5000);
+			continue;
+		}
+		V4l2Decoder::Frame f;
+		const V4l2Decoder::Result r = v4l2_dec->next(&f, 100);
+		struct timespec ats;
+		clock_gettime(CLOCK_MONOTONIC, &ats);
+		switch (r) {
+		case V4l2Decoder::Result::Frame: {
+			static uint64_t stat_start_us, stat_frames;
+			const uint64_t now_us = (uint64_t)ats.tv_sec * 1000000 + ats.tv_nsec / 1000;
+			stat_frames++;
+			if (!stat_start_us)
+				stat_start_us = now_us;
+			if (now_us - stat_start_us >= 5000000) {
+				spdlog::debug("V4L2 decoder: {:.1f} fps, decode {} us after feeding",
+				              stat_frames * 1e6 / (now_us - stat_start_us), now_us - f.pts_us);
+				stat_frames = 0;
+				stat_start_us = now_us;
+			}
+			}
+			idr_notify_decoded_frame();
+			if (f.error)
+				idr_request_decoder_issue("decoder-errinfo");
+			count_decoder_health(f.error, false, ats);
+			display_decoded_frame((int)f.fb_id, f.dmabuf_fd, f.pts_us, ats);
+			if (frame_proc != nullptr)
+				frame_proc->push_latest(v4l2_dec, f);
+			break;
+		case V4l2Decoder::Result::FormatChanged:
+			forget_pending_frames();
+			if (frame_proc) frame_proc->drain_decoder_refs();
+			if (v4l2_dec->reconfigure())
+				init_v4l2_buffers(v4l2_dec->format());
+			break;
+		case V4l2Decoder::Result::Eos:
+			frm_eos = 1;
+			break;
+		case V4l2Decoder::Result::Timeout:
+			// No end-of-stream comes from a decoder that never saw a picture.
+			if (signal_flag && ++idle_after_stop >= 10)
+				frm_eos = 1;
+			break;
+		case V4l2Decoder::Result::Error:
+			if (signal_flag)
+				frm_eos = 1;
+			pthread_mutex_unlock(&mpp_reinit_mutex);
+			usleep(10000);
+			continue;
+		}
+		pthread_mutex_unlock(&mpp_reinit_mutex);
+	}
+	frm_eos = 1;
+	spdlog::info("Frame thread done.");
+	return nullptr;
+}
+#else
 // __FRAME_THREAD__
 //
 // - allocate DRM buffers and DRM FB based on frame size
@@ -507,28 +745,7 @@ void *__FRAME_THREAD__(void *param)
 					}
 					idr_request_decoder_issue(reason);
 				}
-
-				// Track decoder error/discard rates over time: these are
-				// otherwise completely silent unless they escalate to an
-				// (independently rate-limited) IDR request, but a storm of
-				// them is exactly the "poor-link period" signal that has
-				// correlated with rare RGA/GPU frame-conversion hiccups
-				// downstream -- worth having in the log to line up against
-				// any later "frame conversion failed" error.
-				static uint64_t win_errinfo = 0, win_discard = 0, win_frames = 0;
-				static time_t win_start = 0;
-				win_frames++;
-				if (errinfo) win_errinfo++;
-				if (discard) win_discard++;
-				if (win_start == 0) win_start = ats.tv_sec;
-				if (ats.tv_sec - win_start >= 5) {
-					if (win_errinfo || win_discard) {
-						spdlog::warn("Decoder health: {} frames, errinfo={} discard={} in last {}s",
-						             win_frames, win_errinfo, win_discard, ats.tv_sec - win_start);
-					}
-					win_errinfo = win_discard = win_frames = 0;
-					win_start = ats.tv_sec;
-				}
+				count_decoder_health(errinfo, discard, ats);
 				if (!mpi.first_frame_ts.tv_sec) {
 					ts = ats;
 					mpi.first_frame_ts = ats;
@@ -538,11 +755,6 @@ void *__FRAME_THREAD__(void *param)
 				if (buffer && !discard) {
 					output_list->video_poc = mpp_frame_get_poc(frame);
 					uint64_t feed_data_ts =  mpp_frame_get_pts(frame);
-					FrameTiming timing;
-					if (frame_timing_take(feed_data_ts, &timing))
-						timing.decoded_us = (uint64_t)ats.tv_sec * 1000000 + ats.tv_nsec / 1000;
-					else
-						timing.pts_us = 0;
 
 					MppBufferInfo info;
 					ret = mpp_buffer_info_get(buffer, &info);
@@ -554,52 +766,9 @@ void *__FRAME_THREAD__(void *param)
 
 					ts = ats;
 
-					if (front_buffer_mode) {
-						// Copy straight into the scanned-out buffer, before the
-						// decoder gets this buffer back (mpp_frame_deinit below).
-						uint64_t shown_us = front_buffer_show(info.fd);
-						if (shown_us) {
-							if (timing.pts_us) publish_latency_facts(timing, shown_us);
-							osd_publish_uint_fact("video.displayed_frame", NULL, 0, 1);
-							osd_publish_uint_fact("video.decode_and_handover_ms", NULL, 0,
-							                      (shown_us - feed_data_ts) / 1000);
-						}
-						ret = pthread_mutex_lock(&video_mutex);
-						assert(!ret);
-						front_frame_ready = true;
-						ret = pthread_cond_signal(&video_cond);
-						assert(!ret);
-						ret = pthread_mutex_unlock(&video_mutex);
-						assert(!ret);
-					} else {
-					// send DRM FB to display thread
-					const uint64_t capture_us = !vsync_lock_mode ? 0 :
-						vsync_lock.frame_ready((uint64_t)ats.tv_sec * 1000000 + ats.tv_nsec / 1000,
-						                       timing.pts_us ? timing.sei.capture_ground_us : 0,
-						                       timing.pts_us ? timing.sei.rx_done_ground_us : 0,
-						                       timing.pts_us, timing.pts_us ? timing.size : 0);
-					ret = pthread_mutex_lock(&video_mutex);
-					assert(!ret);
-					if (vsync_lock_mode) {
-						if (paced_count == kPacedFrames) {
-							paced_head = (paced_head + 1) % kPacedFrames;
-							paced_count--;
-							vsync_lock.frame_dropped();
-						}
-						paced_frames[(paced_head + paced_count) % kPacedFrames] = {
-							(int)mpi.frame_to_drm[i].fb_id, feed_data_ts, timing, capture_us};
-						paced_count++;
-					} else {
-					output_list->video_fb_id = mpi.frame_to_drm[i].fb_id;
-                    //output_list->video_fb_index=i;
-                    output_list->decoding_pts=feed_data_ts;
-					timing_for_display = timing;
-					}
-					ret = pthread_cond_signal(&video_cond);
-					assert(!ret);
-					ret = pthread_mutex_unlock(&video_mutex);
-					assert(!ret);
-					}
+					// --front-buffer copies before the decoder gets this
+					// buffer back (mpp_frame_deinit below).
+					display_decoded_frame((int)mpi.frame_to_drm[i].fb_id, info.fd, feed_data_ts, ats);
 
 					if (frame_proc != nullptr &&
 					    decoded_hor_stride > 0 && decoded_ver_stride > 0) {
@@ -623,6 +792,7 @@ void *__FRAME_THREAD__(void *param)
 	spdlog::info("Frame thread done.");
 	return nullptr;
 }
+#endif // PIXELPILOT_V4L2
 
 
 // A page flip carrying a frame with timing (see FrameTiming): the flip
@@ -911,6 +1081,8 @@ static void display_loop_immediate() {
 		unlock_osd_plane();
 		if (commit_ret)
 			report_commit_error(commit_ret, flags);
+		else
+			video_frame_shown(fb_id);
 		// A blocking commit has already flipped, so its event is waiting; a
 		// NONBLOCK one (--disable-vsync) must not be waited for here -- its
 		// event is picked up on a later pass, with its own timestamp.
@@ -1045,6 +1217,7 @@ static void display_loop_paced() {
 		}
 		drain_flip_events(50);
 		unlock_osd_plane();
+		video_frame_shown(fb_id);
 		if (flip_seen) {
 			vsync_lock.dump_vblank(flip_seq, flip_us, shown.capture_us);
 			vsync_lock.vblank(flip_seq, flip_us);
@@ -1209,7 +1382,7 @@ void sigusr2_handler(int signum) {
 // Shutdown helper for the re-encode pipeline (frame pacer + encoder) teardown.
 struct DvrShutdownCtx {
     FrameProcessor *p;
-    MppEncoder   *e;
+    VideoEncoder *e;
     pthread_t     tp, te;
 };
 
@@ -1355,7 +1528,7 @@ extern "C" {
         if (old_has_reenc && !new_has_reenc) {
             if (receiver) receiver->dvr_reenc_request_recording(false);
             FrameProcessor *p  = frame_proc;
-            MppEncoder     *e  = reencoder;
+            VideoEncoder   *e  = reencoder;
             pthread_t       tp = g_tid_fproc;
             pthread_t       te = g_tid_enc;
             frame_proc      = nullptr;
@@ -1379,11 +1552,11 @@ extern "C" {
         // Create encoder pipeline if newly needed. The re-encoded NALs are muxed
         // (with Opus) by the receiver's reenc recorder, not a minimp4 Dvr.
         if (new_has_reenc && !reencoder && dvr_template) {
-            reencoder = new MppEncoder(reenc_params,
+            reencoder = new VideoEncoder(reenc_params,
                              [](std::shared_ptr<std::vector<uint8_t>> nal) {
                                  if (dvr_enabled && receiver) receiver->dvr_reenc_push(nal);
                              });
-            pthread_create(&g_tid_enc, NULL, &MppEncoder::__THREAD__, reencoder);
+            pthread_create(&g_tid_enc, NULL, &VideoEncoder::__THREAD__, reencoder);
             frame_proc = new FrameProcessor(reencoder, reenc_params.fps, reenc_params.resolution, drm_fd,
                                            dvr_reenc_on_fatal_error);
             if (enable_live_colortrans)
@@ -1408,7 +1581,27 @@ int decoder_stalled_count=0;
 // pts_us is when the packet is fed, CLOCK_MONOTONIC microseconds, and
 // unique per packet: it comes back out on the decoded frame, where it both
 // measures decode + handover and finds the frame's timing SEI again.
-bool feed_packet_to_decoder(MppPacket *packet,void* data_p,int data_len,uint64_t pts_us){
+#ifdef PIXELPILOT_V4L2
+// Feeding and a decoder reinit (a codec switch, from the receiver's or the
+// menu's thread) exclude each other; the frame thread is not involved.
+static std::mutex v4l2_feed_mutex;
+
+bool feed_packet_to_decoder(DecoderPacket *packet,void* data_p,int data_len,uint64_t pts_us){
+    (void)packet;
+    std::lock_guard<std::mutex> lk(v4l2_feed_mutex);
+    const uint64_t data_feed_begin = get_time_ms();
+    const bool ok = v4l2_dec->feed((const uint8_t *)data_p, (size_t)data_len, pts_us, 100);
+    const uint64_t elapsed = get_time_ms() - data_feed_begin;
+    if (elapsed > 2)
+        osd_publish_uint_fact("video.decoder_feed_time_ms", NULL, 0, elapsed);
+    if (!ok) {
+        decoder_stalled_count++;
+        spdlog::warn("Cannot feed decoder, stalled {} ?", decoder_stalled_count);
+    }
+    return ok;
+}
+#else
+bool feed_packet_to_decoder(DecoderPacket *packet,void* data_p,int data_len,uint64_t pts_us){
     mpp_packet_set_data(packet, data_p);
     mpp_packet_set_size(packet, data_len);
     mpp_packet_set_pos(packet, data_p);
@@ -1430,6 +1623,7 @@ bool feed_packet_to_decoder(MppPacket *packet,void* data_p,int data_len,uint64_t
     }
     return true;
 }
+#endif
 
 // Runtime audio on/off for the OSD menu (System -> Receiver -> Audio).
 extern "C" {
@@ -1447,6 +1641,42 @@ extern "C" {
 	}
 }
 
+#ifdef PIXELPILOT_V4L2
+static VideoCodec stream_codec = VideoCodec::H265;
+
+static void reinit_v4l2_decoder(VideoCodec new_codec) {
+    if (new_codec != VideoCodec::H264) new_codec = VideoCodec::H265;
+    if (v4l2_dec->is_open() && v4l2_dec->codec() == new_codec) return;
+    spdlog::info("Reinitializing V4L2 decoder: {} -> {}",
+                 v4l2_dec->codec() == VideoCodec::H264 ? "H.264" : "H.265",
+                 new_codec == VideoCodec::H264 ? "H.264" : "H.265");
+    // Signal frame thread to release the lock, then acquire it
+    mpp_reinit_pending.store(true, std::memory_order_release);
+    pthread_mutex_lock(&mpp_reinit_mutex);
+    {
+        std::lock_guard<std::mutex> lk(v4l2_feed_mutex);
+        forget_pending_frames();
+        if (frame_proc) frame_proc->drain_decoder_refs();
+        v4l2_dec->close();
+        if (!v4l2_dec->open(new_codec))
+            spdlog::error("V4L2 decoder: cannot reopen for {}", new_codec == VideoCodec::H264 ? "H.264" : "H.265");
+    }
+    mpp_reinit_pending.store(false, std::memory_order_release);
+    pthread_mutex_unlock(&mpp_reinit_mutex);
+}
+
+void switch_pipeline_source(const char * source_type, const char * source_path) {
+    if (strcmp(source_type, "file") == 0) {
+        VideoCodec file_codec = receiver->switch_to_file_playback(source_path);
+        reinit_v4l2_decoder(file_codec);
+    } else if (strcmp(source_type, "stream") == 0) {
+        receiver->switch_to_stream();
+        reinit_v4l2_decoder(stream_codec);
+    } else {
+        spdlog::error("Unknown source type: {}", source_type);
+    }
+}
+#else
 static MppCodingType current_mpp_type = MPP_VIDEO_CodingHEVC;
 static MppCodingType stream_mpp_type  = MPP_VIDEO_CodingHEVC;
 
@@ -1491,6 +1721,7 @@ void switch_pipeline_source(const char * source_type, const char * source_path) 
         spdlog::error("Unknown source type: {}", source_type);
     }
 }
+#endif
 
 void fast_forward(double rate){ 
         receiver->fast_forward();
@@ -1656,7 +1887,7 @@ static void publish_codec_fact(VideoCodec c) {
 	                      (c == VideoCodec::H265) ? 1u : 0u);
 }
 
-void read_gstreamerpipe_stream(MppPacket *packet, int gst_udp_port, const char *sock ,const VideoCodec& codec){
+void read_gstreamerpipe_stream(DecoderPacket *packet, int gst_udp_port, const char *sock ,const VideoCodec& codec){
 	if (sock) {
 		receiver = std::make_unique<GstRtpReceiver>(sock, codec);
 	} else {
@@ -1666,12 +1897,18 @@ void read_gstreamerpipe_stream(MppPacket *packet, int gst_udp_port, const char *
 	// Realign the MPP decoder whenever the receiver detects a mid-stream codec
 	// switch and rebuilds its pipeline.
 	receiver->set_codec_changed_callback([](VideoCodec c) {
+#ifdef PIXELPILOT_V4L2
+		stream_codec = c;
+		::codec = c;
+		reinit_v4l2_decoder(c);
+#else
 		MppCodingType t = (c == VideoCodec::H265) ? MPP_VIDEO_CodingHEVC : MPP_VIDEO_CodingAVC;
 		stream_mpp_type = t;
 		// Keep the global codec in sync so the decoder info-change handler
 		// (init_buffer) hands the raw DVR the right codec and rolls its file.
 		::codec = c;
 		reinit_mpp_decoder(t);
+#endif
 		publish_codec_fact(c);
 	});
 	long long bytes_received = 0; 
@@ -1732,6 +1969,12 @@ void read_gstreamerpipe_stream(MppPacket *packet, int gst_udp_port, const char *
     main_loop();
     receiver->stop_receiving();
     spdlog::info("Feeding eos");
+#ifdef PIXELPILOT_V4L2
+    {
+        std::lock_guard<std::mutex> lk(v4l2_feed_mutex);
+        v4l2_dec->send_eos();
+    }
+#else
     mpp_packet_set_eos(packet);
     //mpp_packet_set_pos(packet, nal_buffer);
     mpp_packet_set_length(packet, 0);
@@ -1739,9 +1982,11 @@ void read_gstreamerpipe_stream(MppPacket *packet, int gst_udp_port, const char *
     while (MPP_OK != (ret = mpi.mpi->decode_put_packet(mpi.ctx, packet))) {
         usleep(10000);
     }
+#endif
 };
 
 
+#ifndef PIXELPILOT_V4L2
 void set_control_verbose(MppApi * mpi,  MppCtx ctx,MpiCmd control,RK_U32 enable){
     RK_U32 res = mpi->control(ctx, control, &enable);
     if(res){
@@ -1786,6 +2031,7 @@ void set_mpp_decoding_parameters(MppApi * mpi,  MppCtx ctx) {
     int fast_mode = 0;
     set_control_verbose(mpi,ctx,MPP_DEC_SET_PARSER_FAST_MODE,fast_mode);
 }
+#endif
 
 void printHelp() {
   printf(
@@ -2400,6 +2646,17 @@ int main(int argc, char **argv)
 		video_zpos = 4;
 	}
 	
+#ifdef PIXELPILOT_V4L2
+	if (front_buffer_mode) {
+		spdlog::warn("--front-buffer needs a copy engine, not available here: page flips instead");
+		front_buffer_mode = false;
+	}
+	stream_codec = codec == VideoCodec::H264 ? VideoCodec::H264 : VideoCodec::H265;
+	// wave5's frames are I420; the planes are found by format, overlays
+	// first (see MODESET_PREFER_OVERLAYS).
+	const uint32_t video_format = DRM_FORMAT_YUV420;
+	const int modeset_flags = MODESET_PREFER_OVERLAYS;
+#else
 	MppCodingType mpp_type = MPP_VIDEO_CodingHEVC;
 	if(codec==VideoCodec::H264) {
 		mpp_type = MPP_VIDEO_CodingAVC;
@@ -2408,6 +2665,9 @@ int main(int argc, char **argv)
 	stream_mpp_type  = mpp_type;
 	ret = mpp_check_support_format(MPP_CTX_DEC, mpp_type);
 	assert(!ret);
+	const uint32_t video_format = DRM_FORMAT_NV12;
+	const int modeset_flags = 0;
+#endif
 	
 	//////////////////////////////////  DRM SETUP
 	ret = modeset_open(&drm_fd, "/dev/dri/card0");
@@ -2421,7 +2681,7 @@ int main(int argc, char **argv)
 		return 0;
 	}
 
-	output_list = modeset_prepare(drm_fd, mode_width, mode_height, mode_vrefresh, video_plane_id_override, osd_plane_id_override, video_scale_factor);
+	output_list = modeset_prepare(drm_fd, mode_width, mode_height, mode_vrefresh, video_plane_id_override, osd_plane_id_override, video_scale_factor, video_format, modeset_flags);
 	if (!output_list) {
 		fprintf(stderr,
 				"cannot initialize display. Is display connected? Is --screen-mode correct?\n");
@@ -2453,6 +2713,8 @@ int main(int argc, char **argv)
 	// straight-alpha pixels blend over black instead of an empty CRTC.
 	if (modeset_create_black_video(drm_fd, output_list) < 0)
 		spdlog::warn("no-video black backdrop unavailable; OSD may look solid until video starts");
+	else
+		modeset_show_backdrop(drm_fd, output_list);
 
 	gamma_lut_controller_init(&lut_ctrl, drm_fd, output_list);
 
@@ -2463,6 +2725,14 @@ int main(int argc, char **argv)
 	}
 	
 	////////////////////////////////// MPI SETUP
+#ifdef PIXELPILOT_V4L2
+	DecoderPacket packet = nullptr;
+	v4l2_dec = new V4l2Decoder(drm_fd);
+	if (!v4l2_dec->open(stream_codec)) {
+		spdlog::error("No video decoder");
+		return -3;
+	}
+#else
 	MppPacket packet;
 
 	uint8_t* nal_buffer = (uint8_t*)malloc(1024 * 1024);
@@ -2481,6 +2751,7 @@ int main(int argc, char **argv)
 	int param = MPP_POLL_BLOCK;
 	ret = mpi.mpi->control(mpi.ctx, MPP_SET_OUTPUT_BLOCK, &param);
 	assert(!ret);
+#endif
 
 
 	////////////////////////////////// SIGNAL SETUP
@@ -2507,10 +2778,10 @@ int main(int argc, char **argv)
 		// spin up the MPP encoder + frame pacer that feed the reenc recorder; the
 		// encoder output is pushed to the receiver via dvr_reenc_push().
 		if (has_reenc) {
-			reencoder = new MppEncoder(reenc_params, [](std::shared_ptr<std::vector<uint8_t>> nal) {
+			reencoder = new VideoEncoder(reenc_params, [](std::shared_ptr<std::vector<uint8_t>> nal) {
 				if (dvr_enabled && receiver) receiver->dvr_reenc_push(nal);
 			});
-			ret = pthread_create(&g_tid_enc, NULL, &MppEncoder::__THREAD__, reencoder);
+			ret = pthread_create(&g_tid_enc, NULL, &VideoEncoder::__THREAD__, reencoder);
 			assert(!ret);
 			frame_proc = new FrameProcessor(reencoder, reenc_params.fps, reenc_params.resolution, drm_fd,
 			                               dvr_reenc_on_fatal_error);
@@ -2572,7 +2843,7 @@ int main(int argc, char **argv)
 	}
 
 	////////////////////////////////////////////// MAIN LOOP
-    read_gstreamerpipe_stream((void**)packet, listen_port, unix_socket, codec);
+    read_gstreamerpipe_stream((DecoderPacket *)packet, listen_port, unix_socket, codec);
 
 	////////////////////////////////////////////// MPI CLEANUP
 
@@ -2619,6 +2890,12 @@ int main(int argc, char **argv)
 		}
 	}
 
+#ifdef PIXELPILOT_V4L2
+	// Freeing the frame buffers takes them off the video plane too.
+	v4l2_dec->close();
+	delete v4l2_dec;
+	v4l2_dec = nullptr;
+#else
 	ret = mpi.mpi->reset(mpi.ctx);
 	assert(!ret);
 
@@ -2642,6 +2919,7 @@ int main(int argc, char **argv)
 	mpp_packet_deinit(&packet);
 	mpp_destroy(mpi.ctx);
 	free(nal_buffer);
+#endif
 	
 	////////////////////////////////////////////// DRM CLEANUP
 	restore_planes_zpos(drm_fd, output_list);
