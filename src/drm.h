@@ -21,7 +21,9 @@
 #include <xf86drmMode.h>
 #include <drm_fourcc.h>
 #include <pthread.h>
+#ifndef PIXELPILOT_V4L2
 #include <rockchip/rk_mpi.h>
+#endif
 #include <assert.h>
 
 #define OSD_BUF_COUNT	2
@@ -44,7 +46,16 @@ struct modeset_buf {
 	uint32_t fb;
 	int prime_fd;
 	uint32_t gl_fb_id;
+	uint32_t format;	// DRM_FORMAT_ARGB8888, or ARGB4444 where the OSD plane has nothing better
 };
+
+// modeset_prepare() flags
+// Video and OSD go on overlay planes even where the primary plane would
+// take their format; the primary then shows the black backdrop (see
+// modeset_show_backdrop()). For controllers whose primary plane cannot be
+// positioned, and where taking the primary plane's framebuffer away turns
+// the whole CRTC off.
+#define MODESET_PREFER_OVERLAYS	(1 << 0)
 
 struct modeset_output {
 	struct drm_object connector;
@@ -66,6 +77,10 @@ struct modeset_output {
 	// Video variables
 	drmModeAtomicReq *video_request;
 	struct drm_object video_plane;
+	uint32_t video_format;	// the decoder's frames, DRM_FORMAT_NV12 or YUV420
+	// Set when the video plane turned out not to scale: the video is then
+	// shown 1:1, centred.
+	bool video_no_scaling;
 	uint32_t video_frm_width;
 	uint32_t video_frm_height;
 	int video_fb_x, video_fb_y, video_fb_width, video_fb_height;
@@ -79,6 +94,10 @@ struct modeset_output {
 	uint32_t black_video_fb;
 	uint32_t black_video_handle;
 	uint32_t black_video_size;
+
+	// MODESET_PREFER_OVERLAYS: the CRTC's primary plane, used by neither
+	// video nor OSD, showing black_video_fb for good (id 0 = none).
+	struct drm_object backdrop_plane;
 
     // Used to calculate latency: when the frame's packet was fed to the
     // decoder, CLOCK_MONOTONIC in microseconds (it is also the MPP pts)
@@ -111,7 +130,7 @@ int modeset_find_crtc(int fd, drmModeRes *res, drmModeConnector *conn, struct mo
 
 const char* drm_fourcc_to_string(uint32_t fourcc);
 
-int modeset_find_plane(int fd, struct modeset_output *out, struct drm_object *plane_out, uint32_t plane_format, uint32_t plane_id_override);
+int modeset_find_plane(int fd, struct modeset_output *out, struct drm_object *plane_out, uint32_t plane_format, uint32_t plane_id_override, uint32_t exclude_plane_id, int skip_primary);
 
 void modeset_drm_object_fini(struct drm_object *obj);
 
@@ -127,9 +146,9 @@ int modeset_setup_framebuffers(int fd, drmModeConnector *conn, struct modeset_ou
 
 void modeset_output_destroy(int fd, struct modeset_output *out);
 
-struct modeset_output *modeset_output_create(int fd, drmModeRes *res, drmModeConnector *conn, uint16_t mode_width, uint16_t mode_height, uint32_t mode_vrefresh, uint32_t video_plane_id, uint32_t osd_plane_id, float video_scale_factor);
+struct modeset_output *modeset_output_create(int fd, drmModeRes *res, drmModeConnector *conn, uint16_t mode_width, uint16_t mode_height, uint32_t mode_vrefresh, uint32_t video_plane_id, uint32_t osd_plane_id, float video_scale_factor, uint32_t video_format, int flags);
 
-struct modeset_output *modeset_prepare(int fd, uint16_t mode_width, uint16_t mode_height, uint32_t mode_vrefresh, uint32_t video_plane_id, uint32_t osd_plane_id, float video_scale_factor);
+struct modeset_output *modeset_prepare(int fd, uint16_t mode_width, uint16_t mode_height, uint32_t mode_vrefresh, uint32_t video_plane_id, uint32_t osd_plane_id, float video_scale_factor, uint32_t video_format, int flags);
 
 void *modeset_print_modes(int fd);
 
@@ -139,9 +158,13 @@ int modeset_atomic_prepare_commit(int fd, struct modeset_output *out, drmModeAto
 
 void modeset_apply_video_scale(int fd, struct modeset_output *out);
 
-/* Create the full-screen black NV12 frame used as a backdrop while no video is
- * present (see struct modeset_output). Returns 0 on success. */
+/* Create the full-screen black frame (in out->video_format) used as a backdrop
+ * while no video is present (see struct modeset_output). Returns 0 on success. */
 int modeset_create_black_video(int fd, struct modeset_output *out);
+
+/* MODESET_PREFER_OVERLAYS: put the black frame on the backdrop plane, with the
+ * modeset that turns the CRTC on. No-op without a backdrop plane. */
+int modeset_show_backdrop(int fd, struct modeset_output *out);
 
 /* Set the video plane's SRC/CRTC geometry (and zpos) into `req`. fullscreen!=0
  * covers the whole screen (for the black backdrop); otherwise the aspect-scaled
