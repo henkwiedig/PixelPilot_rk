@@ -48,14 +48,23 @@
 // extra here: on stock firmware a long-held BACK reboots the goggle unit's
 // GUI process (confirmed by decompiling GlassesUI::slotKeyPress) --
 // deliberately not replicated.
+//
+// Other single-channel ladders (the BetaFPV VR04's: up/down/left/right,
+// enter, back, record and bind on one channel) use the same reader with
+// their own table from config["gsmenu"]["vrx_adc"]: keys, scale_mv,
+// idle_mv, tolerance_mv; a "bind" key on the ladder opens the bind dialog
+// like the VRX Pro's separate bind button. Left out, every setting is the
+// VRX Pro's above.
 
 #include <cerrno>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <string>
+#include <vector>
 #include <fcntl.h>
 #include <unistd.h>
 #include <yaml-cpp/yaml.h>
@@ -74,8 +83,9 @@ constexpr int kRepeatRateMs = 100;         // matches REPEAT_RATE_MS
 
 constexpr int kIdleThresholdMv = 135; // below this: no button pressed (stock's 0x87)
 constexpr int kMatchToleranceMv = 80; // +/-0x50, same window stock uses
+constexpr double kMvPerCount = 1800.0 / 1024; // 10-bit SARADC against 1.8 V
 
-enum class VrxKey { None, Up, Down, Left, Right, Center, Rec };
+enum class VrxKey { None, Up, Down, Left, Right, Center, Rec, Bind };
 
 struct AdcKeyEntry {
     VrxKey key;
@@ -104,8 +114,26 @@ const char *key_name(VrxKey k) {
     }
 }
 
+// A key name from the config: the dispatch names, plus the buttons' own
+// names where they differ. "back" is "left" (back/escape a step), as the
+// VRX Pro's BACK button is above.
+VrxKey key_from_name(const std::string &n) {
+    if (n == "up") return VrxKey::Up;
+    if (n == "down") return VrxKey::Down;
+    if (n == "left" || n == "back" || n == "esc") return VrxKey::Left;
+    if (n == "right") return VrxKey::Right;
+    if (n == "center" || n == "ok" || n == "enter") return VrxKey::Center;
+    if (n == "rec" || n == "record") return VrxKey::Rec;
+    if (n == "bind") return VrxKey::Bind;
+    return VrxKey::None;
+}
+
 bool g_enabled = false;
 std::string g_device;
+std::vector<AdcKeyEntry> g_keys(std::begin(kAdcKeys), std::end(kAdcKeys));
+double g_mv_per_count = kMvPerCount;
+int g_idle_mv = kIdleThresholdMv;
+int g_tolerance_mv = kMatchToleranceMv;
 
 // The "bind" button (in_voltage0_raw by default) is a separate SARADC
 // channel from the joystick ladder above: it's a plain momentary switch, not
@@ -146,8 +174,30 @@ bool read_raw(const std::string &path, int *out_raw) {
 bool read_millivolts(int *out_mv) {
     int raw;
     if (!read_raw(g_device, &raw)) return false;
-    *out_mv = (raw * 1800) / 1024;
+    *out_mv = (int)(raw * g_mv_per_count);
     return true;
+}
+
+// The IIO channel's own scale (mV per count), from in_voltage_scale or
+// in_voltageN_scale next to the in_voltageN_raw being read.
+bool read_iio_scale(const std::string &raw_path, double *out) {
+    const size_t slash = raw_path.rfind('/');
+    const size_t suffix = raw_path.rfind("_raw");
+    if (slash == std::string::npos || suffix == std::string::npos) return false;
+    const std::string dir = raw_path.substr(0, slash + 1);
+    const std::string channel = raw_path.substr(slash + 1, suffix - slash - 1); // in_voltageN
+    for (const std::string &name : {channel + "_scale", std::string("in_voltage_scale")}) {
+        FILE *f = fopen((dir + name).c_str(), "r");
+        if (!f) continue;
+        double v = 0;
+        const bool ok = fscanf(f, "%lf", &v) == 1 && v > 0;
+        fclose(f);
+        if (ok) {
+            *out = v;
+            return true;
+        }
+    }
+    return false;
 }
 
 bool sample_bind_pressed() {
@@ -159,9 +209,9 @@ bool sample_bind_pressed() {
 VrxKey sample_key() {
     int mv;
     if (!read_millivolts(&mv)) return VrxKey::None;
-    if (mv < kIdleThresholdMv) return VrxKey::None;
-    for (const auto &entry : kAdcKeys) {
-        if (std::abs(mv - entry.voltage_mv) <= kMatchToleranceMv) return entry.key;
+    if (mv < g_idle_mv) return VrxKey::None;
+    for (const auto &entry : g_keys) {
+        if (std::abs(mv - entry.voltage_mv) <= g_tolerance_mv) return entry.key;
     }
     return VrxKey::None;
 }
@@ -188,6 +238,31 @@ void setup_vrx_adc(void) {
         ? adc_config["device"].as<std::string>()
         : "/sys/bus/iio/devices/iio:device0/in_voltage6_raw";
 
+    if (adc_config["scale_mv"]) {
+        const std::string scale = adc_config["scale_mv"].as<std::string>();
+        if (scale == "auto") {
+            if (!read_iio_scale(g_device, &g_mv_per_count))
+                fprintf(stderr, "VRX ADC: no IIO scale next to %s, %.4f mV per count\n",
+                        g_device.c_str(), g_mv_per_count);
+        } else {
+            g_mv_per_count = adc_config["scale_mv"].as<double>();
+        }
+    }
+    if (adc_config["idle_mv"]) g_idle_mv = adc_config["idle_mv"].as<int>();
+    if (adc_config["tolerance_mv"]) g_tolerance_mv = adc_config["tolerance_mv"].as<int>();
+    if (adc_config["keys"] && adc_config["keys"].IsSequence()) {
+        g_keys.clear();
+        for (const auto &k : adc_config["keys"]) {
+            const std::string name = k["name"] ? k["name"].as<std::string>() : "";
+            const VrxKey key = key_from_name(name);
+            if (key == VrxKey::None || !k["mv"]) {
+                fprintf(stderr, "VRX ADC: ignoring key '%s' (needs a known name and mv)\n", name.c_str());
+                continue;
+            }
+            g_keys.push_back({key, k["mv"].as<int>()});
+        }
+    }
+
     int mv;
     if (!read_millivolts(&mv)) {
         fprintf(stderr, "VRX ADC: failed to read %s: %s\n", g_device.c_str(), strerror(errno));
@@ -195,11 +270,14 @@ void setup_vrx_adc(void) {
     }
 
     g_enabled = true;
-    printf("VRX ADC: polling %s\n", g_device.c_str());
+    printf("VRX ADC: polling %s (%zu keys, %.4f mV per count)\n", g_device.c_str(), g_keys.size(),
+           g_mv_per_count);
 
+    // An empty bind_device: no separate bind button (a ladder may carry one).
     g_bind_device = adc_config["bind_device"]
         ? adc_config["bind_device"].as<std::string>()
         : "/sys/bus/iio/devices/iio:device0/in_voltage0_raw";
+    if (g_bind_device.empty()) return;
 
     int bind_raw;
     if (!read_raw(g_bind_device, &bind_raw)) {
@@ -230,9 +308,16 @@ void handle_vrx_adc_input(void) {
         return;
     }
 
+    const VrxKey released = g_confirmed;
     g_confirmed = seen;
     if (seen == VrxKey::None) {
-        dispatch_release_key();
+        if (released != VrxKey::Bind)
+            dispatch_release_key();
+    } else if (seen == VrxKey::Bind) {
+        // Like the separate bind button: once per press, no repeat.
+        printf("VRX ADC: bind button pressed\n");
+        bind_dialog_trigger();
+        g_repeat_time = LONG_MAX;
     } else {
         fire_press(seen, false);
         g_repeat_time = now + kInitialRepeatDelayMs;
