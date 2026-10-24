@@ -20,10 +20,14 @@
 
 #include "spdlog/spdlog.h"
 
-// Frames on their way through the encoder, and coded-picture buffers.
+#include "dvr.h"
+
+// Frames on their way through the encoder, and coded-picture buffers. A
+// coded buffer holds an uncompressed frame's worth (the driver's ceiling):
+// a keyframe at a high bitrate outgrows 1 MiB, and the encoder then drops
+// the access unit, so a recording that starts with it never starts.
 static const unsigned kSourceBuffers = 3;
 static const unsigned kCodedBuffers = 4;
-static const uint32_t kCodedBufferSize = 1024 * 1024;
 
 static int xioctl(int fd, unsigned long req, void *arg) {
     int ret;
@@ -268,7 +272,7 @@ bool V4l2Encoder::open_device(const V4l2Decoder::Frame &f) {
     fmt.fmt.pix_mp.width = f.width;
     fmt.fmt.pix_mp.height = f.height;
     fmt.fmt.pix_mp.num_planes = 1;
-    fmt.fmt.pix_mp.plane_fmt[0].sizeimage = kCodedBufferSize;
+    fmt.fmt.pix_mp.plane_fmt[0].sizeimage = f.width * f.height * 3 / 2;
     if (xioctl(fd_, VIDIOC_S_FMT, &fmt)) {
         spdlog::error("V4L2 encoder: S_FMT (coded): {}", strerror(errno));
         close_device();
@@ -517,6 +521,36 @@ void V4l2Encoder::collect_output() {
         if (xioctl(fd_, VIDIOC_DQBUF, &buf))
             break;
         const uint32_t used = planes[0].bytesused;
+        if (buf.flags & V4L2_BUF_FLAG_ERROR) {
+            static uint64_t last_warn_ms = 0;
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            const uint64_t now = (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+            if (now - last_warn_ms > 1000) {
+                last_warn_ms = now;
+                spdlog::warn("V4L2 encoder: a picture failed to encode");
+            }
+        }
+        {
+            // What the encoder hands out, every 5 s at debug level.
+            static uint64_t stat_start_ms, stat_pictures, stat_empty, stat_bytes, stat_keyframes;
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            const uint64_t now = (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+            if (!stat_start_ms)
+                stat_start_ms = now;
+            stat_pictures++;
+            stat_bytes += used;
+            if (!used) stat_empty++;
+            if (buf.flags & V4L2_BUF_FLAG_KEYFRAME) stat_keyframes++;
+            if (now - stat_start_ms >= 5000) {
+                spdlog::debug("V4L2 encoder: {} pictures ({} keyframes, {} empty), {} kbit/s",
+                              stat_pictures, stat_keyframes, stat_empty,
+                              stat_bytes * 8 / (now - stat_start_ms));
+                stat_start_ms = now;
+                stat_pictures = stat_empty = stat_bytes = stat_keyframes = 0;
+            }
+        }
         if (used && !(buf.flags & V4L2_BUF_FLAG_ERROR) && buf.index < coded_.size() &&
             used <= coded_[buf.index].second && output_cb) {
             const uint8_t *data = (const uint8_t *)coded_[buf.index].first + planes[0].data_offset;
@@ -550,9 +584,10 @@ void FrameProcessor::drop_latest() {
 
 void FrameProcessor::push_latest(V4l2Decoder *dec, const V4l2Decoder::Frame &frame) {
     std::lock_guard<std::mutex> lk(mtx);
-    if (!running)
-        return;
     drop_latest();
+    // Not recording: hold nothing, encode nothing.
+    if (!running || !dvr_enabled)
+        return;
     dec->ref(frame.index);
     dec_ = dec;
     latest_ = frame;
@@ -628,7 +663,9 @@ void FrameProcessor::loop() {
         std::lock_guard<std::mutex> lk(mtx);
         if (!running)
             break;
-        if (dec_ && latest_.index >= 0)
+        if (!dvr_enabled)
+            drop_latest();
+        else if (dec_ && latest_.index >= 0)
             encoder->push_frame(dec_, latest_);
     }
     spdlog::info("Frame pacer done.");
