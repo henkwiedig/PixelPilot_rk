@@ -14,7 +14,9 @@
 #include <xf86drmMode.h>
 #include <drm_fourcc.h>
 #include <pthread.h>
+#ifndef PIXELPILOT_V4L2
 #include <rockchip/rk_mpi.h>
+#endif
 #include <assert.h>
 #include <math.h>
 
@@ -138,6 +140,32 @@ int set_drm_object_property(drmModeAtomicReq *req, struct drm_object *obj,
 	return drmModeAtomicAddProperty(req, obj->id, prop_id, value);
 }
 
+// zpos, where the driver lets it be set: some only report a fixed stacking
+// order (an immutable zpos), and setting that fails the whole commit.
+static drmModePropertyRes *mutable_zpos(struct drm_object *obj)
+{
+	for (int i = 0; i < obj->props->count_props; i++)
+		if (!strcmp(obj->props_info[i]->name, "zpos"))
+			return (obj->props_info[i]->flags & DRM_MODE_PROP_IMMUTABLE) ? NULL : obj->props_info[i];
+	return NULL;
+}
+
+static int set_drm_object_zpos(drmModeAtomicReq *req, struct drm_object *obj, uint64_t zpos)
+{
+	drmModePropertyRes *prop = mutable_zpos(obj);
+	return prop ? drmModeAtomicAddProperty(req, obj->id, prop->prop_id, zpos) : 0;
+}
+
+static bool plane_is_primary(int fd, uint32_t plane_id)
+{
+	drmModeObjectPropertiesPtr props = drmModeObjectGetProperties(fd, plane_id, DRM_MODE_OBJECT_PLANE);
+	if (!props)
+		return false;
+	int64_t type = get_property_value(fd, props, "type");
+	drmModeFreeObjectProperties(props);
+	return type == DRM_PLANE_TYPE_PRIMARY;
+}
+
 
 int modeset_find_crtc(int fd, drmModeRes *res, drmModeConnector *conn, struct modeset_output *out)
 {
@@ -213,7 +241,7 @@ const char* drm_fourcc_to_string(uint32_t fourcc) {
     return result;
 }
 
-int modeset_find_plane(int fd, struct modeset_output *out, struct drm_object *plane_out, uint32_t plane_format, uint32_t plane_id_override)
+int modeset_find_plane(int fd, struct modeset_output *out, struct drm_object *plane_out, uint32_t plane_format, uint32_t plane_id_override, uint32_t exclude_plane_id, int skip_primary)
 {
 	drmModePlaneResPtr plane_res;
 	bool found_plane = false;
@@ -255,6 +283,9 @@ int modeset_find_plane(int fd, struct modeset_output *out, struct drm_object *pl
 
 	for (i = 0; (i < plane_res->count_planes) && !found_plane; i++) {
 		int plane_id = plane_res->planes[i];
+
+		if (plane_id == exclude_plane_id || (skip_primary && plane_is_primary(fd, plane_id)))
+			continue;
 
 		drmModePlanePtr plane = drmModeGetPlane(fd, plane_id);
 		if (!plane) {
@@ -313,6 +344,11 @@ int modeset_setup_objects(int fd, struct modeset_output *out)
 	modeset_get_object_properties(fd, plane_osd, DRM_MODE_OBJECT_PLANE);
 	if (!plane_osd->props)
 		goto out_plane;
+	if (out->backdrop_plane.id) {
+		modeset_get_object_properties(fd, &out->backdrop_plane, DRM_MODE_OBJECT_PLANE);
+		if (!out->backdrop_plane.props)
+			out->backdrop_plane.id = 0;
+	}
 	return 0;
 
 out_plane:
@@ -330,6 +366,8 @@ void modeset_destroy_objects(int fd, struct modeset_output *out)
 	modeset_drm_object_fini(&out->crtc);
 	modeset_drm_object_fini(&out->video_plane);
 	modeset_drm_object_fini(&out->osd_plane);
+	if (out->backdrop_plane.id)
+		modeset_drm_object_fini(&out->backdrop_plane);
 }
 
 
@@ -342,10 +380,12 @@ int modeset_create_fb(int fd, struct modeset_buf *buf)
 	int ret;
 	uint32_t handles[4] = {0}, pitches[4] = {0}, offsets[4] = {0};
 
+	if (!buf->format)
+		buf->format = DRM_FORMAT_ARGB8888;
 	memset(&creq, 0, sizeof(creq));
 	creq.width = buf->width;
 	creq.height = buf->height;
-	creq.bpp = 32;
+	creq.bpp = buf->format == DRM_FORMAT_ARGB4444 ? 16 : 32;
 	ret = drmIoctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq);
 	if (ret < 0) {
 		fprintf(stderr, "cannot create buffer (%d): %m\n",
@@ -371,7 +411,7 @@ int modeset_create_fb(int fd, struct modeset_buf *buf)
 	handles[0] = buf->handle;
 	pitches[0] = buf->stride;
 
-	ret = drmModeAddFB2(fd, buf->width, buf->height, DRM_FORMAT_ARGB8888,
+	ret = drmModeAddFB2(fd, buf->width, buf->height, buf->format,
 			    handles, pitches, offsets, &buf->fb, 0);
 	if (ret) {
 		fprintf(stderr, "cannot create framebuffer (%d): %m\n",
@@ -445,13 +485,20 @@ int modeset_create_black_video(int fd, struct modeset_output *out)
 		goto err_destroy;
 	}
 	memset(map, 0, pitch * h);                     // Y = 0 (black)
-	memset(map + pitch * h, 128, pitch * h / 2);   // UV = 128 (neutral chroma)
+	memset(map + pitch * h, 128, pitch * h / 2);   // U, V = 128 (neutral chroma)
 	munmap(map, creq.size);
 
+	// NV12: one interleaved chroma plane; I420: U then V, each half the pitch.
 	uint32_t handles[4] = { creq.handle, creq.handle, 0, 0 };
 	uint32_t pitches[4] = { pitch, pitch, 0, 0 };
 	uint32_t offsets[4] = { 0, pitch * h, 0, 0 };
-	if (drmModeAddFB2(fd, w, h, DRM_FORMAT_NV12, handles, pitches, offsets, &out->black_video_fb, 0)) {
+	const uint32_t format = out->video_format ? out->video_format : DRM_FORMAT_NV12;
+	if (format == DRM_FORMAT_YUV420) {
+		handles[2] = creq.handle;
+		pitches[1] = pitches[2] = pitch / 2;
+		offsets[2] = offsets[1] + (pitch / 2) * (h / 2);
+	}
+	if (drmModeAddFB2(fd, w, h, format, handles, pitches, offsets, &out->black_video_fb, 0)) {
 		fprintf(stderr, "black video: addfb2 failed: %m\n");
 		goto err_destroy;
 	}
@@ -467,6 +514,33 @@ err_destroy:
 		out->black_video_fb = 0;
 	}
 	return -errno;
+}
+
+int modeset_show_backdrop(int fd, struct modeset_output *out)
+{
+	if (!out->backdrop_plane.id || !out->black_video_fb)
+		return 0;
+	drmModeAtomicReq *req = drmModeAtomicAlloc();
+	struct drm_object *plane = &out->backdrop_plane;
+	const uint32_t w = out->mode.hdisplay, h = out->mode.vdisplay;
+	set_drm_object_property(req, &out->connector, "CRTC_ID", out->crtc.id);
+	set_drm_object_property(req, &out->crtc, "MODE_ID", out->mode_blob_id);
+	set_drm_object_property(req, &out->crtc, "ACTIVE", 1);
+	set_drm_object_property(req, plane, "FB_ID", out->black_video_fb);
+	set_drm_object_property(req, plane, "CRTC_ID", out->crtc.id);
+	set_drm_object_property(req, plane, "SRC_X", 0);
+	set_drm_object_property(req, plane, "SRC_Y", 0);
+	set_drm_object_property(req, plane, "SRC_W", w << 16);
+	set_drm_object_property(req, plane, "SRC_H", h << 16);
+	set_drm_object_property(req, plane, "CRTC_X", 0);
+	set_drm_object_property(req, plane, "CRTC_Y", 0);
+	set_drm_object_property(req, plane, "CRTC_W", w);
+	set_drm_object_property(req, plane, "CRTC_H", h);
+	int ret = drmModeAtomicCommit(fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
+	if (ret < 0)
+		fprintf(stderr, "black backdrop on plane %u failed: %m\n", plane->id);
+	drmModeAtomicFree(req);
+	return ret;
 }
 
 void modeset_set_video_geometry(struct modeset_output *out, drmModeAtomicReq *req, int fullscreen, int zpos)
@@ -486,11 +560,15 @@ void modeset_set_video_geometry(struct modeset_output *out, drmModeAtomicReq *re
 		else                   och = (uint32_t)(ocw / ratio);
 		cw = (uint32_t)(ocw * out->video_scale_factor);
 		ch = (uint32_t)(och * out->video_scale_factor);
+		if (out->video_no_scaling) {
+			cw = sw;
+			ch = sh;
+		}
 		cx = (out->video_crtc_width  - (int)cw) / 2;
 		cy = (out->video_crtc_height - (int)ch) / 2;
 	}
 	set_drm_object_property(req, &out->video_plane, "CRTC_ID", out->crtc.id);
-	set_drm_object_property(req, &out->video_plane, "zpos",   zpos);
+	set_drm_object_zpos(req, &out->video_plane, zpos);
 	set_drm_object_property(req, &out->video_plane, "SRC_X",  0);
 	set_drm_object_property(req, &out->video_plane, "SRC_Y",  0);
 	set_drm_object_property(req, &out->video_plane, "SRC_W",  sw << 16);
@@ -562,7 +640,7 @@ static uint32_t mode_refresh_mhz(const drmModeModeInfo *m)
 	return (uint32_t)(num / den);
 }
 
-struct modeset_output *modeset_output_create(int fd, drmModeRes *res, drmModeConnector *conn, uint16_t mode_width, uint16_t mode_height, uint32_t mode_vrefresh, uint32_t video_plane_id, uint32_t osd_plane_id, float video_scale_factor)
+struct modeset_output *modeset_output_create(int fd, drmModeRes *res, drmModeConnector *conn, uint16_t mode_width, uint16_t mode_height, uint32_t mode_vrefresh, uint32_t video_plane_id, uint32_t osd_plane_id, float video_scale_factor, uint32_t video_format, int flags)
 {
 	int ret;
 	struct modeset_output *out;
@@ -570,6 +648,7 @@ struct modeset_output *modeset_output_create(int fd, drmModeRes *res, drmModeCon
 	out = malloc(sizeof(*out));
 	memset(out, 0, sizeof(*out));
 	out->video_scale_factor = video_scale_factor;
+	out->video_format = video_format;
 	out->connector.id = conn->connector_id;
 
 	if (conn->connection != DRM_MODE_CONNECTED) {
@@ -636,19 +715,63 @@ struct modeset_output *modeset_output_create(int fd, drmModeRes *res, drmModeCon
 		goto out_blob;
 	}
 
-	ret = modeset_find_plane(fd, out, &out->video_plane, DRM_FORMAT_NV12, video_plane_id);
+	const char *video_format_name = video_format == DRM_FORMAT_YUV420 ? "YUV420" : "NV12";
+	const int overlays = (flags & MODESET_PREFER_OVERLAYS) != 0;
+	ret = -EINVAL;
+	if (overlays && !video_plane_id)
+		ret = modeset_find_plane(fd, out, &out->video_plane, video_format, 0, 0, 1);
+	if (ret)
+		ret = modeset_find_plane(fd, out, &out->video_plane, video_format, video_plane_id, 0, 0);
 	if (ret) {
-		fprintf(stderr, "no valid video plane with format NV12 for crtc %u\n", out->crtc.id);
+		fprintf(stderr, "no valid video plane with format %s for crtc %u\n", video_format_name, out->crtc.id);
 		goto out_blob;
 	}
-	fprintf(stdout, "Using plane %d (NV12) for Video\n",  out->video_plane.id);
+	fprintf(stdout, "Using plane %d (%s) for Video\n",  out->video_plane.id, video_format_name);
 
-	ret = modeset_find_plane(fd, out, &out->osd_plane, DRM_FORMAT_ARGB8888, osd_plane_id);
+	// ARGB8888, else ARGB4444 (converted from LVGL's ARGB8888 on flush); with
+	// MODESET_PREFER_OVERLAYS first on any overlay plane, then on the primary.
+	static const uint32_t osd_formats[] = {DRM_FORMAT_ARGB8888, DRM_FORMAT_ARGB4444};
+	ret = -EINVAL;
+	for (int pass = overlays && !osd_plane_id ? 0 : 1; pass < 2 && ret; pass++) {
+		for (int f = 0; f < 2 && ret; f++) {
+			ret = modeset_find_plane(fd, out, &out->osd_plane, osd_formats[f], osd_plane_id,
+			                         out->video_plane.id, pass == 0);
+			if (!ret)
+				out->osd_bufs[0].format = out->osd_bufs[1].format = osd_formats[f];
+		}
+	}
 	if (ret) {
-		fprintf(stderr, "no valid osd plane with format ARGB8888 for crtc %u\n", out->crtc.id);
+		fprintf(stderr, "no valid osd plane with format ARGB8888 or ARGB4444 for crtc %u\n", out->crtc.id);
 		goto out_blob;
 	}
-	fprintf(stdout, "Using plane %d (ARGB8888) for OSD\n",  out->osd_plane.id);
+	fprintf(stdout, "Using plane %d (%s) for OSD\n",  out->osd_plane.id,
+	        out->osd_bufs[0].format == DRM_FORMAT_ARGB4444 ? "ARGB4444" : "ARGB8888");
+
+	// The primary plane, if neither took it, carries the black backdrop.
+	if (overlays) {
+		drmModePlaneResPtr plane_res = drmModeGetPlaneResources(fd);
+		for (uint32_t i = 0; plane_res && i < plane_res->count_planes; i++) {
+			uint32_t id = plane_res->planes[i];
+			if (id == out->video_plane.id || id == out->osd_plane.id || !plane_is_primary(fd, id))
+				continue;
+			drmModePlanePtr plane = drmModeGetPlane(fd, id);
+			if (!plane)
+				continue;
+			bool usable = false;
+			if (plane->possible_crtcs & (1 << out->crtc_index))
+				for (uint32_t j = 0; j < plane->count_formats; j++)
+					if (plane->formats[j] == video_format)
+						usable = true;
+			drmModeFreePlane(plane);
+			if (usable) {
+				out->backdrop_plane.id = id;
+				fprintf(stdout, "Using plane %d (%s) for the black backdrop\n", id, video_format_name);
+				break;
+			}
+		}
+		if (plane_res)
+			drmModeFreePlaneResources(plane_res);
+	}
 
 	ret = modeset_setup_objects(fd, out);
 	if (ret) {
@@ -724,7 +847,7 @@ void *modeset_print_modes(int fd)
 
 }
 
-struct modeset_output *modeset_prepare(int fd, uint16_t mode_width, uint16_t mode_height, uint32_t mode_vrefresh, uint32_t video_plane_id, uint32_t osd_plane_id, float video_scale_factor)
+struct modeset_output *modeset_prepare(int fd, uint16_t mode_width, uint16_t mode_height, uint32_t mode_vrefresh, uint32_t video_plane_id, uint32_t osd_plane_id, float video_scale_factor, uint32_t video_format, int flags)
 {
 	drmModeRes *res;
 	drmModeConnector *conn;
@@ -746,7 +869,7 @@ struct modeset_output *modeset_prepare(int fd, uint16_t mode_width, uint16_t mod
 			continue;
 		}
 
-		out = modeset_output_create(fd, res, conn, mode_width, mode_height, mode_vrefresh, video_plane_id, osd_plane_id, video_scale_factor);
+		out = modeset_output_create(fd, res, conn, mode_width, mode_height, mode_vrefresh, video_plane_id, osd_plane_id, video_scale_factor, video_format, flags);
 		drmModeFreeConnector(conn);
 		if (out) {
 			drmModeFreeResources(res);
@@ -796,6 +919,10 @@ static void video_dst_rect(const struct modeset_output *out, uint32_t src_w, uin
 
 	if (w < src_w)
 		w &= ~1u;
+	if (out->video_no_scaling) {
+		w = src_w;
+		h = src_h;
+	}
 
 	*dst_w = w;
 	*dst_h = h;
@@ -856,6 +983,22 @@ int modeset_perform_modeset(int fd, struct modeset_output *out, drmModeAtomicReq
 	/* perform test-only atomic commit */
 	flags = DRM_MODE_ATOMIC_TEST_ONLY | DRM_MODE_ATOMIC_ALLOW_MODESET;
 	ret = drmModeAtomicCommit(fd, req, flags, NULL);
+	if (ret < 0 && plane == &out->video_plane && !out->video_no_scaling) {
+		// A video plane that does not scale: show the video 1:1 instead.
+		int crtcx, crtcy;
+		uint32_t crtcw, crtch;
+		video_dst_rect(out, width, height, &crtcx, &crtcy, &crtcw, &crtch);
+		if (crtcw != width || crtch != height) {
+			out->video_no_scaling = true;
+			ret = modeset_atomic_prepare_commit(fd, out, req, plane, fb_id, width, height, zpos);
+			if (ret >= 0)
+				ret = drmModeAtomicCommit(fd, req, flags, NULL);
+			if (ret >= 0)
+				fprintf(stdout, "plane %d does not scale: video %ux%u shown 1:1\n", plane->id, width, height);
+			else
+				out->video_no_scaling = false;
+		}
+	}
 	if (ret < 0) {
 		fprintf(stderr, "test-only atomic commit failed for plane %d: %m\n", plane->id);
 		return ret;
@@ -927,7 +1070,7 @@ int modeset_atomic_prepare_commit(int fd, struct modeset_output *out, drmModeAto
 		return -1;
 	if (set_drm_object_property(req, plane, "CRTC_H", crtch) < 0)
 		return -1;
-	if (set_drm_object_property(req, plane, "zpos", zpos) < 0)
+	if (set_drm_object_zpos(req, plane, zpos) < 0)
 		return -1;
 
 	// The OSD carries straight (non-premultiplied) alpha from LVGL. Ask the
@@ -950,6 +1093,8 @@ void restore_planes_zpos(int fd, struct modeset_output *output_list) {
 	struct modeset_buf *buf = &output_list->osd_bufs[0];
 
 	// TODO(geehe) Find a more elegant way to do this.
+	if (!mutable_zpos(&output_list->osd_plane) && !mutable_zpos(&output_list->video_plane))
+		return;   // a fixed stacking order: nothing to restore
 	int64_t zpos = get_property_value(fd, output_list->osd_plane.props, "zpos");
 	ret = modeset_atomic_prepare_commit(fd, output_list, output_list->osd_request, &output_list->osd_plane, buf->fb, buf->width, buf->height, zpos);
 	if (ret < 0) {
