@@ -86,7 +86,7 @@ extern bool enable_live_colortrans;
 extern float live_colortrans_offset;
 extern float live_colortrans_gain;
 
-#include "frame_processor.h"
+#include "video_encoder.h"
 extern FrameProcessor *frame_proc;
 extern bool dvr_osd;
 
@@ -2921,10 +2921,49 @@ typedef struct png_closure
  * buffers is what made the menu sluggish. The shadow always holds the complete
  * current UI; my_flush_cb copies it to the off-screen DRM buffer and flips. */
 static uint8_t * lvgl_shadow;
+static uint32_t lvgl_shadow_stride;
+
+/* An ARGB4444 OSD plane (no ARGB8888 one on this display): LVGL still renders
+ * ARGB8888 into the shadow, the flush converts. Only what changed is
+ * converted -- the areas of this frame, plus those of the frame before, which
+ * went to the other buffer -- since a full screen is 2M pixels. */
+static lv_area_t osd_dirty, osd_dirty_prev;
+static bool osd_dirty_valid, osd_dirty_prev_valid;
+
+static void osd_area_join(lv_area_t *acc, bool *valid, const lv_area_t *a)
+{
+	if (!*valid) {
+		*acc = *a;
+		*valid = true;
+		return;
+	}
+	if (a->x1 < acc->x1) acc->x1 = a->x1;
+	if (a->y1 < acc->y1) acc->y1 = a->y1;
+	if (a->x2 > acc->x2) acc->x2 = a->x2;
+	if (a->y2 > acc->y2) acc->y2 = a->y2;
+}
+
+static void osd_convert_argb4444(struct modeset_buf *dst, const lv_area_t *a)
+{
+	const int32_t x1 = LV_MAX(a->x1, 0), y1 = LV_MAX(a->y1, 0);
+	const int32_t x2 = LV_MIN(a->x2, (int32_t)dst->width - 1), y2 = LV_MIN(a->y2, (int32_t)dst->height - 1);
+	for (int32_t y = y1; y <= y2; y++) {
+		const uint32_t *s = (const uint32_t *)(lvgl_shadow + (size_t)y * lvgl_shadow_stride) + x1;
+		uint16_t *d = (uint16_t *)(dst->map + (size_t)y * dst->stride) + x1;
+		for (int32_t x = x1; x <= x2; x++) {
+			const uint32_t px = *s++;
+			*d++ = ((px >> 16) & 0xf000) | ((px >> 12) & 0x0f00) | ((px >> 8) & 0x00f0) | ((px >> 4) & 0x000f);
+		}
+	}
+}
 
 void my_flush_cb(lv_display_t * display, const lv_area_t * area, uint8_t * px_map)
 {
-	(void)area; (void)px_map;
+	(void)px_map;
+
+	const bool argb4444 = p->out->osd_bufs[0].format == DRM_FORMAT_ARGB4444;
+	if (argb4444)
+		osd_area_join(&osd_dirty, &osd_dirty_valid, area);
 
 	/* Direct mode calls flush once per invalidated area. Acting on the
 	 * intermediate calls used to flip the visible buffer mid-frame — the
@@ -2940,7 +2979,17 @@ void my_flush_cb(lv_display_t * display, const lv_area_t * area, uint8_t * px_ma
 	 * is stable: copy without the lock. */
 	int back = p->out->osd_buf_switch ^ 1;
 	struct modeset_buf *dst = &p->out->osd_bufs[back];
-	memcpy(dst->map, lvgl_shadow, dst->size);
+	if (argb4444) {
+		if (osd_dirty_valid)
+			osd_convert_argb4444(dst, &osd_dirty);
+		if (osd_dirty_prev_valid)
+			osd_convert_argb4444(dst, &osd_dirty_prev);
+		osd_dirty_prev = osd_dirty;
+		osd_dirty_prev_valid = osd_dirty_valid;
+		osd_dirty_valid = false;
+	} else {
+		memcpy(dst->map, lvgl_shadow, dst->size);
+	}
 
 	int ret = pthread_mutex_lock(&osd_mutex);
 	assert(!ret);
@@ -2992,13 +3041,17 @@ void setup_lvgl(osd_thread_params *p) {
 	 * With one buffer LVGL renders in place and never runs its dual-buffer
 	 * dirty-area sync (which read back from uncached DRM memory every frame).
 	 * Keep the DRM pitch (buf->stride) so the shadow's row layout matches the
-	 * hardware-aligned scanline stride and the flush copy is one flat memcpy. */
-	size_t shadow_sz = ((size_t)buf1->size + 63) & ~(size_t)63;
+	 * hardware-aligned scanline stride and the flush copy is one flat memcpy.
+	 * An ARGB4444 plane's rows are half that: the shadow keeps 4 bytes a
+	 * pixel there and the flush converts. */
+	lvgl_shadow_stride = buf1->format == DRM_FORMAT_ARGB4444 ? buf1->stride * 2 : buf1->stride;
+	const size_t shadow_used = (size_t)lvgl_shadow_stride * buf1->height;
+	size_t shadow_sz = (shadow_used + 63) & ~(size_t)63;
 	lvgl_shadow = (uint8_t *)aligned_alloc(64, shadow_sz);
 	assert(lvgl_shadow);
 	memset(lvgl_shadow, 0, shadow_sz);
 	lv_draw_buf_init(&lvgl_draw_buf1, buf1->width, buf1->height,
-	                 LV_COLOR_FORMAT_ARGB8888, buf1->stride, lvgl_shadow, buf1->size);
+	                 LV_COLOR_FORMAT_ARGB8888, lvgl_shadow_stride, lvgl_shadow, shadow_used);
 	lv_display_set_draw_buffers(display, &lvgl_draw_buf1, NULL);
 	lv_display_set_render_mode(display, LV_DISPLAY_RENDER_MODE_DIRECT);
 
