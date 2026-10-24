@@ -43,6 +43,20 @@ gsmenu:
   #   # code (idle ~1023, pressed <15) rather than the joystick's voltage
   #   # ladder. Pressing it runs /usr/bin/bind and shows a progress popup.
   #   bind_device: /sys/bus/iio/devices/iio:device0/in_voltage0_raw
+  #   # Another ladder on one channel (e.g. the BetaFPV VR04's): its own
+  #   # table, and no separate bind channel. Left out, these are the VRX
+  #   # Pro's: 1800/1024 mV per count, idle below 135 mV, +/-80 mV, and
+  #   # up 800 / left 1000 / right 1200 / center 1400 / down 1600 / rec 390
+  #   # / back 1780. Names: up down left right center (ok, enter) rec
+  #   # (record) back (acts as left) bind (opens the bind dialog).
+  #   scale_mv: auto        # the IIO channel's in_voltage*_scale
+  #   idle_mv: 135
+  #   tolerance_mv: 80
+  #   bind_device: ""
+  #   keys:
+  #     - { name: bind, mv: 219 }
+  #     - { name: back, mv: 380 }
+  #     - { name: up,   mv: 780 }
   # Define custom actions here
   # action is the command the button will trigger
   # actions:
