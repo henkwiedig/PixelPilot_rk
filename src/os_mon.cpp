@@ -291,19 +291,25 @@ protected:
  * VRX Pro, whose stock ar_ldy_gnd reads SARADC channel 5
  * (/sys/bus/iio/devices/iio:device0/in_voltage5_raw) and shows `mV * 16 - 300` as "G-Volt".
  *
- * Every run() reads `raw` and the sibling `in_voltage_scale` (mV per LSB, IIO ABI), averages the
- * last 10 samples like stock does, applies `mv * multiplier + offset_mv` (clamped at 0) and
- * publishes it as `os_mon.power.voltage` in mV tagged `sensor=<name>` -- the same fact the INA226
- * sensor publishes, so existing OSD widgets show it. No current/power: a divider can't tell.
+ * Every run() reads `raw` and the sibling `in_voltage_scale` (mV per LSB, IIO ABI) -- or, for an
+ * `in_voltageN_input` path, the driver's processed (calibrated) value in mV, e.g. the BetaFPV
+ * VR04's channel 1 behind a 20.7:1 divider -- averages the last 10 samples like stock does,
+ * applies `mv * multiplier + offset_mv` (clamped at 0) and publishes it as
+ * `os_mon.power.voltage` in mV tagged `sensor=<name>` -- the same fact the INA226 sensor
+ * publishes, so existing OSD widgets show it. No current/power: a divider can't tell.
  */
 class IioVoltageSensor : public ISensor {
 public:
-    explicit IioVoltageSensor(const std::string &raw_path, int multiplier, int offset_mv,
+    explicit IioVoltageSensor(const std::string &raw_path, double multiplier, int offset_mv,
                               const std::string &name)
         : raw_path(raw_path), multiplier(multiplier), offset_mv(offset_mv), name(name) {
-        scale_path = this->raw_path.parent_path() / "in_voltage_scale";
+        const std::string file = this->raw_path.filename().string();
+        processed = file.size() > 6 && file.compare(file.size() - 6, 6, "_input") == 0;
+        if (!processed) {
+            scale_path = this->raw_path.parent_path() / "in_voltage_scale";
+        }
         is_valid_sensor = std::filesystem::exists(this->raw_path) &&
-                          std::filesystem::exists(scale_path);
+                          (processed || std::filesystem::exists(scale_path));
         if (!is_valid_sensor) {
             spdlog::error("IIO voltage sensor {}: {} or {} missing! Sensor is disabled.", name,
                           this->raw_path.string(), scale_path.string());
@@ -316,7 +322,7 @@ public:
             return;
         }
         auto raw = read_double(raw_path);
-        auto scale = read_double(scale_path);
+        auto scale = processed ? std::optional<double>(1.0) : read_double(scale_path);
         if (!raw.has_value() || !scale.has_value()) {
             return;
         }
@@ -342,7 +348,8 @@ private:
     static constexpr std::size_t WINDOW = 10;
     std::filesystem::path raw_path;
     std::filesystem::path scale_path;
-    int multiplier;
+    bool processed;   // raw_path is in_voltageN_input: mV already
+    double multiplier;
     int offset_mv;
     std::string name;
     bool is_valid_sensor;
@@ -524,6 +531,60 @@ private:
 };
 
 
+/**
+ * A temperature from an IIO device: the value of one sysfs file times `multiplier`, published
+ * as `os_mon.temperature` in millidegrees C like the thermal zones, tagged `sensor=<IIO device>`
+ * and `name=<name>`.
+ *
+ * Usually in_temp_input (millidegrees, multiplier 1). The Artosyn AR9311's "temperature" device
+ * (BetaFPV VR04) has no in_temp_input: like the vendor driver it reports whole degrees C in
+ * in_temp_scale, so that one takes multiplier 1000.
+ */
+class IioTemperatureSensor : public ISensor {
+public:
+    explicit IioTemperatureSensor(const std::string &path, double multiplier,
+                                  const std::string &name)
+        : path(path), multiplier(multiplier), name(name) {
+        device = this->path.parent_path().filename().string();
+        is_valid_sensor = std::filesystem::exists(this->path);
+        if (!is_valid_sensor) {
+            spdlog::error("IIO temperature sensor {}: {} missing! Sensor is disabled.", name,
+                          this->path.string());
+        }
+    }
+
+    void run() override {
+        if (!is_valid_sensor) {
+            return;
+        }
+        std::ifstream file(path);
+        double value;
+        if (!(file >> value)) {
+            spdlog::error("Unable to read IIO value from {}", path.string());
+            return;
+        }
+        osd_tag tags[2];
+        strcpy(tags[0].key, "sensor");
+        strncpy(tags[0].val, device.c_str(), sizeof(tags[0].val) - 1);
+        tags[0].val[sizeof(tags[0].val) - 1] = '\0';
+        strcpy(tags[1].key, "name");
+        strncpy(tags[1].val, name.c_str(), sizeof(tags[1].val) - 1);
+        tags[1].val[sizeof(tags[1].val) - 1] = '\0';
+        osd_publish_int_fact("os_mon.temperature", tags, 2, std::lround(value * multiplier));
+    }
+
+    bool is_valid() override {
+      return is_valid_sensor;
+    }
+
+private:
+    std::filesystem::path path;
+    double multiplier;
+    std::string name;
+    std::string device;
+    bool is_valid_sensor;
+};
+
 void OsSensors::addCPU() {
     sensors.push_back(std::make_shared<CPUSensor>());
 }
@@ -538,7 +599,7 @@ void OsSensors::addPower(const std::string &sensor_name, const std::string &hwmo
     sensors.push_back(std::make_shared<PowerSensor>(sensor_name, hwmon_id));
 }
 
-void OsSensors::addIioVoltage(const std::string &raw_path, int multiplier, int offset_mv,
+void OsSensors::addIioVoltage(const std::string &raw_path, double multiplier, int offset_mv,
                                const std::string &name) {
     sensors.push_back(std::make_shared<IioVoltageSensor>(raw_path, multiplier, offset_mv, name));
 }
@@ -555,6 +616,11 @@ void OsSensors::addPwmFan(const std::string &device, int channel, const std::str
 
 void OsSensors::addTemperature(const std::string &thermal_zone) {
     sensors.push_back(std::make_shared<TemperatureSensor>(thermal_zone));
+}
+
+void OsSensors::addIioTemperature(const std::string &path, double multiplier,
+                                  const std::string &name) {
+    sensors.push_back(std::make_shared<IioTemperatureSensor>(path, multiplier, name));
 }
 
 std::size_t OsSensors::discoverTemperature() {

@@ -2587,7 +2587,7 @@ int main(int argc, char **argv)
 							std::string path = power_sensor["path"].as<std::string>();
 							os_sensors.addIioVoltage(
 								path,
-								power_sensor["multiplier"] ? power_sensor["multiplier"].as<int>() : 1,
+								power_sensor["multiplier"] ? power_sensor["multiplier"].as<double>() : 1.0,
 								power_sensor["offset_mv"] ? power_sensor["offset_mv"].as<int>() : 0,
 								power_sensor["name"] ? power_sensor["name"].as<std::string>()
 													 : std::filesystem::path(path).filename().string());
@@ -2617,6 +2617,15 @@ int main(int argc, char **argv)
 					os_sensors.discoverTemperature();
 				} else {
 					for (const auto& temp_sensor : temperature) {
+						if (temp_sensor["type"] && temp_sensor["type"].as<std::string>() == "iio") {
+							std::string path = temp_sensor["path"].as<std::string>();
+							os_sensors.addIioTemperature(
+								path,
+								temp_sensor["multiplier"] ? temp_sensor["multiplier"].as<double>() : 1.0,
+								temp_sensor["name"] ? temp_sensor["name"].as<std::string>()
+								                    : std::filesystem::path(path).filename().string());
+							continue;
+						}
 						std::string thermal_zone = temp_sensor["thermal_zone"].as<std::string>();
 						os_sensors.addTemperature(thermal_zone);
 					}
