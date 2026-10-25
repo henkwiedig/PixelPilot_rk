@@ -75,7 +75,6 @@ private:
     int fd_ = -1;
     int wake_fd_ = -1;
     bool reopen_ = false;
-    bool idr_pending_ = true;
     uint32_t width_ = 0, height_ = 0, stride_ = 0, plane_height_ = 0;
     std::vector<Source> sources_;
     std::vector<std::pair<void *, size_t>> coded_;
