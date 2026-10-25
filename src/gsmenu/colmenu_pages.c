@@ -524,6 +524,29 @@ static const colmenu_item_t sys_receiver_items[] = {
     { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="RX Mode", .param="rx_mode", .on_change=on_rx_mode_change },
 };
 static const colmenu_page_t sys_receiver_page = { "Receiver", "gs", "system", sys_receiver_items, 2 };
+/* System → Audio only with a sound card to play to (the BetaFPV VR04 has
+ * none: /proc/asound/cards says "--- no soundcards ---", or is missing). */
+static bool audio_available(void)
+{
+    char line[64] = "";
+    FILE * f = fopen("/proc/asound/cards", "r");
+    if(!f) return false;
+    bool none = !fgets(line, sizeof(line), f) || strstr(line, "no soundcards");
+    fclose(f);
+    return !none;
+}
+
+/* Rows that only do something on the Rockchip platform: the V4L2 one
+ * (BetaFPV VR04) has no copy engine for the front buffer, no GL pass for live
+ * colortrans or for the OSD in recordings, and its overlay planes show the
+ * video 1:1 (no scaling). */
+#ifdef PIXELPILOT_V4L2
+static bool rockchip_only(void) { return false; }
+#define ROCKCHIP_ONLY .available = rockchip_only
+#else
+#define ROCKCHIP_ONLY .available = NULL
+#endif
+
 static const colmenu_item_t sys_audio_items[] = {
     { .kind=COLMENU_SWITCH,   .icon=LV_SYMBOL_AUDIO,      .label="Audio",  .param="audio",        .on_change=on_audio_enabled },
     { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_AUDIO,      .label="Output", .param="audio_device", .on_change=on_audio_device },
@@ -534,11 +557,11 @@ static const colmenu_item_t sys_display_items[] = {
     { .kind=COLMENU_SWITCH,   .icon=LV_SYMBOL_SETTINGS, .label="GS Rendering",   .param="gs_rendering" },
     { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Connector",      .param="connector" },
     { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Resolution",     .param="resolution", .on_change=notify_restart },
-    { .kind=COLMENU_SLIDER,   .icon=LV_SYMBOL_SETTINGS, .label="Video scale factor", .precision=2, .param="video_scale", .on_change=on_video_scale, .on_live=on_video_scale },
-    { .kind=COLMENU_SWITCH,   .icon=LV_SYMBOL_SETTINGS, .label="Live Colortrans", .param="gs_live_colortrans", .on_change=on_live_colortrans },
+    { .kind=COLMENU_SLIDER,   .icon=LV_SYMBOL_SETTINGS, .label="Video scale factor", .precision=2, .param="video_scale", .on_change=on_video_scale, .on_live=on_video_scale, ROCKCHIP_ONLY },
+    { .kind=COLMENU_SWITCH,   .icon=LV_SYMBOL_SETTINGS, .label="Live Colortrans", .param="gs_live_colortrans", .on_change=on_live_colortrans, ROCKCHIP_ONLY },
     /* --front-buffer: RGA copy into the scanned-out buffer, no vblank wait,
      * may tear. The buffer is set up with the decoder, so it needs a restart. */
-    { .kind=COLMENU_SWITCH,   .icon=LV_SYMBOL_SETTINGS, .label="Front Buffer",   .param="gs_front_buffer", .on_change=notify_restart },
+    { .kind=COLMENU_SWITCH,   .icon=LV_SYMBOL_SETTINGS, .label="Front Buffer",   .param="gs_front_buffer", .on_change=notify_restart, ROCKCHIP_ONLY },
 };
 static const colmenu_page_t sys_display_page = { "Display", "gs", "system", sys_display_items, 6 };
 static const colmenu_item_t sys_dvr_items[] = {
@@ -549,7 +572,7 @@ static const colmenu_item_t sys_dvr_items[] = {
     { .kind=COLMENU_DROPDOWN, .label="Resolution",        .param="dvr_reenc_resolution", .on_change=on_dvr_reenc_resolution },
     { .kind=COLMENU_DROPDOWN, .label="Re-encode FPS",     .param="dvr_reenc_fps",        .on_change=on_dvr_reenc_fps },
     { .kind=COLMENU_DROPDOWN, .label="Bitrate (kbps)",    .param="dvr_reenc_bitrate",    .on_change=on_dvr_reenc_bitrate },
-    { .kind=COLMENU_SWITCH,   .label="Record OSD in DVR", .param="dvr_osd",              .on_change=on_dvr_osd },
+    { .kind=COLMENU_SWITCH,   .label="Record OSD in DVR", .param="dvr_osd",              .on_change=on_dvr_osd, ROCKCHIP_ONLY },
 };
 static const colmenu_page_t sys_dvr_page = { "DVR", "gs", "system", sys_dvr_items, 8 };
 
@@ -596,7 +619,7 @@ static const colmenu_page_t sys_datetime_page = { "Date & Time", "gs", "system",
 
 static const colmenu_item_t system_items[] = {
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_WIFI,  .label="Receiver", .sub=&sys_receiver_page },
-    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_AUDIO, .label="Audio",    .sub=&sys_audio_page },
+    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_AUDIO, .label="Audio",    .sub=&sys_audio_page, .available=audio_available },
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_IMAGE, .label="Display",  .sub=&sys_display_page },
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_VIDEO, .label="DVR",      .sub=&sys_dvr_page },
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_WIFI,  .label="Restream", .sub=&sys_restream_page },
