@@ -83,10 +83,20 @@ os_sensors:
     #   multiplier: 16
     #   offset_mv: -300
     #   name: vrx  # `sensor` tag, default: the file name
+    # An in_voltageN_input path is the driver's calibrated mV (no scale), e.g. BetaFPV VR04:
+    # - type: iio
+    #   path: /sys/bus/iio/devices/iio:device0/in_voltage1_input
+    #   multiplier: 20.7
   temperature:
     # Monitor Radxa chip temperatures, see /sys/class/thermal/thermal_zone*/
     - thermal_zone: thermal_zone0  # CPU on Radxa
     - thermal_zone: thermal_zone1  # GPU on Radxa
+    # Or an IIO temperature file: value * multiplier = millidegrees C (in_temp_input: 1),
+    # published with the tag name=<name>. BetaFPV VR04 (whole degrees in in_temp_scale):
+    # - type: iio
+    #   path: /sys/bus/iio/devices/iio:device1/in_temp_scale
+    #   multiplier: 1000
+    #   name: soc
 
 # OS sensors can be auto-discovered
 # os_sensors:

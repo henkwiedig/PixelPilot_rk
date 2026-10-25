@@ -22,14 +22,17 @@ public:
     void addPower(const std::string &sensor_type, const std::string &hwmon_id);
     std::size_t discoverPower();
     // Adds a supply voltage sensor on a Linux IIO ADC channel behind a divider:
-    // published mV = raw * in_voltage_scale * multiplier + offset_mv
-    void addIioVoltage(const std::string &raw_path, int multiplier, int offset_mv,
+    // published mV = raw * in_voltage_scale * multiplier + offset_mv (in_voltageN_input:
+    // its mV * multiplier + offset_mv)
+    void addIioVoltage(const std::string &raw_path, double multiplier, int offset_mv,
                        const std::string &name);
     // Adds a PWM fan's duty cycle (os_mon.fan.duty, %) -- the pwmchip is found by its platform
     // device name, e.g. "fe6e0000.pwm"
     void addPwmFan(const std::string &device, int channel, const std::string &name);
     // Adds temperature sensor
     void addTemperature(const std::string &thermal_zone);
+    // Adds an IIO temperature: the file's value * multiplier, in millidegrees C
+    void addIioTemperature(const std::string &path, double multiplier, const std::string &name);
     std::size_t discoverTemperature();
     // Automatically detects and adds all CPU, power and temperature sensors; returns the number
     // of discovered sensors
