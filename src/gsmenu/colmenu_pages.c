@@ -524,16 +524,13 @@ static const colmenu_item_t sys_receiver_items[] = {
     { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="RX Mode", .param="rx_mode", .on_change=on_rx_mode_change },
 };
 static const colmenu_page_t sys_receiver_page = { "Receiver", "gs", "system", sys_receiver_items, 2 };
-/* System → Audio only with a sound card to play to (the BetaFPV VR04 has
- * none: /proc/asound/cards says "--- no soundcards ---", or is missing). */
+/* System → Audio only where the kernel has sound (ALSA): the BetaFPV VR04
+ * has no sound card of its own, its USB one only shows up once Audio is on
+ * (gsmenu.sh then puts the USB-C port into host mode), so a card isn't
+ * required here. */
 static bool audio_available(void)
 {
-    char line[64] = "";
-    FILE * f = fopen("/proc/asound/cards", "r");
-    if(!f) return false;
-    bool none = !fgets(line, sizeof(line), f) || strstr(line, "no soundcards");
-    fclose(f);
-    return !none;
+    return access("/proc/asound", F_OK) == 0;
 }
 
 /* Rows that only do something on the Rockchip platform: the V4L2 one
