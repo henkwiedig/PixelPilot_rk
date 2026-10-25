@@ -16,8 +16,9 @@
 // the one ahead of it has gone out. Without them, the newest frame.
 //
 // When the video rate is the refresh rate or an integer fraction of it, the
-// HDMI refresh rate is trimmed by up to +-1000 ppm through the kernel's
-// debugfs vsync_adjust knob, which puts the vblanks on the frames' due
+// refresh rate is trimmed by up to +-1000 ppm through a kernel knob (VOP2's
+// debugfs vsync_adjust in ppm, or the Artosyn VO's pixel clock, sysfs
+// pclk_hz), which puts the vblanks on the frames' due
 // times: each frame then goes out after a constant latency, chosen so that
 // all but the latest 1% are ready guard_us before their commit deadline.
 // The camera and the display run off different clocks, so without the lock
@@ -40,9 +41,10 @@
 // (stable_capture()) and works on a step-free capture time.
 class VsyncLock {
 public:
-	// period_us: the display mode's nominal refresh period. guard_us: how
-	// long before the commit deadline the late frames should be ready.
-	void init(int drm_fd, uint32_t crtc_index, double period_us, unsigned guard_us);
+	// period_us: the display mode's nominal refresh period, clock_khz: its
+	// pixel clock. guard_us: how long before the commit deadline the late
+	// frames should be ready.
+	void init(int drm_fd, uint32_t crtc_index, double period_us, uint32_t clock_khz, unsigned guard_us);
 	// Back to the nominal refresh rate.
 	void shutdown();
 	// The same from a signal handler: async-signal-safe.
@@ -107,6 +109,7 @@ private:
 	static const int kRateTicks = 20;  // drops and misses per second over ~10 s
 
 	void set_ppm(int ppm);
+	bool write_knob(int ppm);
 	void update_margin();
 	uint64_t stable_capture(uint64_t capture_us, uint64_t t_us);
 	bool vblank_known() const { return last_vbl_us_ != 0; }
@@ -114,6 +117,9 @@ private:
 	int drm_fd_ = -1;
 	uint32_t crtc_index_ = 0;
 	int knob_fd_ = -1;
+	uint64_t knob_nominal_hz_ = 0;  // pclk_hz: the mode's pixel clock; 0: vsync_adjust
+	char knob_reset_[24] = "";      // what puts the knob back on nominal
+	int knob_reset_len_ = 0;
 	double nominal_period_us_ = 0;
 	unsigned guard_us_ = 0;
 
