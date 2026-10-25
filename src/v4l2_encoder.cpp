@@ -141,7 +141,13 @@ void V4l2Encoder::loop() {
                 encode(rpc);
                 break;
             case Rpc::IDR:
-                idr_pending_ = true;
+                // A keyframe by reopening: a fresh instance starts with one.
+                // V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME is a live parameter change
+                // on wave5 (intra period 1, then back) whose SET_PARAM interrupt
+                // the VPU drops under decode load; the instance then encodes
+                // nothing more, and the decoder sharing the VPU stalls with it.
+                if (fd_ >= 0)
+                    reopen_ = true;
                 break;
             case Rpc::BITRATE:
                 params.bitrate_kbps = rpc.value;
@@ -394,7 +400,6 @@ bool V4l2Encoder::open_device(const V4l2Decoder::Frame &f) {
     stride_ = f.stride;
     plane_height_ = f.plane_height;
     reopen_ = false;
-    idr_pending_ = false;   // the first picture is one anyway
     spdlog::info("V4L2 encoder: {} {}x{} at {} fps, {} kbit/s", codec_name(params.codec), f.width, f.height,
                  params.fps, params.bitrate_kbps);
     return true;
@@ -465,11 +470,6 @@ void V4l2Encoder::encode(const Rpc &rpc) {
         }
         rpc.dec->unref(f.index);
         return;
-    }
-
-    if (idr_pending_) {
-        set_ctrl(V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 1, "keyframe");
-        idr_pending_ = false;
     }
 
     struct v4l2_plane planes[VIDEO_MAX_PLANES] = {};
