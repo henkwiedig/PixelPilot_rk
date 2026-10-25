@@ -1125,6 +1125,17 @@ static void sleep_until_us(uint64_t t_us) {
 	while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {}
 }
 
+#ifdef PIXELPILOT_V4L2
+// The paced flips commit from this thread: on the AR9311's two busy cores the
+// kernel worker that writes a NONBLOCK commit to the hardware, an ordinary
+// thread, came too late for its vblank a few times every 10 s, even with a
+// 4 ms lead. A blocking commit returns right after the vblank, which the loop
+// waits for anyway.
+static const uint32_t kPacedFlipFlags = 0;
+#else
+static const uint32_t kPacedFlipFlags = DRM_MODE_ATOMIC_NONBLOCK;
+#endif
+
 // --vsync-lock: one commit per refresh, vsync_lock.lead_us() before the
 // vblank, with the newest frame and the OSD together (vsync_lock.h).
 static void display_loop_paced() {
@@ -1193,11 +1204,11 @@ static void display_loop_paced() {
 
 		drmModeAtomicFree(output_list->video_request);
 		output_list->video_request = drmModeAtomicAlloc();
-		// A modeset is blocking; any other commit is a NONBLOCK flip, and
-		// its event says which vblank it made.
+		// A modeset is blocking; any other commit is a flip (kPacedFlipFlags),
+		// and its event says which vblank it made.
 		const PlaneChange change = set_video_plane(st, fb_id, false);
 		const uint32_t flags = DRM_MODE_PAGE_FLIP_EVENT |
-			(change == PlaneChange::Modeset ? DRM_MODE_ATOMIC_ALLOW_MODESET : DRM_MODE_ATOMIC_NONBLOCK);
+			(change == PlaneChange::Modeset ? DRM_MODE_ATOMIC_ALLOW_MODESET : kPacedFlipFlags);
 		if (fb_id != 0 && in_fence >= 0)
 			set_drm_object_property(output_list->video_request, &output_list->video_plane,
 			                        "IN_FENCE_FD", in_fence);
@@ -2115,7 +2126,7 @@ void printHelp() {
     "                             into it: no wait for vblank, at the cost of tearing\n"
     "\n"
     "    --vsync-lock           - One paced page flip per refresh, and the refresh rate\n"
-    "                             trimmed (kernel debugfs vsync_adjust) so the frames arrive\n"
+    "                             trimmed (kernel debugfs vsync_adjust or sysfs pclk_hz) so the frames arrive\n"
     "                             just before their flip: no judder, short constant wait\n"
     "\n"
     "    --vsync-lock-guard <ms> - How early the late frames should be ready (Default: 1.0)\n"
@@ -2699,7 +2710,7 @@ int main(int argc, char **argv)
 	if (vsync_lock_mode) {
 		const drmModeModeInfo &m = output_list->mode;
 		vsync_lock.init(drm_fd, output_list->crtc_index, (double)m.htotal * m.vtotal * 1000.0 / m.clock,
-		                vsync_lock_guard_us);
+		                m.clock, vsync_lock_guard_us);
 		signal(SIGTERM, vsync_lock_sigterm);
 		if (vsync_lock_dump)
 			vsync_lock.open_dump(vsync_lock_dump);

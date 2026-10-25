@@ -26,6 +26,11 @@
 static const double kKp = 200.0;   // ppm per ms
 static const double kKi = 5.0;     // ppm per ms per second
 static const int kMaxPpm = 1000;   // the kernel knob's range
+// The Artosyn pixel PLL takes a change of up to 1/2048 (488 ppm) in one
+// write; a bigger one the kernel walks in steps, sleeping a frame per step,
+// inside the write: a missed vblank here. The trim moves at most this far
+// per write instead.
+static const int kPclkStepPpm = 400;
 
 // The median frame is held this far ahead of the late ones: the kSpreadQuantile
 // of the deviations from the median, kDefaultMarginUs until there are enough.
@@ -62,55 +67,80 @@ static uint64_t monotonic_us() {
 	return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
 
-void VsyncLock::init(int drm_fd, uint32_t crtc_index, double period_us, unsigned guard_us) {
+void VsyncLock::init(int drm_fd, uint32_t crtc_index, double period_us, uint32_t clock_khz, unsigned guard_us) {
 	drm_fd_ = drm_fd;
 	crtc_index_ = crtc_index;
 	nominal_period_us_ = period_us_ = period_us;
 	guard_us_ = guard_us;
 
-	// debugfs names the DRM device by its minor, the video port by the
-	// CRTC's index (VOP2 registers one CRTC per video port, in order).
+	// VOP2: debugfs names the DRM device by its minor, the video port by
+	// the CRTC's index (VOP2 registers one CRTC per video port, in order).
+	// The Artosyn VO has one CRTC and puts its pixel clock, which the
+	// driver sets to the mode's at every modeset, on its device in sysfs.
 	char path[96] = "";
+	char pclk_path[96] = "";
 	struct stat st;
 	if (fstat(drm_fd, &st) == 0) {
 		snprintf(path, sizeof(path), "/sys/kernel/debug/dri/%u/video_port%u/vsync_adjust",
 		         minor(st.st_rdev), crtc_index);
 		knob_fd_ = open(path, O_WRONLY | O_CLOEXEC);
+		if (knob_fd_ < 0 && clock_khz) {
+			snprintf(pclk_path, sizeof(pclk_path), "/sys/dev/char/%u:%u/device/pclk_hz",
+			         major(st.st_rdev), minor(st.st_rdev));
+			knob_fd_ = open(pclk_path, O_WRONLY | O_CLOEXEC);
+			if (knob_fd_ >= 0) {
+				knob_nominal_hz_ = (uint64_t)clock_khz * 1000;
+				snprintf(path, sizeof(path), "%s", pclk_path);
+			}
+		}
 	}
 	if (knob_fd_ < 0) {
-		spdlog::warn("vsync lock: no {} ({}): paced flips only, the refresh rate stays nominal",
-		             path, strerror(errno));
+		spdlog::warn("vsync lock: no {}{}{}: paced flips only, the refresh rate stays nominal", path,
+		             pclk_path[0] ? " or " : "", pclk_path);
 		return;
 	}
+	knob_reset_len_ = knob_nominal_hz_ ?
+		snprintf(knob_reset_, sizeof(knob_reset_), "%llu\n", (unsigned long long)knob_nominal_hz_) :
+		snprintf(knob_reset_, sizeof(knob_reset_), "0\n");
 	spdlog::info("vsync lock: refresh period {:.3f} us, trimmed through {}", period_us, path);
 	// A previous run may have left a trim behind.
-	set_ppm(0);
+	write_knob(0);
 }
 
 void VsyncLock::reset_from_signal() {
 	if (knob_fd_ >= 0)
-		(void)!write(knob_fd_, "0\n", 2);
+		(void)!write(knob_fd_, knob_reset_, knob_reset_len_);
 }
 
 void VsyncLock::shutdown() {
 	if (knob_fd_ < 0)
 		return;
-	set_ppm(0);
+	write_knob(0);
 	close(knob_fd_);
 	knob_fd_ = -1;
+}
+
+bool VsyncLock::write_knob(int ppm) {
+	char buf[24];
+	const int n = knob_nominal_hz_ ?
+		snprintf(buf, sizeof(buf), "%llu\n",
+		         (unsigned long long)((int64_t)knob_nominal_hz_ + (int64_t)knob_nominal_hz_ * ppm / 1000000)) :
+		snprintf(buf, sizeof(buf), "%d\n", ppm);
+	if (write(knob_fd_, buf, n) != n)
+		return false;
+	ppm_ = ppm;
+	return true;
 }
 
 void VsyncLock::set_ppm(int ppm) {
 	if (knob_fd_ < 0)
 		return;
+	if (knob_nominal_hz_)
+		ppm = std::max(ppm_ - kPclkStepPpm, std::min(ppm_ + kPclkStepPpm, ppm));
 	// Written even when unchanged: a modeset puts the kernel back on the
 	// nominal rate behind our back.
-	char buf[16];
-	const int n = snprintf(buf, sizeof(buf), "%d\n", ppm);
-	if (write(knob_fd_, buf, n) == n) {
-		ppm_ = ppm;
+	if (write_knob(ppm))
 		return;
-	}
 	static uint64_t last_warn_us = 0;
 	const uint64_t now = monotonic_us();
 	if (now - last_warn_us > 5000000) {

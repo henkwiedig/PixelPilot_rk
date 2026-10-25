@@ -298,7 +298,8 @@ into it by RGA as soon as it leaves the decoder - no wait for vblank, at the cos
 on the RK3568); on a 60 Hz output this took capture -> display from 66 to 51 ms median.
 
 With `--vsync-lock` the display thread flips once per refresh, a lead before the vblank, and trims
-the HDMI refresh rate (kernel debugfs `vsync_adjust`, +-1000 ppm) so that every frame goes out
+the refresh rate (+-1000 ppm: the kernel's debugfs `vsync_adjust` on Rockchip's VOP2, the pixel
+clock through sysfs `pclk_hz` on the Artosyn VO) so that every frame goes out
 after the same capture -> scan-out latency (see `src/vsync_lock.h`). It publishes, twice a second:
 
 | Fact                         | Type   | Description                                                                |
