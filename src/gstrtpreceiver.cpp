@@ -1307,8 +1307,13 @@ std::string GstRtpReceiver::construct_gstreamer_pipeline()
     const std::string src_caps = demux_audio
         ? std::string("caps=\"application/x-rtp\"")
         : pipeline::gst_create_rtp_caps(m_video_codec);
+    // The kernel's default socket buffer (rmem_default, 208 KB) holds ~75 ms of a
+    // 22 Mbit/s stream: any scheduling hiccup of the source thread longer than that
+    // drops packets, and a frame with a hole is lost. The DVR branch's extra CPU load
+    // on the 2-core VR04 made it ~1 loss/s. The buffer costs nothing until queued;
+    // the kernel caps it at rmem_max.
     if (! unix_socket)
-        ss<<"udpsrc port="<<m_port<<" "<<src_caps<<" ! tee name=rtp_tee ";
+        ss<<"udpsrc port="<<m_port<<" buffer-size=2097152 "<<src_caps<<" ! tee name=rtp_tee ";
     else
         ss<<"appsrc name=appsrc "<<src_caps<<" ! tee name=rtp_tee ";
     ss<<"rtp_tee. ! ";
