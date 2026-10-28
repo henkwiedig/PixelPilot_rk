@@ -2077,6 +2077,86 @@ static void dvr_set_fragmented_mux(GstElement* sms) {
     gst_object_unref(mux);
 }
 
+// splitmuxsink releases nothing to the muxer until it has seen the keyframe that
+// ENDS a GOP: the video input blocks in "Waiting for end of GOP" and its internal
+// queue grows by one buffer per overrun while fewer than two keyframes are queued
+// (gstsplitmuxsink.c handle_q_overrun). No property turns that off. An air unit
+// that sends no periodic IDR (intra refresh, e.g. the BetaFPV P1 at 22 Mbit/s) has
+// no GOP end, so the queue grows at the stream rate until the board is out of
+// memory and thrashes. Keep real keyframes as they are; where none shows up for
+// kDvrSyntheticGopNs, flag the next frame as a sync sample so the GOP ends there.
+// The cost is a sync sample that is no IDR: a seek (or the start of a split file)
+// landing on one shows the intra-refresh wave for a few frames.
+static constexpr GstClockTime kDvrSyntheticGopNs = GST_SECOND / 2;
+static constexpr guint kDvrSyntheticGopFrames = 60;   // when buffers carry no timestamp
+// Raw record branch input queue: ~0.5 s of a 22 Mbit/s stream. Closing a file and opening
+// the next takes splitmuxsink ~3 s on the VR04 (cold code pages come back through squashfs),
+// during which it queues the live input; this bounds what piles up on top of the 2 GOPs it
+// holds itself, and a stalled disk drops the oldest packets instead of eating the board's memory.
+static constexpr guint kDvrQueueBytes = 1500000;
+
+struct DvrGopState {
+    GstClockTime base_pts = GST_CLOCK_TIME_NONE;      // first buffer seen
+    GstClockTime last_key_pts = GST_CLOCK_TIME_NONE;  // last buffer passed as a sync sample
+    guint frames_since_key = 0;
+    bool started = false;                             // first sync sample passed
+    guint64 frames = 0, real_keys = 0, synthetic_keys = 0, dropped = 0;
+};
+
+static void dvr_gop_state_free(gpointer p) {
+    auto* st = static_cast<DvrGopState*>(p);
+    spdlog::info("[DVR] keyframe gate: {} frames, {} real keyframes, {} synthetic sync samples, "
+                 "{} frames dropped before the first one",
+                 st->frames, st->real_keys, st->synthetic_keys, st->dropped);
+    delete st;
+}
+
+static GstPadProbeReturn dvr_gop_probe(GstPad*, GstPadProbeInfo* info, gpointer user_data) {
+    auto* st = static_cast<DvrGopState*>(user_data);
+    GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (!buf) return GST_PAD_PROBE_OK;
+    st->frames++;
+
+    GstClockTime pts = GST_BUFFER_PTS_IS_VALID(buf) ? GST_BUFFER_PTS(buf) : GST_BUFFER_DTS(buf);
+    const bool pts_ok = GST_CLOCK_TIME_IS_VALID(pts);
+    auto mark_key = [&](bool real) {
+        if (!st->started)
+            spdlog::info("[DVR] first sync sample is {} ({} frames dropped before it)",
+                         real ? "a real keyframe" : "synthetic", st->dropped);
+        st->started = true;
+        st->last_key_pts = pts;
+        st->frames_since_key = 0;
+        if (real) st->real_keys++; else st->synthetic_keys++;
+    };
+
+    if (!GST_BUFFER_FLAG_IS_SET(buf, GST_BUFFER_FLAG_DELTA_UNIT)) {
+        mark_key(true);
+        return GST_PAD_PROBE_OK;
+    }
+
+    // A delta frame. How long has the stream run without a sync sample?
+    bool synthetic;
+    if (pts_ok) {
+        GstClockTime& ref = st->started ? st->last_key_pts : st->base_pts;
+        if (!GST_CLOCK_TIME_IS_VALID(ref) || pts < ref) ref = pts;  // first buffer / clock stepped back
+        synthetic = pts - ref >= kDvrSyntheticGopNs;
+    } else {
+        synthetic = ++st->frames_since_key >= kDvrSyntheticGopFrames;
+    }
+    if (synthetic) {
+        buf = gst_buffer_make_writable(buf);
+        GST_BUFFER_FLAG_UNSET(buf, GST_BUFFER_FLAG_DELTA_UNIT);
+        GST_PAD_PROBE_INFO_DATA(info) = buf;
+        mark_key(false);
+        return GST_PAD_PROBE_OK;
+    }
+    if (!st->started) {   // nothing before the first sync sample can be decoded
+        st->dropped++;
+        return GST_PAD_PROBE_DROP;
+    }
+    return GST_PAD_PROBE_OK;
+}
+
 void GstRtpReceiver::set_dvr_config(int64_t max_size_bytes, std::function<std::string()> base_path_fn) {
     std::lock_guard<std::mutex> lk(m_dvr_cfg_mutex);
     m_dvr_max_size = max_size_bytes > 0 ? max_size_bytes : 0;
@@ -2151,10 +2231,11 @@ void GstRtpReceiver::dvr_add_record_bin() {
     // splitmuxsink. A leading queue on each input decouples the record branch
     // from the tee so a slow disk cannot back-pressure and stall the live video.
     std::stringstream ss;
-    ss << "queue name=dvr_vq max-size-buffers=0 max-size-bytes=0 max-size-time=0 ! "
+    ss << "queue name=dvr_vq max-size-buffers=0 max-size-bytes=" << kDvrQueueBytes
+       << " max-size-time=0 leaky=downstream ! "
        << pipeline::gst_rtp_video_caps_fields(m_video_codec) << " ! "
        << (h265 ? "rtph265depay" : "rtph264depay") << " name=dvr_vdepay ! "
-       << (h265 ? "h265parse" : "h264parse") << " config-interval=-1 ! "
+       << (h265 ? "h265parse" : "h264parse") << " name=dvr_vparse config-interval=-1 ! "
        << "splitmuxsink name=dvr_sms muxer=mp4mux max-size-bytes=" << static_cast<guint64>(max_bytes);
     if (audio) {
         // capssetter (ANY sink template) hands Opus RTP caps to the depayloader
@@ -2189,6 +2270,16 @@ void GstRtpReceiver::dvr_add_record_bin() {
         g_object_set_data_full(G_OBJECT(sms), "dvr-base", g_strdup(base.c_str()), g_free);
         g_signal_connect(sms, "format-location", G_CALLBACK(&GstRtpReceiver::dvr_format_location), nullptr);
         gst_object_unref(sms);
+    }
+
+    // Give splitmuxsink the GOP ends it waits for (see dvr_gop_probe); the state is
+    // freed, and its summary logged, when the parser's src pad goes away with the bin.
+    if (GstElement* vparse = gst_bin_get_by_name(GST_BIN(bin), "dvr_vparse")) {
+        if (GstPad* sp = gst_element_get_static_pad(vparse, "src")) {
+            gst_pad_add_probe(sp, GST_PAD_PROBE_TYPE_BUFFER, dvr_gop_probe, new DvrGopState(), dvr_gop_state_free);
+            gst_object_unref(sp);
+        }
+        gst_object_unref(vparse);
     }
 
     // Payload-type demux for the record branch when audio is muxed into the flow.
