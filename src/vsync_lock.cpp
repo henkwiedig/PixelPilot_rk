@@ -51,9 +51,14 @@ static const uint64_t kLeadStepGapUs = 1000000, kLeadRelaxUs = 10000000;
 // A capture interval off a whole number of camera frames by more than
 // kStepUs is a step in the clock mapping: the camera itself is regular to a
 // few us. The clock sync moves at most once per probe (500 ms), so one step
-// per kStepGapUs is taken out: when the camera changes its rate, only its
-// first interval passes for a step, and the median period soon follows.
+// per kStepGapUs is taken out, and only up to kMaxStepUs: its moves are a
+// few ms. Anything bigger is the median period lagging the frames, a whole
+// frame off (8.3 ms even at 120 fps): after a reconnect the frames come
+// with gaps or at a lower rate for seconds, the median follows over several
+// intervals, and every 400 ms one more 16.7 or 33.3 ms "step" passed and
+// stayed, until the target latency went negative and every frame dropped.
 static const double kStepUs = 300;
+static const double kMaxStepUs = 5000;
 static const uint64_t kStepGapUs = 400000;
 
 static uint64_t monotonic_us() {
@@ -139,7 +144,8 @@ uint64_t VsyncLock::stable_capture(uint64_t capture_us, uint64_t t_us) {
 			const double period = quantile(iv, 0.5);
 			const double k = std::round(d / period);
 			const double off = d - k * period;
-			if (k >= 1 && k <= 8 && std::fabs(off) > kStepUs && t_us - last_step_us_ >= kStepGapUs) {
+			if (k >= 1 && k <= 8 && std::fabs(off) > kStepUs && std::fabs(off) <= kMaxStepUs &&
+			    t_us - last_step_us_ >= kStepGapUs) {
 				capture_corr_us_ -= (int64_t)std::llround(off);
 				last_step_us_ = t_us;
 				steps_++;
@@ -371,7 +377,23 @@ void VsyncLock::tick(uint64_t now_us) {
 		for (const Sample &x : win)
 			if (x.capture_us)
 				lat.push_back((double)(int64_t)(x.t_us - x.capture_us));
-		const bool use_latency = lat.size() >= win.size() / 2 && lat.size() >= 20;
+		bool use_latency = lat.size() >= win.size() / 2 && lat.size() >= 20;
+		if (use_latency && quantile(lat, 0.5) < 0) {
+			// Frames ready before they were captured: the capture times
+			// are wrong. Undo the steps taken out of them and drop the
+			// samples taken with them; until the capture times make sense
+			// again, show the newest frame.
+			std::lock_guard<std::mutex> lk(mutex_);
+			if (capture_corr_us_ || now_us - last_bad_capture_log_us_ >= 10000000) {
+				spdlog::warn("vsync lock: frames ready {:.1f} ms before their capture, {:+.1f} ms of clock "
+				             "steps undone",
+				             -quantile(lat, 0.5) / 1000, capture_corr_us_ / 1000.0);
+				last_bad_capture_log_us_ = now_us;
+			}
+			capture_corr_us_ = 0;
+			sample_count_ = 0;
+			use_latency = false;
+		}
 		if (use_latency != slot_mode_)
 			deviation_count_ = 0;  // a different kind of deviation
 

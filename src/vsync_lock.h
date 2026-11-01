@@ -66,7 +66,7 @@ public:
 	// The vblank time a frame captured at capture_us belongs to (to within
 	// half a refresh), 0: no capture-time scheduling, show the newest frame.
 	uint64_t due_us(uint64_t capture_us) const {
-		return slot_mode_ && capture_us ? capture_us + (uint64_t)target_lat_us_ : 0;
+		return slot_mode_ && capture_us ? (uint64_t)((int64_t)capture_us + (int64_t)target_lat_us_) : 0;
 	}
 	// A vblank was seen (page flip event or vblank wait).
 	void vblank(uint32_t seq, uint64_t t_us);
@@ -142,6 +142,7 @@ private:
 	uint64_t last_step_us_ = 0;
 	unsigned steps_ = 0;
 	double largest_step_us_ = 0;
+	uint64_t last_bad_capture_log_us_ = 0;
 
 	// Each frame's phase against its window's median (ring), for the margin.
 	double deviations_[kDeviations];
