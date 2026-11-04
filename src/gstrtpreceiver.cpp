@@ -1261,6 +1261,11 @@ static std::shared_ptr<std::vector<uint8_t>> gst_copy_buffer(GstBuffer* buffer){
     return ret;
 }
 
+// The marker of the buffer the pull thread is handing to the callback.
+static thread_local bool t_last_buffer_au_end = false;
+
+bool GstRtpReceiver::last_buffer_au_end() { return t_last_buffer_au_end; }
+
 static void loop_pull_appsink_samples(bool& keep_looping,GstElement *app_sink_element,
                                       const GstRtpReceiver::NEW_FRAME_CALLBACK out_cb,
                                       const std::function<void()>& on_tick){
@@ -1276,6 +1281,7 @@ static void loop_pull_appsink_samples(bool& keep_looping,GstElement *app_sink_el
             if (buffer) {
                 on_incoming_stream_buffer(buffer, "appsink");
                 auto buff_copy=gst_copy_buffer(buffer);
+                t_last_buffer_au_end = GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_MARKER);
                 out_cb(buff_copy);
             }
             gst_sample_unref(sample);
@@ -1318,8 +1324,17 @@ std::string GstRtpReceiver::construct_gstreamer_pipeline()
     } else {
         ss<<pipeline::create_rtp_depacketize_for_codec(m_video_codec);
     }
-    ss<<pipeline::create_parse_for_codec(m_video_codec);
-    ss<<pipeline::create_out_caps(m_video_codec);
+    // Slice mode: each NAL as the depayloader completes it, the RTP marker on
+    // the last of an access unit kept as the buffer's MARKER flag. h265parse
+    // would gather them into access units again (and could drop the flag).
+    const bool nal = m_nal_mode && m_video_codec == VideoCodec::H265;
+    m_nal_active.store(nal, std::memory_order_relaxed);
+    if (nal) {
+        ss<<"video/x-h265, stream-format=\"byte-stream\", alignment=nal ! ";
+    } else {
+        ss<<pipeline::create_parse_for_codec(m_video_codec);
+        ss<<pipeline::create_out_caps(m_video_codec);
+    }
     ss<<"appsink drop=true name=out_appsink";
     if (play_audio) {
         ss<<pipeline::create_audio_branch(m_audio_pt, m_audio_device);
@@ -1550,6 +1565,7 @@ std::string GstRtpReceiver::construct_file_playback_pipeline(const char * file_p
                      file_codec == VideoCodec::H265 ? "H.265" : "H.264");
     }
     m_playback_codec = file_codec;
+    m_nal_active.store(false, std::memory_order_relaxed);
 
     std::stringstream ss;
     ss<<"filesrc location="<<file_path<<" ! qtdemux ! ";

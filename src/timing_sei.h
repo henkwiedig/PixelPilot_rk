@@ -4,7 +4,8 @@
 /*
  * Per-frame timing that ar8030-transport-rx puts into the H.265 stream:
  * one prefix SEI (user_data_unregistered, our UUID) ahead of each access
- * unit's first slice. Every time in it is on this machine's
+ * unit's first slice -- or, when rx passed the frame on slice by slice, a
+ * suffix SEI ahead of its last slice. Every time in it is on this machine's
  * CLOCK_MONOTONIC in microseconds -- rx has already mapped the air unit's
  * capture time onto the ground clock -- so it compares directly against
  * get_time_us() and against DRM's page-flip timestamps.
@@ -39,10 +40,14 @@ struct timing_sei_v1 { /* little endian */
 };
 #pragma pack(pop)
 
-/* Looks for the timing SEI in an H.265 Annex-B access unit, scanning only
- * up to the first slice (it is a prefix SEI). Returns 1 and fills *out if
- * found, 0 otherwise. */
+/* Looks for the timing SEI in an H.265 Annex-B access unit: a prefix SEI
+ * before the first slice or a suffix SEI after it. Returns 1 and fills
+ * *out if found, 0 otherwise. */
 int timing_sei_parse(const uint8_t *au, uint32_t len, struct timing_sei_v1 *out);
+
+/* The same for one NAL, start code included (slice mode: the pipeline
+ * hands out NALs one by one): prefix or suffix SEI alike. */
+int timing_sei_parse_nal(const uint8_t *nal, uint32_t len, struct timing_sei_v1 *out);
 
 #ifdef __cplusplus
 }

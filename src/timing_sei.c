@@ -3,6 +3,7 @@
 #include <string.h>
 
 #define SEI_PREFIX_NAL_TYPE 39
+#define SEI_SUFFIX_NAL_TYPE 40
 #define SEI_USER_DATA_UNREGISTERED 5
 #define TIMING_SEI_PAYLOAD_SIZE (16 + (int)sizeof(struct timing_sei_v1))
 
@@ -28,8 +29,34 @@ static uint32_t find_start_code(const uint8_t *buf, uint32_t len, uint32_t from,
     return len;
 }
 
+/* Decodes our message from the SEI NAL whose payload (after its 2-byte
+ * header) is buf[from..to). Returns 1 if it is ours. */
+static int decode_sei(const uint8_t *buf, uint32_t from, uint32_t to, struct timing_sei_v1 *out)
+{
+    /* Undo emulation prevention, only as far as our message goes. */
+    uint8_t rbsp[2 + TIMING_SEI_PAYLOAD_SIZE];
+    uint32_t r = 0;
+    int zeros = 0;
+    for (uint32_t i = from; i < to && r < sizeof(rbsp); i++) {
+        if (zeros >= 2 && buf[i] == 3) {
+            zeros = 0;
+            continue;
+        }
+        rbsp[r++] = buf[i];
+        zeros = buf[i] == 0 ? zeros + 1 : 0;
+    }
+    if (r == sizeof(rbsp) && rbsp[0] == SEI_USER_DATA_UNREGISTERED &&
+        rbsp[1] >= TIMING_SEI_PAYLOAD_SIZE && memcmp(rbsp + 2, k_uuid, sizeof(k_uuid)) == 0 &&
+        rbsp[2 + 16] == TIMING_SEI_VERSION) {
+        memcpy(out, rbsp + 2 + 16, sizeof(*out));
+        return 1;
+    }
+    return 0;
+}
+
 int timing_sei_parse(const uint8_t *au, uint32_t len, struct timing_sei_v1 *out)
 {
+    int seen_slice = 0;
     uint32_t sc_len;
     uint32_t pos = find_start_code(au, len, 0, &sc_len);
     while (pos < len) {
@@ -38,31 +65,27 @@ int timing_sei_parse(const uint8_t *au, uint32_t len, struct timing_sei_v1 *out)
             return 0;
         uint8_t type = (au[nal] >> 1) & 0x3f;
         if (type <= 31)
-            return 0; /* first slice: a prefix SEI can only come before it */
+            seen_slice = 1;
         uint32_t next_sc;
         uint32_t next = find_start_code(au, len, nal, &next_sc);
-        if (type == SEI_PREFIX_NAL_TYPE) {
-            /* Undo emulation prevention, only as far as our message goes. */
-            uint8_t rbsp[2 + TIMING_SEI_PAYLOAD_SIZE];
-            uint32_t r = 0;
-            int zeros = 0;
-            for (uint32_t i = nal + 2; i < next && r < sizeof(rbsp); i++) {
-                if (zeros >= 2 && au[i] == 3) {
-                    zeros = 0;
-                    continue;
-                }
-                rbsp[r++] = au[i];
-                zeros = au[i] == 0 ? zeros + 1 : 0;
-            }
-            if (r == sizeof(rbsp) && rbsp[0] == SEI_USER_DATA_UNREGISTERED &&
-                rbsp[1] >= TIMING_SEI_PAYLOAD_SIZE && memcmp(rbsp + 2, k_uuid, sizeof(k_uuid)) == 0 &&
-                rbsp[2 + 16] == TIMING_SEI_VERSION) {
-                memcpy(out, rbsp + 2 + 16, sizeof(*out));
-                return 1;
-            }
-        }
+        /* A prefix SEI ahead of the first slice, a suffix SEI after it. */
+        if ((seen_slice ? type == SEI_SUFFIX_NAL_TYPE : type == SEI_PREFIX_NAL_TYPE) &&
+            decode_sei(au, nal + 2, next, out))
+            return 1;
         pos = next;
         sc_len = next_sc;
     }
     return 0;
+}
+
+int timing_sei_parse_nal(const uint8_t *nal, uint32_t len, struct timing_sei_v1 *out)
+{
+    uint32_t sc_len;
+    uint32_t pos = find_start_code(nal, len, 0, &sc_len);
+    if (pos != 0 || sc_len + 2 >= len)
+        return 0;
+    uint8_t type = (nal[sc_len] >> 1) & 0x3f;
+    if (type != SEI_PREFIX_NAL_TYPE && type != SEI_SUFFIX_NAL_TYPE)
+        return 0;
+    return decode_sei(nal, sc_len + 2, len, out);
 }

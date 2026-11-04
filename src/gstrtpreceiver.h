@@ -76,6 +76,16 @@ public:
     // The big advantage of gstreamer is that it seems to handle all those parsing quirks the best,
     // e.g. the frames on this cb should be easily passable to whatever decode api is available.
     typedef std::function<void(std::shared_ptr<std::vector<uint8_t>> frame)> NEW_FRAME_CALLBACK;
+    // Slice mode: the live H.265 pipeline hands the callback one NAL at a
+    // time, as soon as the depayloader has it, instead of whole access units
+    // (no h265parse), so a decoder that takes a picture slice by slice
+    // starts on it before it is all in. Set before start_receiving(). File
+    // playback still hands out access units; nal_aligned() says which.
+    void set_nal_mode(bool on) { m_nal_mode = on; }
+    bool nal_aligned() const { return m_nal_active.load(std::memory_order_relaxed); }
+    // In the callback (on the pull thread): the buffer it was given ends an
+    // access unit (it carried the RTP marker). Meaningful in NAL mode only.
+    static bool last_buffer_au_end();
     void start_receiving(NEW_FRAME_CALLBACK cb);
     void stop_receiving();
     VideoCodec switch_to_file_playback(const char* file_path);
@@ -164,6 +174,9 @@ private:
     int m_audio_pt = 98;
     // True while a switch_to_file_playback() pipeline is up (no live audio branch).
     bool m_file_playback = false;
+    // Slice mode (set_nal_mode()), and whether the pipeline up now is built for it.
+    bool m_nal_mode = false;
+    std::atomic<bool> m_nal_active{false};
     // Serializes switch_to_stream() so a menu audio-toggle and an automatic
     // codec-switch rebuild can never tear down/rebuild the pipeline at once.
     std::mutex m_stream_mutex;
