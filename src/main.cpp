@@ -111,6 +111,7 @@ pthread_mutex_t video_mutex;
 // flip event's vblank timestamp.
 struct FrameTiming {
 	uint64_t pts_us;       // fed to the decoder (also the MPP pts)
+	uint64_t fed_us;       // all of it with the decoder: pts_us, or the last slice's append
 	uint64_t decoded_us;   // decode_get_frame() handed the frame out
 	struct timing_sei_v1 sei;
 	uint32_t size;         // the access unit, bytes
@@ -136,9 +137,10 @@ static int paced_head, paced_count;
 
 // Round robin: the oldest entry is overwritten, which only ever loses the
 // timing of a frame the decoder dropped anyway.
-static void frame_timing_store(uint64_t pts_us, const struct timing_sei_v1 &sei, uint32_t size) {
+static void frame_timing_store(uint64_t pts_us, const struct timing_sei_v1 &sei, uint32_t size,
+                               uint64_t fed_us) {
 	std::lock_guard<std::mutex> lk(frame_timing_mutex);
-	frame_timing[frame_timing_next] = {pts_us, 0, sei, size};
+	frame_timing[frame_timing_next] = {pts_us, fed_us, 0, sei, size};
 	frame_timing_next = (frame_timing_next + 1) % kFrameTimingSlots;
 }
 
@@ -577,7 +579,7 @@ void *__FRAME_THREAD__(void *param)
 						vsync_lock.frame_ready((uint64_t)ats.tv_sec * 1000000 + ats.tv_nsec / 1000,
 						                       timing.pts_us ? timing.sei.capture_ground_us : 0,
 						                       timing.pts_us ? timing.sei.rx_done_ground_us : 0,
-						                       timing.pts_us, timing.pts_us ? timing.size : 0);
+						                       timing.pts_us ? timing.fed_us : 0, timing.pts_us ? timing.size : 0);
 					ret = pthread_mutex_lock(&video_mutex);
 					assert(!ret);
 					if (vsync_lock_mode) {
@@ -668,8 +670,9 @@ static void publish_latency_facts(const FrameTiming &f, uint64_t scanout_us) {
 	// it carries the sync uncertainty: rx done -> fed to MPP (RTP +
 	// GStreamer), fed -> decoded frame out (hardware decode + MPP's own
 	// queueing), decoded -> scan-out (handover + waiting for the flip).
-	v[LAT_PIPELINE] = ((double)f.pts_us - (double)t.rx_done_ground_us) / 1000.0;
-	v[LAT_DECODE] = ((double)f.decoded_us - (double)f.pts_us) / 1000.0;
+	// A picture fed slice by slice counts as fed with its last slice.
+	v[LAT_PIPELINE] = ((double)f.fed_us - (double)t.rx_done_ground_us) / 1000.0;
+	v[LAT_DECODE] = ((double)f.decoded_us - (double)f.fed_us) / 1000.0;
 	v[LAT_DISPLAY] = ((double)scanout_us - (double)f.decoded_us) / 1000.0;
 	const bool have_encode = t.flags & TIMING_SEI_FLAG_ENCODE;
 	v[LAT_ENCODE] = t.encode_us / 1000.0;
@@ -1408,12 +1411,14 @@ int decoder_stalled_count=0;
 // pts_us is when the packet is fed, CLOCK_MONOTONIC microseconds, and
 // unique per packet: it comes back out on the decoded frame, where it both
 // measures decode + handover and finds the frame's timing SEI again.
-bool feed_packet_to_decoder(MppPacket *packet,void* data_p,int data_len,uint64_t pts_us){
+// flag: MPP_PACKET_FLAG_* for this packet (slice mode's STREAM_START), 0 else.
+bool feed_packet_to_decoder(MppPacket *packet,void* data_p,int data_len,uint64_t pts_us,RK_U32 flag = 0){
     mpp_packet_set_data(packet, data_p);
     mpp_packet_set_size(packet, data_len);
     mpp_packet_set_pos(packet, data_p);
     mpp_packet_set_length(packet, data_len);
     mpp_packet_set_pts(packet,(RK_S64) pts_us);
+    mpp_packet_set_flag(packet, flag);
     // Feed the data to mpp until either timeout (in which case the decoder might have stalled)
     // or success
     uint64_t data_feed_begin = get_time_ms();
@@ -1450,6 +1455,53 @@ extern "C" {
 static MppCodingType current_mpp_type = MPP_VIDEO_CodingHEVC;
 static MppCodingType stream_mpp_type  = MPP_VIDEO_CodingHEVC;
 
+// ---------------------------------------------------------------------------
+// Slice mode: a picture goes to the decoder as its slices arrive. Needs the
+// RK3568 decoder's stream mode (the VRX Pro's rkvdec2 kernel patch and MPP's
+// MPP_DEC_SET_STREAM_APPEND, both after fpvOS), a link that passes the air's
+// slices on one by one (ar8030-transport-rx) and an encoder that cuts its
+// pictures into slices. The receiver then hands out NALs instead of access
+// units (GstRtpReceiver::set_nal_mode()); the first slice of a picture,
+// behind its parameter sets, goes in as a packet flagged
+// MPP_PACKET_FLAG_STREAM_START with the picture's slice count, each later
+// slice by MPP_DEC_SET_STREAM_APPEND, and the decoder is done with the
+// picture ~1.5 ms after its last slice instead of ~3.5 ms. MPP needs the
+// slice count up front: it is learned from the pictures, which go in whole
+// until three in a row have had the same count.
+// ---------------------------------------------------------------------------
+static bool slices_enabled = true;                    // --no-slices
+static std::atomic<bool> decoder_streams{false};      // the decoder takes pictures slice by slice
+static std::atomic<uint32_t> decoder_generation{0};   // one per decoder (re)init
+
+// After each decoder init: can it take pictures slice by slice?
+static void probe_decoder_streaming(MppCodingType type) {
+	decoder_generation.fetch_add(1);
+	decoder_streams.store(false);
+#ifdef MPP_PACKET_FLAG_STREAM_START
+	if (!slices_enabled || type != MPP_VIDEO_CodingHEVC)
+		return;
+	if (mpi.mpi->control(mpi.ctx, MPP_DEC_SET_STREAM_APPEND, NULL) != MPP_OK) {
+		spdlog::info("slices: the decoder takes whole pictures only");
+		return;
+	}
+	// The packets are then whole pictures or first slices, nothing to split:
+	// MPP's own splitter would hold a first slice back for the rest.
+	MppDecCfg cfg = NULL;
+	mpp_dec_cfg_init(&cfg);
+	if (mpi.mpi->control(mpi.ctx, MPP_DEC_GET_CFG, cfg) == MPP_OK &&
+	    mpp_dec_cfg_set_u32(cfg, "base:split_parse", 0) == MPP_OK &&
+	    mpi.mpi->control(mpi.ctx, MPP_DEC_SET_CFG, cfg) == MPP_OK) {
+		decoder_streams.store(true);
+		spdlog::info("slices: the decoder takes pictures slice by slice");
+	} else {
+		spdlog::warn("slices: could not turn MPP's frame splitter off, whole pictures only");
+	}
+	mpp_dec_cfg_deinit(cfg);
+#else
+	(void)type;
+#endif
+}
+
 static void reinit_mpp_decoder(MppCodingType new_type) {
     if (new_type == current_mpp_type) return;
     spdlog::info("Reinitializing MPP decoder: {} -> {}",
@@ -1473,6 +1525,7 @@ static void reinit_mpp_decoder(MppCodingType new_type) {
     ret = mpi.mpi->control(mpi.ctx, MPP_SET_OUTPUT_BLOCK, &param);
     assert(!ret);
     current_mpp_type = new_type;
+    probe_decoder_streaming(new_type);
 
     mpp_reinit_pending.store(false, std::memory_order_release);
     pthread_mutex_unlock(&mpp_reinit_mutex);
@@ -1656,6 +1709,193 @@ static void publish_codec_fact(VideoCodec c) {
 	                      (c == VideoCodec::H265) ? 1u : 0u);
 }
 
+// The packet's MPP pts: when it is fed, unique per packet. It comes back out
+// on the decoded frame, where it finds the frame's timing again.
+static uint64_t next_feed_pts() {
+	static uint64_t last_pts_us = 0;
+	uint64_t pts_us = get_time_us();
+	if (pts_us <= last_pts_us) pts_us = last_pts_us + 1;
+	last_pts_us = pts_us;
+	return pts_us;
+}
+
+// feed_packet_to_decoder(), asking the air for a keyframe when the decoder
+// keeps refusing packets.
+static void feed_decoder(MppPacket *packet, void *data, int len, uint64_t pts_us, RK_U32 flag) {
+	static int stall_count = 0;
+	static uint64_t last_stall_idr_ms = 0;
+	if (!feed_packet_to_decoder(packet, data, len, pts_us, flag)) {
+		stall_count++;
+		uint64_t now = get_time_ms();
+		if (stall_count >= 3 && (now - last_stall_idr_ms) > 500) {
+			last_stall_idr_ms = now;
+			stall_count = 0;
+			idr_request_decoder_issue("decoder-feed-stall");
+		}
+	} else {
+		stall_count = 0;
+	}
+}
+
+// Slice mode's picture assembly (see probe_decoder_streaming()), on the pull
+// thread: one NAL at a time, start code included.
+struct SliceFeed {
+	std::vector<uint8_t> pic;    // for the next packet: parameter sets and SEIs, and the slices of a whole picture
+	bool open = false;           // the picture's first slice has come
+	bool streaming = false;      // it went in with STREAM_START
+	bool ended = false;          // ... and has had its last append
+	uint64_t pts = 0;
+	int slices = 0;              // the picture's slices so far
+	int announced = 0;           // the slice count it went in with
+	uint32_t size = 0;           // its bytes so far
+	bool have_timing = false;
+	struct timing_sei_v1 timing;
+	int slice_count = 0;         // learned slices per picture, 0 = not yet
+	int candidate = 0, agree = 0;
+	uint32_t generation = 0;
+	// for the log
+	unsigned n_streamed = 0, n_whole = 0, n_cut = 0, n_dropped = 0, n_refused = 0;
+	uint64_t log_ms = 0;
+};
+static SliceFeed slice_feed;
+
+static void slice_append(SliceFeed &s, const uint8_t *data, uint32_t len, bool last) {
+#ifdef MPP_PACKET_FLAG_STREAM_START
+	MppDecStreamAppend a;
+	a.data = data;
+	a.size = len;
+	a.flags = last ? MPP_STREAM_APPEND_LAST : 0;
+	a.pts = (RK_S64)s.pts;
+	if (mpi.mpi->control(mpi.ctx, MPP_DEC_SET_STREAM_APPEND, &a) != MPP_OK)
+		s.n_refused++;
+#else
+	(void)s; (void)data; (void)len; (void)last;
+#endif
+	if (last) {
+		s.ended = true;
+		if (s.have_timing)
+			frame_timing_store(s.pts, s.timing, s.size, get_time_us());
+	}
+}
+
+// The open picture is over: complete (its marker came) or not (the next
+// picture started first: rx lost the rest of it).
+static void slice_feed_end(MppPacket *packet, SliceFeed &s, bool complete) {
+	if (!s.open)
+		return;
+	if (s.streaming) {
+		if (!s.ended)
+			slice_append(s, NULL, 0, true); // its rest is lost: the decoder ends it there
+		if (!complete)
+			s.n_cut++;
+	} else if (complete) {
+		s.pts = next_feed_pts();
+		if (s.have_timing)
+			frame_timing_store(s.pts, s.timing, s.size, s.pts);
+		feed_decoder(packet, s.pic.data(), (int)s.pic.size(), s.pts, 0);
+		s.n_whole++;
+	} else {
+		s.n_dropped++; // whole, but not all of it came: dropped, as rx drops a frame it did not get whole
+	}
+	if (complete) {
+		if (s.slices == s.candidate) {
+			if (s.agree < 3) s.agree++;
+		} else {
+			s.candidate = s.slices;
+			s.agree = 1;
+		}
+		if (s.agree == 3 && s.slice_count != s.candidate) {
+			s.slice_count = s.candidate;
+			spdlog::info("slices: {} a picture{}", s.slice_count,
+			             s.slice_count >= 2 && decoder_streams.load() ? ", fed as they come" : "");
+		}
+	}
+	s.pic.clear();
+	s.open = s.streaming = s.ended = s.have_timing = false;
+	s.slices = 0;
+	s.size = 0;
+}
+
+static void slice_feed_nal(MppPacket *packet, const uint8_t *nal, uint32_t len, bool au_end) {
+	SliceFeed &s = slice_feed;
+	const uint32_t gen = decoder_generation.load();
+	if (s.generation != gen) { // a new decoder: start over
+		s = SliceFeed();
+		s.generation = gen;
+	}
+	const uint32_t sc = (len >= 4 && !nal[0] && !nal[1] && !nal[2] && nal[3] == 1) ? 4 :
+	                    (len >= 3 && !nal[0] && !nal[1] && nal[2] == 1) ? 3 : 0;
+	if (!sc || len < sc + 3)
+		return;
+	const uint8_t type = (nal[sc] >> 1) & 0x3f;
+	const bool vcl = type <= 31;
+	const bool first = vcl && (nal[sc + 2] & 0x80); // first_slice_segment_in_pic_flag
+	// What only comes ahead of a picture's first slice (VPS, SPS, PPS, AUD,
+	// prefix SEI, reserved) starts the next one.
+	const bool starts_au = first || (type >= 32 && type <= 35) || type == 39 ||
+	                       (type >= 41 && type <= 44) || (type >= 48 && type <= 55);
+	if (s.open && starts_au)
+		slice_feed_end(packet, s, false);
+
+	if (!vcl) {
+		struct timing_sei_v1 t;
+		if ((type == 39 || type == 40) && timing_sei_parse_nal(nal, len, &t) &&
+		    (t.flags & TIMING_SEI_FLAG_SYNC_VALID)) {
+			s.timing = t;
+			s.have_timing = true;
+		}
+		// The decoder reads only the slices of what is appended: a
+		// streamed picture's suffix SEI stays here.
+		if (!s.streaming) {
+			s.pic.insert(s.pic.end(), nal, nal + len);
+			s.size += len;
+		}
+		if (au_end)
+			slice_feed_end(packet, s, true);
+		return;
+	}
+
+	if (first) {
+		s.open = true;
+		s.slices = 0;
+	} else if (!s.open) {
+		return; // a slice of a picture whose start never came
+	}
+	s.slices++;
+	s.size += len;
+#ifdef MPP_PACKET_FLAG_STREAM_START
+	if (first && !au_end && s.slice_count >= 2 && decoder_streams.load()) {
+		s.pic.insert(s.pic.end(), nal, nal + len);
+		s.pts = next_feed_pts();
+		s.announced = s.slice_count;
+		feed_decoder(packet, s.pic.data(), (int)s.pic.size(), s.pts,
+		             MPP_PACKET_FLAG_STREAM_START | MPP_PACKET_STREAM_SLICES(s.announced));
+		s.pic.clear();
+		s.streaming = true;
+		s.n_streamed++;
+		return;
+	}
+#endif
+	if (s.streaming) {
+		// More slices than it went in with come too late for it.
+		if (!s.ended)
+			slice_append(s, nal, len, au_end || s.slices == s.announced);
+	} else {
+		s.pic.insert(s.pic.end(), nal, nal + len);
+	}
+	if (au_end)
+		slice_feed_end(packet, s, true);
+
+	const uint64_t now = get_time_ms();
+	if (now - s.log_ms >= 10000) {
+		if (s.log_ms)
+			spdlog::info("slices: last 10 s {} pictures streamed, {} whole, {} cut short, {} dropped, "
+			             "{} appends refused", s.n_streamed, s.n_whole, s.n_cut, s.n_dropped, s.n_refused);
+		s.n_streamed = s.n_whole = s.n_cut = s.n_dropped = s.n_refused = 0;
+		s.log_ms = now;
+	}
+}
+
 void read_gstreamerpipe_stream(MppPacket *packet, int gst_udp_port, const char *sock ,const VideoCodec& codec){
 	if (sock) {
 		receiver = std::make_unique<GstRtpReceiver>(sock, codec);
@@ -1679,34 +1919,31 @@ void read_gstreamerpipe_stream(MppPacket *packet, int gst_udp_port, const char *
     auto cb=[&packet,/*&decoder_stalled_count,*/ &bytes_received, &period_start](std::shared_ptr<std::vector<uint8_t>> frame){
         // Let the gst pull thread run at quite high priority
         static bool first= true;
-        static int stall_count = 0;
-        static uint64_t last_stall_idr_ms = 0;
         if(first){
             SchedulingHelper::set_thread_params_max_realtime("GstPullThread",SchedulingHelper::PRIORITY_REALTIME_LOW);
             first= false;
         }
 		bytes_received += frame->size();
-		uint64_t now = get_time_ms();
+        if (receiver && receiver->nal_aligned()) {
+            // Slice mode: one NAL. The byte count goes out once a picture,
+            // as it does for whole ones (an OSD fact per NAL costs).
+            static uint32_t au_bytes = 0;
+            const bool au_end = GstRtpReceiver::last_buffer_au_end();
+            au_bytes += frame->size();
+            if (au_end) {
+                osd_publish_uint_fact("gstreamer.received_bytes", NULL, 0, au_bytes);
+                au_bytes = 0;
+            }
+            slice_feed_nal(packet, frame->data(), (uint32_t)frame->size(), au_end);
+            return;
+        }
 		osd_publish_uint_fact("gstreamer.received_bytes", NULL, 0, frame->size());
-        static uint64_t last_pts_us = 0;
-        uint64_t pts_us = get_time_us();
-        if (pts_us <= last_pts_us) pts_us = last_pts_us + 1;
-        last_pts_us = pts_us;
+        uint64_t pts_us = next_feed_pts();
         struct timing_sei_v1 sei;
         if (timing_sei_parse(frame->data(), (uint32_t)frame->size(), &sei) &&
             (sei.flags & TIMING_SEI_FLAG_SYNC_VALID))
-            frame_timing_store(pts_us, sei, (uint32_t)frame->size());
-        const bool fed_ok = feed_packet_to_decoder(packet,frame->data(),frame->size(),pts_us);
-        if (!fed_ok) {
-            stall_count++;
-            if (stall_count >= 3 && (now - last_stall_idr_ms) > 500) {
-                last_stall_idr_ms = now;
-                stall_count = 0;
-                idr_request_decoder_issue("decoder-feed-stall");
-            }
-        } else {
-            stall_count = 0;
-        }
+            frame_timing_store(pts_us, sei, (uint32_t)frame->size(), pts_us);
+        feed_decoder(packet, frame->data(), (int)frame->size(), pts_us, 0);
         // Raw DVR is no longer fed frame-by-frame here: the receiver records the
         // native stream (+ muxed Opus) in-pipeline via splitmuxsink.
     };
@@ -1716,6 +1953,7 @@ void read_gstreamerpipe_stream(MppPacket *packet, int gst_udp_port, const char *
     dvr_configure_receiver();
     dvr_configure_reenc_receiver();
     if (receiver) {
+        receiver->set_nal_mode(decoder_streams.load());
         receiver->set_dvr_reenc_on_start(dvr_reenc_on_start);
         receiver->dvr_request_recording(dvr_enabled != 0 && dvr_mode_has_raw());
         receiver->dvr_reenc_request_recording(dvr_enabled != 0 && dvr_mode_has_reenc());
@@ -1876,6 +2114,9 @@ void printHelp() {
     "\n"
     "    --vsync-lock-dump <path> - Write every frame's, vblank's and controller tick's timing\n"
     "                             to path (strftime template, e.g. /media/dvr/vsync_%Y%m%d_%H%M%S.txt)\n"
+    "\n"
+    "    --no-slices            - Feed the decoder whole pictures only, even where it could\n"
+    "                             start on a picture's first slice (VRX Pro, sliced stream)\n"
     "\n"
     "    --disable-gregidr      - Disable last-hop probing and IDR requests\n"
     "\n"
@@ -2147,6 +2388,11 @@ int main(int argc, char **argv)
 
 	__OnArgument("--vsync-lock") {
 		vsync_lock_mode = true;
+		continue;
+	}
+
+	__OnArgument("--no-slices") {
+		slices_enabled = false;
 		continue;
 	}
 
@@ -2481,6 +2727,7 @@ int main(int argc, char **argv)
 	int param = MPP_POLL_BLOCK;
 	ret = mpi.mpi->control(mpi.ctx, MPP_SET_OUTPUT_BLOCK, &param);
 	assert(!ret);
+	probe_decoder_streaming(mpp_type);
 
 
 	////////////////////////////////// SIGNAL SETUP
