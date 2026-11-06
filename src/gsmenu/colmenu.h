@@ -112,6 +112,11 @@ void colmenu_prompt(const char * title, void (*on_ok)(const char * text, void * 
  * non-zero exit shows an error dialog with the command output. */
 void colmenu_exec(const char * cmd);
 
+/* Hand the keypad to the current column: for a dialog closing over the menu.
+ * The column it was opened from may be gone by then (a drone subtree closes
+ * when the link drops), so a group saved at open time must not be restored. */
+void colmenu_refocus(void);
+
 /* Integration hooks for embedding in the app's menu screen. */
 lv_group_t * colmenu_root_group(void);                               /* focus on open */
 void         colmenu_set_root_back(void (*cb)(void * ctx), void * ctx); /* Back at root */
