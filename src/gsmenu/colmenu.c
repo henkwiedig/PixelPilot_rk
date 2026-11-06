@@ -1232,4 +1232,5 @@ void colmenu_reflect_switch(const char * param, bool on)
 }
 
 lv_group_t * colmenu_root_group(void) { return colstack_root_group(g_cs); }
+void colmenu_refocus(void) { if(g_cs) lv_indev_set_group(indev_drv, colstack_cur_group(g_cs)); }
 void colmenu_set_root_back(void (*cb)(void * ctx), void * ctx) { colstack_set_root_back(g_cs, cb, ctx); }
