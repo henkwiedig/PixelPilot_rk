@@ -16,6 +16,7 @@
 #include "lvgl/lvgl.h"
 
 #include "../input.h"
+#include "colmenu.h"
 #include "helper.h"
 #include "gs_scripts.h"
 #include "styles.h"
@@ -42,16 +43,27 @@ typedef struct {
     lv_group_t *group;
     uint32_t term_tick;   /* tick when SIGTERM was sent (0 = not stopping); used
                              to escalate to SIGKILL if the script ignores it   */
+    bool locked;          /* Close is disabled while the child runs: a job whose
+                             own cleanup must run can only be stopped (SIGTERM) */
+    int esc;              /* ANSI escape parser state, kept across reads        */
+    bool cr;              /* a "\r" came last: the next text rewrites the line  */
 } script_runner_t;
+
+enum { ESC_NONE, ESC_START, ESC_CSI };
+
+#define MAX_CMD_ARGS 8
 
 static char *g_script_names[MAX_SCRIPT_COUNT];
 static int g_script_count;
 static lv_obj_t *g_confirm_msgbox;
 static lv_group_t *g_confirm_group;
+static lv_timer_t *g_confirm_timer;   /* keeps the keypad on the dialog */
 static char g_pending_script[256];
-/* group to restore the keypad to after the confirm/runner closes; captured at
- * run time so the feature works from colmenu (no menu_page_data there). */
-static lv_group_t *g_return_group;
+/* gs_scripts_run_cmd(): the command waiting for its confirm dialog (argv
+ * strdup'd, NULL-terminated; g_pending_argv[0] == NULL = a script is pending) */
+static char *g_pending_argv[MAX_CMD_ARGS + 1];
+static char g_pending_title[128];
+static char g_pending_prompt[640];
 
 static script_runner_t g_runner = {
     .pid = -1,
@@ -129,6 +141,11 @@ static void clear_script_names(void)
     g_script_count = 0;
 }
 
+/* Appends child output the way a terminal shows it: a "\r" that is not part of
+ * "\r\n" returns to the start of the line, so the text after it rewrites that
+ * line (progress counters, wget's bar stay on one line), and ANSI escape
+ * sequences (colours) and other control bytes are dropped. The escape and "\r"
+ * state carry over from one read to the next. */
 static void runner_append(const char *text)
 {
     if (!text) {
@@ -140,28 +157,58 @@ static void runner_append(const char *text)
         return;
     }
 
-    size_t new_len = g_runner.output_len + add;
-    if (new_len > MAX_OUTPUT_KEEP) {
-        size_t drop = new_len - MAX_OUTPUT_KEEP;
-        if (drop > g_runner.output_len) {
-            drop = g_runner.output_len;
-        }
-        if (drop > 0 && g_runner.output) {
-            memmove(g_runner.output, g_runner.output + drop, g_runner.output_len - drop);
-            g_runner.output_len -= drop;
-            g_runner.output[g_runner.output_len] = '\0';
-        }
-    }
-
-    size_t cap = g_runner.output_len + add + 1;
-    char *new_buf = realloc(g_runner.output, cap);
+    char *new_buf = realloc(g_runner.output, g_runner.output_len + add + 1);
     if (!new_buf) {
         return;
     }
     g_runner.output = new_buf;
-    memcpy(g_runner.output + g_runner.output_len, text, add);
-    g_runner.output_len += add;
-    g_runner.output[g_runner.output_len] = '\0';
+
+    char *out = g_runner.output;
+    size_t len = g_runner.output_len;
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+        unsigned char c = *p;
+        if (g_runner.esc == ESC_CSI) {          /* parameters until the final byte */
+            if (c >= 0x40 && c <= 0x7e) {
+                g_runner.esc = ESC_NONE;
+            }
+            continue;
+        }
+        if (g_runner.esc == ESC_START) {        /* ESC [ ... or a two-byte escape */
+            g_runner.esc = (c == '[') ? ESC_CSI : ESC_NONE;
+            continue;
+        }
+        if (c == 0x1b) {
+            g_runner.esc = ESC_START;
+            continue;
+        }
+        if (c == '\r') {
+            g_runner.cr = true;
+            continue;
+        }
+        if (c == '\n') {
+            g_runner.cr = false;
+            out[len++] = '\n';
+            continue;
+        }
+        if (c < 0x20 && c != '\t') {
+            continue;
+        }
+        if (g_runner.cr) {
+            while (len > 0 && out[len - 1] != '\n') {
+                len--;
+            }
+            g_runner.cr = false;
+        }
+        out[len++] = (char)c;
+    }
+    out[len] = '\0';
+
+    if (len > MAX_OUTPUT_KEEP) {
+        size_t drop = len - MAX_OUTPUT_KEEP;
+        memmove(out, out + drop, len - drop + 1);
+        len -= drop;
+    }
+    g_runner.output_len = len;
 
     if (g_runner.output_ta && lv_obj_is_valid(g_runner.output_ta)) {
         lv_obj_t *ta = g_runner.output_ta;
@@ -193,6 +240,13 @@ static void script_poll_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
 
+    /* The menu behind may take the keypad meanwhile (closing the drone
+     * columns when the link drops, as during an air unit's reboot): keep it on
+     * Stop/Close while the window is open. */
+    if (g_runner.group && lv_indev_get_group(indev_drv) != g_runner.group) {
+        lv_indev_set_group(indev_drv, g_runner.group);
+    }
+
     if (g_runner.fd >= 0) {
         char chunk[OUTPUT_CHUNK + 1];
         ssize_t r;
@@ -203,9 +257,10 @@ static void script_poll_timer_cb(lv_timer_t *timer)
     }
 
     if (g_runner.running && g_runner.pid > 0) {
-        /* Escalate to SIGKILL if the script ignored SIGTERM for over a second. */
+        /* Escalate to SIGKILL if the script ignored SIGTERM for over a second;
+         * a locked job's cleanup (e.g. ssh to the air unit) gets 30 s. */
         if (g_runner.term_tick &&
-            lv_tick_elaps(g_runner.term_tick) > 1000) {
+            lv_tick_elaps(g_runner.term_tick) > (g_runner.locked ? 30000u : 1000u)) {
             kill(-g_runner.pid, SIGKILL);
             g_runner.term_tick = 0;
         }
@@ -221,6 +276,12 @@ static void script_poll_timer_cb(lv_timer_t *timer)
             }
             if (g_runner.stop_btn && lv_obj_is_valid(g_runner.stop_btn)) {
                 lv_obj_add_state(g_runner.stop_btn, LV_STATE_DISABLED);
+            }
+            if (g_runner.locked && g_runner.close_btn && lv_obj_is_valid(g_runner.close_btn)) {
+                lv_obj_remove_state(g_runner.close_btn, LV_STATE_DISABLED);
+                if (g_runner.group) {
+                    lv_group_focus_obj(g_runner.close_btn);
+                }
             }
         }
     }
@@ -248,6 +309,9 @@ static void close_runner_ui(void)
     g_runner.running = false;
     g_runner.pid = -1;
     g_runner.term_tick = 0;
+    g_runner.locked = false;
+    g_runner.esc = ESC_NONE;
+    g_runner.cr = false;
 
     if (g_runner.msgbox && lv_obj_is_valid(g_runner.msgbox)) {
         lv_msgbox_close(g_runner.msgbox);
@@ -266,15 +330,17 @@ static void close_runner_ui(void)
         g_runner.group = NULL;
     }
 
-    /* Restore focus to wherever the run was launched from. */
-    if (g_return_group) {
-        lv_indev_set_group(indev_drv, g_return_group);
-    }
+    /* Back to the menu: its current column (the one the run was launched
+     * from may have closed meanwhile, e.g. when the drone link dropped). */
+    colmenu_refocus();
 }
 
 static void script_close_cb(lv_event_t *e)
 {
     (void)e;
+    if (g_runner.locked && g_runner.running) {
+        return;   /* only Stop while a locked job runs */
+    }
     close_runner_ui();
 }
 
@@ -288,27 +354,18 @@ static void script_stop_cb(lv_event_t *e)
          * actually stops. */
         kill(-g_runner.pid, SIGTERM);
         g_runner.term_tick = lv_tick_get() ? lv_tick_get() : 1;
-        runner_append("\nStopping script...\n");
+        runner_append(g_runner.locked ? "\nStopping...\n" : "\nStopping script...\n");
     }
 }
 
-static void start_script_runner(const char *script_name)
+/* Runs `file` (looked up in PATH) with argv on a pty in its own session, in
+ * cwd, and shows its output in a window titled `title` that starts with
+ * `header`. A locked run can only be stopped, not closed, until it exits. */
+static void start_runner(const char *title, const char *cwd, const char *file,
+                         char *const argv[], bool locked, const char *header)
 {
-    if (!script_name || strchr(script_name, '/')) {
-        return;
-    }
-
-    char fullpath[512];
-    snprintf(fullpath, sizeof(fullpath), "%s/%s", SCRIPT_DIR, script_name);
-
-    struct stat st;
-    if (stat(fullpath, &st) == 0 && S_ISREG(st.st_mode)) {
-        mode_t new_mode = st.st_mode | S_IXUSR | S_IXGRP | S_IXOTH;
-        if (new_mode != st.st_mode) {
-            if (chmod(fullpath, new_mode) != 0) {
-                perror("chmod");
-            }
-        }
+    if (g_runner.locked && g_runner.running) {
+        return;   /* never kill a locked job by starting another */
     }
 
     close_runner_ui();
@@ -371,13 +428,13 @@ static void start_script_runner(const char *script_name)
         close(slave_fd);
         close(master_fd);
 
-        if (chdir(SCRIPT_DIR) != 0) {
+        if (cwd && chdir(cwd) != 0) {
             perror("chdir");
             _exit(127);
         }
 
-        execl("/bin/sh", "sh", script_name, (char *)NULL);
-        perror("execl");
+        execvp(file, argv);
+        perror("execvp");
         _exit(127);
     }
 
@@ -389,10 +446,11 @@ static void start_script_runner(const char *script_name)
     g_runner.pid = pid;
     g_runner.fd = master_fd;
     g_runner.running = true;
+    g_runner.locked = locked;
 
     g_runner.msgbox = lv_msgbox_create(NULL);
     lv_obj_add_style(g_runner.msgbox, &style_openipc_lightdark_background, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_msgbox_add_title(g_runner.msgbox, script_name);
+    lv_msgbox_add_title(g_runner.msgbox, title);
 
     lv_obj_t *content = lv_msgbox_get_content(g_runner.msgbox);
     lv_obj_add_style(content, &style_openipc_dark_background, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -421,6 +479,9 @@ static void start_script_runner(const char *script_name)
     lv_obj_add_style(g_runner.stop_btn, &style_openipc_outline, LV_PART_MAIN | LV_STATE_FOCUS_KEY);
     lv_obj_add_style(g_runner.close_btn, &style_openipc, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_add_style(g_runner.close_btn, &style_openipc_outline, LV_PART_MAIN | LV_STATE_FOCUS_KEY);
+    if (locked) {
+        lv_obj_add_state(g_runner.close_btn, LV_STATE_DISABLED);
+    }
 
     theme_msgbox(g_runner.msgbox);
 
@@ -435,16 +496,74 @@ static void start_script_runner(const char *script_name)
     lv_group_add_obj(g_runner.group, g_runner.close_btn);
     lv_indev_set_group(indev_drv, g_runner.group);
 
-    char header[512];
-    snprintf(header, sizeof(header), "Running %s/%s\n\n", SCRIPT_DIR, script_name);
     runner_append(header);
 
     g_runner.timer = lv_timer_create(script_poll_timer_cb, 10, NULL);
 }
 
-static void confirm_cancel_cb(lv_event_t *e)
+static void start_script_runner(const char *script_name)
 {
-    (void)e;
+    if (!script_name || strchr(script_name, '/')) {
+        return;
+    }
+
+    char fullpath[512];
+    snprintf(fullpath, sizeof(fullpath), "%s/%s", SCRIPT_DIR, script_name);
+
+    struct stat st;
+    if (stat(fullpath, &st) == 0 && S_ISREG(st.st_mode)) {
+        mode_t new_mode = st.st_mode | S_IXUSR | S_IXGRP | S_IXOTH;
+        if (new_mode != st.st_mode) {
+            if (chmod(fullpath, new_mode) != 0) {
+                perror("chmod");
+            }
+        }
+    }
+
+    char header[512];
+    snprintf(header, sizeof(header), "Running %s/%s\n\n", SCRIPT_DIR, script_name);
+    char *const argv[] = { "sh", (char *)script_name, NULL };
+    start_runner(script_name, SCRIPT_DIR, "/bin/sh", argv, false, header);
+}
+
+static void clear_pending_cmd(void)
+{
+    for (int i = 0; i < MAX_CMD_ARGS && g_pending_argv[i]; i++) {
+        free(g_pending_argv[i]);
+        g_pending_argv[i] = NULL;
+    }
+}
+
+/* Starts the pending command: the window's first lines show what runs. */
+static void start_pending_cmd(void)
+{
+    char header[512];
+    size_t n = snprintf(header, sizeof(header), "Running");
+    for (int i = 0; g_pending_argv[i] && n < sizeof(header); i++) {
+        n += snprintf(header + n, sizeof(header) - n, " %s", g_pending_argv[i]);
+    }
+    if (n < sizeof(header)) {
+        snprintf(header + n, sizeof(header) - n, "\n\n");
+    }
+    start_runner(g_pending_title, "/", g_pending_argv[0], g_pending_argv, true, header);
+    clear_pending_cmd();
+}
+
+/* As in script_poll_timer_cb: the menu behind must not take the keypad. */
+static void confirm_guard_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    if (g_confirm_group && lv_indev_get_group(indev_drv) != g_confirm_group) {
+        lv_indev_set_group(indev_drv, g_confirm_group);
+    }
+}
+
+static void close_confirm(void)
+{
+    if (g_confirm_timer) {
+        lv_timer_delete(g_confirm_timer);
+        g_confirm_timer = NULL;
+    }
     if (g_confirm_msgbox && lv_obj_is_valid(g_confirm_msgbox)) {
         lv_msgbox_close(g_confirm_msgbox);
     }
@@ -453,51 +572,55 @@ static void confirm_cancel_cb(lv_event_t *e)
         lv_group_del(g_confirm_group);
         g_confirm_group = NULL;
     }
-    /* Restore focus to wherever the run was launched from. */
-    if (g_return_group) {
-        lv_indev_set_group(indev_drv, g_return_group);
-    }
+}
+
+static void confirm_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    close_confirm();
+    clear_pending_cmd();
+    colmenu_refocus();
 }
 
 static void confirm_execute_cb(lv_event_t *e)
 {
     (void)e;
-    if (g_confirm_msgbox && lv_obj_is_valid(g_confirm_msgbox)) {
-        lv_msgbox_close(g_confirm_msgbox);
+    close_confirm();
+    if (g_pending_argv[0]) {
+        start_pending_cmd();
+    } else {
+        start_script_runner(g_pending_script);
     }
-    g_confirm_msgbox = NULL;
-    if (g_confirm_group) {
-        lv_group_del(g_confirm_group);
-        g_confirm_group = NULL;
-    }
-    start_script_runner(g_pending_script);
 }
 
-/* Build the confirm dialog for g_pending_script. Deferred via lv_async_call from
+/* Build the confirm dialog for g_pending_script, or the pending command when
+ * there is one (its own title and prompt). Deferred via lv_async_call from
  * gs_scripts_run so the key press that launched it has released first (colmenu
  * actions fire on the key press, and the release would otherwise click a button). */
 static void show_confirm_dialog(void *unused)
 {
     (void)unused;
-    if (g_confirm_msgbox && lv_obj_is_valid(g_confirm_msgbox)) {
-        lv_msgbox_close(g_confirm_msgbox);
-        g_confirm_msgbox = NULL;
-    }
+    close_confirm();
 
     g_confirm_msgbox = lv_msgbox_create(NULL);
     lv_obj_add_style(g_confirm_msgbox, &style_openipc_lightdark_background, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_msgbox_add_title(g_confirm_msgbox, "Confirm Execution");
+    bool cmd = g_pending_argv[0] != NULL;
+    lv_msgbox_add_title(g_confirm_msgbox, cmd ? g_pending_title : "Confirm Execution");
 
     char prompt[512];
-    snprintf(prompt, sizeof(prompt),
-             "Are you sure you want to execute\n%s?\n\n"
-             "Check the source of this script first. "
-             "It can modify and brick your system.",
-             g_pending_script);
-    lv_msgbox_add_text(g_confirm_msgbox, prompt);
+    if (cmd) {
+        lv_msgbox_add_text(g_confirm_msgbox, g_pending_prompt);
+    } else {
+        snprintf(prompt, sizeof(prompt),
+                 "Are you sure you want to execute\n%s?\n\n"
+                 "Check the source of this script first. "
+                 "It can modify and brick your system.",
+                 g_pending_script);
+        lv_msgbox_add_text(g_confirm_msgbox, prompt);
+    }
 
     lv_obj_t *cancel_btn = lv_msgbox_add_footer_button(g_confirm_msgbox, "Cancel");
-    lv_obj_t *exec_btn = lv_msgbox_add_footer_button(g_confirm_msgbox, "Execute");
+    lv_obj_t *exec_btn = lv_msgbox_add_footer_button(g_confirm_msgbox, cmd ? "Start" : "Execute");
 
     lv_obj_add_style(cancel_btn, &style_openipc, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_add_style(cancel_btn, &style_openipc_outline, LV_PART_MAIN | LV_STATE_FOCUS_KEY);
@@ -518,6 +641,7 @@ static void show_confirm_dialog(void *unused)
     lv_group_add_obj(g_confirm_group, exec_btn);
     lv_group_focus_obj(cancel_btn);   /* default to the safe choice */
     lv_indev_set_group(indev_drv, g_confirm_group);
+    g_confirm_timer = lv_timer_create(confirm_guard_cb, 50, NULL);
     /* the key press that opened this (colmenu actions fire on press) is still
      * down — without this its release would immediately click a button. */
     lv_indev_wait_release(indev_drv);
@@ -528,9 +652,29 @@ void gs_scripts_run(const char *name)
     if (!name || strchr(name, '/')) {
         return;
     }
-    /* remember where to hand the keypad back (the column the run started from) */
-    g_return_group = lv_indev_get_group(indev_drv);
+    clear_pending_cmd();
     snprintf(g_pending_script, sizeof(g_pending_script), "%s", name);
+    show_confirm_dialog(NULL);
+}
+
+void gs_scripts_run_cmd(const char *title, const char *prompt, const char *const argv[])
+{
+    if (!title || !prompt || !argv || !argv[0]) {
+        return;
+    }
+    if (g_runner.locked && g_runner.running) {
+        return;
+    }
+    clear_pending_cmd();
+    for (int i = 0; i < MAX_CMD_ARGS && argv[i]; i++) {
+        g_pending_argv[i] = strdup(argv[i]);
+        if (!g_pending_argv[i]) {
+            clear_pending_cmd();
+            return;
+        }
+    }
+    snprintf(g_pending_title, sizeof(g_pending_title), "%s", title);
+    snprintf(g_pending_prompt, sizeof(g_pending_prompt), "%s", prompt);
     show_confirm_dialog(NULL);
 }
 

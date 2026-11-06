@@ -1359,4 +1359,5 @@ lv_group_t * colmenu_root_group(void) { return colstack_root_group(g_cs); }
 colstack_t * colmenu_cs(void) { return g_cs; }
 colstack_t * colmenu_emit_cs(colmenu_emit_t * e) { return e->cs; }
 lv_obj_t *   colmenu_emit_body(colmenu_emit_t * e) { return e->body; }
+void colmenu_refocus(void) { if(g_cs) lv_indev_set_group(indev_drv, colstack_cur_group(g_cs)); }
 void colmenu_set_root_back(void (*cb)(void * ctx), void * ctx) { colstack_set_root_back(g_cs, cb, ctx); }

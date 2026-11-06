@@ -12,6 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
+#include <strings.h>      /* strcasecmp */
+#include <sys/stat.h>
 #include <unistd.h>
 #include "colmenu.h"
 #include "colmenu_pages.h"
@@ -468,9 +470,84 @@ static void run_reboot_air(void * c) { (void)c; colmenu_exec("gsmenu.sh button a
 static void run_reboot_gs (void * c) { (void)c; colmenu_exec("gsmenu.sh button gs actions Reboot"); }
 static void run_action(void * ctx)   { colmenu_exec((const char *)ctx); }
 
+/* ── Drone → Actions → OTA update (Artosyn air units) ─────────────────────────
+ * Lists the air-unit update images in the SD card's root and hands the chosen
+ * one to `air-ota` (sbc-gs ar8030-transport-rx), which runs the matching tool
+ * (p1-ota for the BetaFPV P1, ascent-ota for the Caddx Ascent) over the link.
+ * The run shows in the scripts' output window and cannot be closed while it
+ * flashes. */
+#define OTA_DIR "/media/dvr"
+
+/* An image the OTA tools take, by its header: an Artosyn ARTO image ("OTRA")
+ * for NAND (byte 6 = 2) whose product (at 0x80) is a P1 air unit's ("HM" since
+ * 2.1, "P1_SKY..." before; BetaFPV's ground images say IGNORE or P1_GND_...),
+ * or a Caddx ASW container ("ASW\0"). */
+static bool is_air_image(const char * path)
+{
+    unsigned char h[0xc0];
+    FILE * f = fopen(path, "rb");
+    if(!f) return false;
+    size_t n = fread(h, 1, sizeof(h), f);
+    fclose(f);
+    if(n >= 4 && memcmp(h, "ASW\0", 4) == 0) return true;
+    if(n < sizeof(h) || memcmp(h, "OTRA", 4) != 0 || h[6] != 2) return false;
+    char product[0x41];
+    memcpy(product, h + 0x80, 0x40);
+    product[0x40] = '\0';
+    return strcmp(product, "HM") == 0 || strncmp(product, "P1_SKY", 6) == 0;
+}
+
+static void run_air_ota(void * ctx)
+{
+    const char * name = ctx;
+    char path[512], prompt[640];
+    snprintf(path, sizeof(path), "%s/%s", OTA_DIR, name);
+    snprintf(prompt, sizeof(prompt),
+             "Flash %s to the drone?\n\n"
+             "It reboots into the new firmware. Keep the drone powered and the "
+             "link up until it is back.", name);
+    const char * argv[] = { "air-ota", path, NULL };
+    gs_scripts_run_cmd("OTA update", prompt, argv);
+}
+
+static int cmp_name(const void * a, const void * b)
+{
+    return strcmp(*(char * const *)a, *(char * const *)b);
+}
+
+static void build_air_ota(colmenu_emit_t * e)
+{
+    char * names[64];
+    int n = 0;
+    DIR * d = opendir(OTA_DIR);   /* autofs: opening it mounts the card */
+    if(d) {
+        struct dirent * de;
+        while((de = readdir(d)) && n < (int)(sizeof(names) / sizeof(names[0]))) {
+            size_t l = strlen(de->d_name);
+            if(de->d_name[0] == '.' || l < 5 || strcasecmp(de->d_name + l - 4, ".img") != 0)
+                continue;
+            char path[512];
+            struct stat st;
+            snprintf(path, sizeof(path), "%s/%s", OTA_DIR, de->d_name);
+            if(stat(path, &st) != 0 || !S_ISREG(st.st_mode) || !is_air_image(path))
+                continue;
+            names[n++] = strdup(de->d_name);
+        }
+        closedir(d);
+    }
+    qsort(names, n, sizeof(names[0]), cmp_name);
+    for(int i = 0; i < n; i++)      /* the name is the row's ctx (freed with it) */
+        colmenu_emit_action(e, LV_SYMBOL_UPLOAD, names[i], run_air_ota, names[i]);
+    if(n == 0)
+        colmenu_emit_label(e, "No air update image on the SD card");
+}
+static const colmenu_page_t air_ota_page = { .title="OTA update", .type="air", .page="ota", .build=build_air_ota };
+
 static void build_air_actions(colmenu_emit_t * e)
 {
     colmenu_emit_action(e, LV_SYMBOL_POWER, "Reboot", run_reboot_air, NULL);
+    if(RXMODE == ARTOSYN)
+        colmenu_emit_submenu(e, LV_SYMBOL_UPLOAD, "OTA update", &air_ota_page);
     for(size_t i = 0; i < airactions_count; i++)
         colmenu_emit_action(e, LV_SYMBOL_PLAY, airactions[i].label, run_action, strdup(airactions[i].action));
 }
