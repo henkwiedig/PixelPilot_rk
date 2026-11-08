@@ -48,6 +48,11 @@
 // extra here: on stock firmware a long-held BACK reboots the goggle unit's
 // GUI process (confirmed by decompiling GlassesUI::slotKeyPress) --
 // deliberately not replicated.
+//
+// BACK re-centres head tracking (gs-headtrack, see gsmenu/headtrack.h)
+// while the OSD has the keys (menu closed, no dialog on top) and the tracker
+// is running. That press sends no key at all, so the menu stays closed; in
+// every other case BACK is "left" as above.
 
 #include <cerrno>
 #include <cmath>
@@ -63,8 +68,12 @@
 #include "input.h"
 #include "adc_input.h"
 #include "gsmenu/bind_dialog.h"
+#include "gsmenu/headtrack.h"
 
 extern YAML::Node config;
+extern bool menu_active;
+extern lv_indev_t *indev_drv;
+extern "C" lv_group_t *osd_group;
 
 namespace {
 
@@ -75,7 +84,7 @@ constexpr int kRepeatRateMs = 100;         // matches REPEAT_RATE_MS
 constexpr int kIdleThresholdMv = 135; // below this: no button pressed (stock's 0x87)
 constexpr int kMatchToleranceMv = 80; // +/-0x50, same window stock uses
 
-enum class VrxKey { None, Up, Down, Left, Right, Center, Rec };
+enum class VrxKey { None, Up, Down, Left, Right, Center, Rec, Back };
 
 struct AdcKeyEntry {
     VrxKey key;
@@ -89,7 +98,7 @@ constexpr AdcKeyEntry kAdcKeys[] = {
     { VrxKey::Center, 1400 },
     { VrxKey::Down,   1600 },
     { VrxKey::Rec,     390 },
-    { VrxKey::Left,   1780 }, // stock "esc" / physical BACK button, aliased to left
+    { VrxKey::Back,   1780 }, // stock "esc" / physical BACK button
 };
 
 const char *key_name(VrxKey k) {
@@ -100,6 +109,7 @@ const char *key_name(VrxKey k) {
         case VrxKey::Right:  return "right";
         case VrxKey::Center: return "center";
         case VrxKey::Rec:    return "rec";
+        case VrxKey::Back:   return "left"; // back/escape-a-step
         default:             return nullptr;
     }
 }
@@ -125,6 +135,7 @@ bool g_bind_confirmed_pressed = false;
 VrxKey g_last_seen = VrxKey::None;
 VrxKey g_confirmed = VrxKey::None;
 long g_repeat_time = 0;
+bool g_back_recentred = false; // the held BACK press re-centred; send no keys for it
 
 long now_ms() {
     struct timespec ts;
@@ -164,6 +175,12 @@ VrxKey sample_key() {
         if (std::abs(mv - entry.voltage_mv) <= kMatchToleranceMv) return entry.key;
     }
     return VrxKey::None;
+}
+
+// BACK with the menu closed: re-centre head tracking, if it's running.
+bool back_recentres() {
+    return !menu_active && lv_indev_get_group(indev_drv) == osd_group &&
+           headtrack_recentre();
 }
 
 void fire_press(VrxKey key, bool holding) {
@@ -223,7 +240,7 @@ void handle_vrx_adc_input(void) {
     long now = now_ms();
 
     if (seen == g_confirmed) {
-        if (seen != VrxKey::None && now >= g_repeat_time) {
+        if (seen != VrxKey::None && !g_back_recentred && now >= g_repeat_time) {
             fire_press(seen, true);
             g_repeat_time = now + kRepeatRateMs;
         }
@@ -231,8 +248,12 @@ void handle_vrx_adc_input(void) {
     }
 
     g_confirmed = seen;
+    g_back_recentred = false;
     if (seen == VrxKey::None) {
         dispatch_release_key();
+    } else if (seen == VrxKey::Back && back_recentres()) {
+        g_back_recentred = true;
+        printf("VRX ADC: back -> head tracking re-centred\n");
     } else {
         fire_press(seen, false);
         g_repeat_time = now + kInitialRepeatDelayMs;
@@ -261,6 +282,7 @@ void cleanup_vrx_adc(void) {
     g_enabled = false;
     g_last_seen = VrxKey::None;
     g_confirmed = VrxKey::None;
+    g_back_recentred = false;
 
     g_bind_enabled = false;
     g_bind_last_seen_pressed = false;

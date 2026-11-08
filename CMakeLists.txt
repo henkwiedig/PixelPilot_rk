@@ -45,6 +45,8 @@ set(SIMULATOR_SOURCES
         src/gsmenu/colmenu_pages.h
         src/gsmenu/colmenu_pages.c
         src/gsmenu/datetime_dialog.c
+        src/gsmenu/headtrack.h
+        src/gsmenu/headtrack.c
         src/gsmenu/executor.h
         src/gsmenu/executor.c
         src/gsmenu/air_txprofiles.h
@@ -97,6 +99,8 @@ set(LIB_SOURCE_FILES
         src/gsmenu/colmenu_pages.h
         src/gsmenu/colmenu_pages.c
         src/gsmenu/datetime_dialog.c
+        src/gsmenu/headtrack.h
+        src/gsmenu/headtrack.c
         src/gsmenu/bind_dialog.h
         src/gsmenu/bind_dialog.c
         src/lvosd.h
