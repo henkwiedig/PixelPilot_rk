@@ -27,6 +27,7 @@
 #include "../drm.h"       /* gamma_lut_controller, gamma_lut_enable/disable */
 #endif
 #include "gs_scripts.h"   /* dynamic /media/dvr/scripts lookup + runner */
+#include "headtrack.h"    /* gs-headtrack: installed?, re-centre */
 
 extern MenuAction airactions[]; extern size_t airactions_count;
 extern MenuAction gsactions[];  extern size_t gsactions_count;
@@ -655,6 +656,19 @@ static const colmenu_item_t sys_fan_items[] = {
 };
 static const colmenu_page_t sys_fan_page = { "Fan", "gs", "system", sys_fan_items, 2 };
 
+/* System → Head tracking: the goggles' IMU drives a gimbal on the air unit
+ * (the board's gs-headtrack, sent over the Artosyn link), so only boards that
+ * ship it show this, and only in Artosyn mode. Enabled starts/stops it and
+ * keeps the choice over reboots (off by default). With the menu closed, the
+ * VRX Pro's BACK button re-centres too (adc_input.cpp). */
+static void headtrack_recentre_action(void) { headtrack_recentre(); }
+static const colmenu_item_t sys_headtrack_items[] = {
+    { .kind=COLMENU_SWITCH, .icon=LV_SYMBOL_EYE_OPEN, .label="Enabled",   .param="headtrack" },
+    { .kind=COLMENU_ACTION, .icon=LV_SYMBOL_HOME,     .label="Re-centre", .on_activate=headtrack_recentre_action },
+    { .kind=COLMENU_LABEL,  .label="BACK re-centres while the menu is closed" },
+};
+static const colmenu_page_t sys_headtrack_page = { "Head tracking", "gs", "system", sys_headtrack_items, 3 };
+
 /* System → Date & Time: every board has an RTC (rtc0: the VRX Pro's battery-
  * backed HYM8563, the Radxa boards' RK817), so no availability gate. Region/City
  * set /etc/localtime via gsmenu.sh; a Region change rebuilds the page so City
@@ -680,6 +694,8 @@ static const colmenu_item_t system_items[] = {
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_WIFI,  .label="Restream", .sub=&sys_restream_page },
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_EDIT,  .label="OSD",      .sub=&osd_editor_page },
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_REFRESH, .label="Fan",    .sub=&sys_fan_page, .available=gs_fan_available },
+    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_EYE_OPEN, .label="Head tracking", .sub=&sys_headtrack_page,
+      .mode_mask=COLMENU_MODE_ARTOSYN, .available=headtrack_available },
 #ifndef USE_SIMULATOR
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_BELL,  .label="Date & Time", .sub=&sys_datetime_page },
 #endif
