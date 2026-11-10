@@ -59,7 +59,9 @@
 // their own table from config["gsmenu"]["vrx_adc"]: keys, scale_mv,
 // idle_mv, tolerance_mv; a "bind" key on the ladder opens the bind dialog
 // like the VRX Pro's separate bind button. Left out, every setting is the
-// VRX Pro's above.
+// VRX Pro's above. A key may name its own "device": a second ladder on
+// another channel (the SinYine F1 VRX's: right/up/enter on channel 0,
+// bind/down/left on channel 1), read with that channel's own IIO scale.
 
 #include <cerrno>
 #include <climits>
@@ -99,6 +101,7 @@ enum class VrxKey { None, Up, Down, Left, Right, Center, Rec, Back, Bind };
 struct AdcKeyEntry {
     VrxKey key;
     int voltage_mv;
+    int device = 0; // index into g_devices
 };
 
 constexpr AdcKeyEntry kAdcKeys[] = {
@@ -143,6 +146,10 @@ bool g_enabled = false;
 std::string g_device;
 std::vector<AdcKeyEntry> g_keys(std::begin(kAdcKeys), std::end(kAdcKeys));
 double g_mv_per_count = kMvPerCount;
+// The ladders: g_device first, then each other key "device"; per ladder its
+// mV per count (scale_mv "auto": that channel's own IIO scale).
+std::vector<std::string> g_devices;
+std::vector<double> g_device_mv_per_count;
 int g_idle_mv = kIdleThresholdMv;
 int g_tolerance_mv = kMatchToleranceMv;
 
@@ -183,10 +190,15 @@ bool read_raw(const std::string &path, int *out_raw) {
     return true;
 }
 
-bool read_millivolts(int *out_mv) {
+bool read_millivolts(int *out_mv, size_t device = 0) {
     int raw;
-    if (!read_raw(g_device, &raw)) return false;
-    *out_mv = (int)(raw * g_mv_per_count);
+    if (device >= g_devices.size()) {
+        if (device != 0 || !read_raw(g_device, &raw)) return false;
+        *out_mv = (int)(raw * g_mv_per_count);
+        return true;
+    }
+    if (!read_raw(g_devices[device], &raw)) return false;
+    *out_mv = (int)(raw * g_device_mv_per_count[device]);
     return true;
 }
 
@@ -219,11 +231,15 @@ bool sample_bind_pressed() {
 }
 
 VrxKey sample_key() {
-    int mv;
-    if (!read_millivolts(&mv)) return VrxKey::None;
-    if (mv < g_idle_mv) return VrxKey::None;
-    for (const auto &entry : g_keys) {
-        if (std::abs(mv - entry.voltage_mv) <= g_tolerance_mv) return entry.key;
+    const size_t n = g_devices.empty() ? 1 : g_devices.size();
+    for (size_t d = 0; d < n; d++) {
+        int mv;
+        if (!read_millivolts(&mv, d)) continue;
+        if (mv < g_idle_mv) continue;
+        for (const auto &entry : g_keys) {
+            if ((size_t)entry.device == d && std::abs(mv - entry.voltage_mv) <= g_tolerance_mv)
+                return entry.key;
+        }
     }
     return VrxKey::None;
 }
@@ -256,9 +272,11 @@ void setup_vrx_adc(void) {
         ? adc_config["device"].as<std::string>()
         : "/sys/bus/iio/devices/iio:device0/in_voltage6_raw";
 
+    bool scale_auto = false;
     if (adc_config["scale_mv"]) {
         const std::string scale = adc_config["scale_mv"].as<std::string>();
         if (scale == "auto") {
+            scale_auto = true;
             if (!read_iio_scale(g_device, &g_mv_per_count))
                 fprintf(stderr, "VRX ADC: no IIO scale next to %s, %.4f mV per count\n",
                         g_device.c_str(), g_mv_per_count);
@@ -266,6 +284,8 @@ void setup_vrx_adc(void) {
             g_mv_per_count = adc_config["scale_mv"].as<double>();
         }
     }
+    g_devices.assign(1, g_device);
+    g_device_mv_per_count.assign(1, g_mv_per_count);
     if (adc_config["idle_mv"]) g_idle_mv = adc_config["idle_mv"].as<int>();
     if (adc_config["tolerance_mv"]) g_tolerance_mv = adc_config["tolerance_mv"].as<int>();
     if (adc_config["keys"] && adc_config["keys"].IsSequence()) {
@@ -277,7 +297,22 @@ void setup_vrx_adc(void) {
                 fprintf(stderr, "VRX ADC: ignoring key '%s' (needs a known name and mv)\n", name.c_str());
                 continue;
             }
-            g_keys.push_back({key, k["mv"].as<int>()});
+            int device = 0;
+            if (k["device"]) {
+                const std::string path = k["device"].as<std::string>();
+                size_t i = 0;
+                while (i < g_devices.size() && g_devices[i] != path) i++;
+                if (i == g_devices.size()) {
+                    double scale = g_mv_per_count;
+                    if (scale_auto && !read_iio_scale(path, &scale))
+                        fprintf(stderr, "VRX ADC: no IIO scale next to %s, %.4f mV per count\n",
+                                path.c_str(), scale);
+                    g_devices.push_back(path);
+                    g_device_mv_per_count.push_back(scale);
+                }
+                device = (int)i;
+            }
+            g_keys.push_back({key, k["mv"].as<int>(), device});
         }
     }
 
@@ -290,6 +325,8 @@ void setup_vrx_adc(void) {
     g_enabled = true;
     printf("VRX ADC: polling %s (%zu keys, %.4f mV per count)\n", g_device.c_str(), g_keys.size(),
            g_mv_per_count);
+    for (size_t d = 1; d < g_devices.size(); d++)
+        printf("VRX ADC: and %s (%.4f mV per count)\n", g_devices[d].c_str(), g_device_mv_per_count[d]);
 
     // An empty bind_device: no separate bind button (a ladder may carry one).
     g_bind_device = adc_config["bind_device"]
