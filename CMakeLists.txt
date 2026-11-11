@@ -44,6 +44,8 @@ set(SIMULATOR_SOURCES
         src/gsmenu/colmenu.c
         src/gsmenu/colmenu_pages.h
         src/gsmenu/colmenu_pages.c
+        src/gsmenu/bind_dialog.h
+        src/gsmenu/bind_dialog.c
         src/gsmenu/datetime_dialog.c
         src/gsmenu/headtrack.h
         src/gsmenu/headtrack.c

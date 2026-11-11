@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include "colmenu.h"
 #include "colmenu_pages.h"
+#include "bind_dialog.h"    /* bind_dialog_trigger(): GS -> Artosyn -> Bind */
 #include "datetime_dialog.h"
 #include "helper.h"       /* show_restart_notice(), find_first_focusable_obj() */
 #include "../menu.h"      /* MenuAction, screens */
@@ -582,6 +583,11 @@ static const colmenu_item_t gs_wfbng_items[] = {
 };
 static const colmenu_page_t gs_wfbng_page = { "WFB-NG", "gs", "wfbng", gs_wfbng_items, 6 };
 
+/* Bind: the bind button's dialog (/usr/bin/bind, the board's pairing script),
+ * for units without a bind button or with it out of reach. Only where the
+ * board ships that script. */
+static bool bind_available(void) { return access("/usr/bin/bind", X_OK) == 0; }
+
 /* GS-side Artosyn link page: this ground unit's own ar8030-lifecycled HTTP
  * API (127.0.0.1:8899, always local -- see gsmenu.sh's lifecycled_url()), so
  * unlike air_artosyn_page this isn't gated on drone detection: it's the local
@@ -593,8 +599,10 @@ static const colmenu_item_t gs_artosyn_items[] = {
     { .kind=COLMENU_VALUE,    .icon=LV_SYMBOL_WIFI,     .label="Status",       .param="status" },
     { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Bandwidth",    .param="bandwidth" },
     { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Output Power", .param="power" },
+    { .kind=COLMENU_ACTION,   .icon=LV_SYMBOL_REFRESH,  .label="Bind",
+      .on_activate=bind_dialog_trigger, .available=bind_available },
 };
-static const colmenu_page_t gs_artosyn_page = { "Artosyn", "gs", "artosyn", gs_artosyn_items, 3 };
+static const colmenu_page_t gs_artosyn_page = { "Artosyn", "gs", "artosyn", gs_artosyn_items, 4 };
 
 /* System → Receiver / Display / DVR */
 static const colmenu_item_t sys_receiver_items[] = {
