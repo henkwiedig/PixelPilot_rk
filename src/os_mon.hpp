@@ -18,8 +18,11 @@ public:
     // Enables CPU load sensor
     void addCPU();
     std::size_t discoverCPU();
-    // Adds power supply sensor (currently supported is ina226 via ina2xx kernel driver)
-    void addPower(const std::string &sensor_type, const std::string &hwmon_id);
+    // Adds power supply sensor (currently supported is ina226 via ina2xx kernel driver).
+    // An empty hwmon_id takes the first hwmon whose name is sensor_type; the facts are
+    // tagged sensor=<name>, or sensor=<hwmon id> when name is empty.
+    void addPower(const std::string &sensor_type, const std::string &hwmon_id,
+                  const std::string &name = "");
     std::size_t discoverPower();
     // Adds a supply voltage sensor on a Linux IIO ADC channel behind a divider:
     // published mV = raw * in_voltage_scale * multiplier + offset_mv (in_voltageN_input:
