@@ -2858,8 +2858,11 @@ int main(int argc, char **argv)
 													 : std::filesystem::path(path).filename().string());
 							continue;
 						}
-						std::string hwmon_id = power_sensor["hwmon_id"].as<std::string>();
-						os_sensors.addPower(type, hwmon_id);
+						// no hwmon_id: the first hwmon named <type>; name: the facts' sensor tag
+						std::string hwmon_id = power_sensor["hwmon_id"]
+						                     ? power_sensor["hwmon_id"].as<std::string>() : "";
+						os_sensors.addPower(type, hwmon_id,
+						                    power_sensor["name"] ? power_sensor["name"].as<std::string>() : "");
 					}
 				}
 			}

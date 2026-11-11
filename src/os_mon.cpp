@@ -9,6 +9,7 @@
 #include <numeric>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 
 #include "spdlog/spdlog.h"
 
@@ -151,27 +152,56 @@ protected:
  * - in1_input - voltage in mV
  * - power1_input - power in uW
  *
- * All 3 published as 3 separate facts tagged with hwmon_id.
+ * All 3 published as 3 separate facts tagged sensor=<name>, or sensor=<hwmon_id> without a
+ * name. Without a hwmon_id the first hwmon whose `name` is the sensor type is used: hwmonN
+ * numbers depend on probe order, the chip's name does not.
  */
 class PowerSensor : public ISensor {
 public:
     enum Sensor { SENSOR_INA226 };
 
     explicit PowerSensor(const std::string &sensor_type,
-						 const std::string &hwmon_id)
-        : is_valid_sensor(false), hwmon_id(hwmon_id) {
-        hwmon_path = std::filesystem::path("/sys/class/hwmon/") / hwmon_id / ""; // Construct the full path
+						 const std::string &hwmon_id,
+						 const std::string &name = "")
+        : is_valid_sensor(false), hwmon_id(hwmon_id.empty() ? find_hwmon(sensor_type) : hwmon_id) {
+        tag = name.empty() ? this->hwmon_id : name;
+        if (this->hwmon_id.empty()) {
+            spdlog::error("No hwmon device named {} found! Power sensor {} is disabled.",
+                          sensor_type, tag);
+            return;
+        }
+        hwmon_path = std::filesystem::path("/sys/class/hwmon/") / this->hwmon_id / ""; // Construct the full path
         if (sensor_type == "ina226") {
             sensor = Sensor::SENSOR_INA226;
             is_valid_sensor = validate_sensor();
             if (!is_valid_sensor) {
                 spdlog::error("The power sensor {} is either not available or its 'name' does not "
-                              "match the expected sensor type! Sensor is disabled.", hwmon_id);
+                              "match the expected sensor type! Sensor is disabled.", this->hwmon_id);
             }
         } else {
             is_valid_sensor = false;
         }
     };
+
+	// The lowest-numbered /sys/class/hwmon/hwmonN whose `name` is `type`, or "" if none.
+	static std::string find_hwmon(const std::string &type) {
+		std::string found;
+		long found_n = -1;
+		std::error_code ec;
+		for (const auto& entry : std::filesystem::directory_iterator("/sys/class/hwmon", ec)) {
+			std::string filename = entry.path().filename().string();
+			if (filename.compare(0, 5, "hwmon") != 0) continue;
+			std::ifstream name_file(entry.path() / "name");
+			std::string content;
+			if (!std::getline(name_file, content) || content != type) continue;
+			long n = std::strtol(filename.c_str() + 5, nullptr, 10);
+			if (found_n < 0 || n < found_n) {
+				found = filename;
+				found_n = n;
+			}
+		}
+		return found;
+	}
     virtual ~PowerSensor() = default;
 
 	static void detect(std::vector<std::shared_ptr<ISensor>> &sensors) {
@@ -207,7 +237,8 @@ public:
             void *batch = osd_batch_init(3);
             osd_tag tags[1];
             strcpy(tags[0].key, "sensor");
-            strcpy(tags[0].val, hwmon_id.c_str());
+            strncpy(tags[0].val, tag.c_str(), sizeof(tags[0].val) - 1);
+            tags[0].val[sizeof(tags[0].val) - 1] = '\0';
 
             osd_add_int_fact(batch, "os_mon.power.voltage", tags, 1, power->voltage);
             osd_add_int_fact(batch, "os_mon.power.current", tags, 1, power->current);
@@ -225,6 +256,7 @@ protected:
     Sensor sensor;
     std::filesystem::path hwmon_path;
     std::string hwmon_id;
+    std::string tag;  // the facts' sensor=<tag>
     struct Power {
         long voltage;  // Voltage in millivolts (mV)
         long current;  // Current in milliamperes (mA)
@@ -595,8 +627,9 @@ std::size_t OsSensors::discoverCPU() {
 	return sensors.size() - before;
 }
 
-void OsSensors::addPower(const std::string &sensor_name, const std::string &hwmon_id) {
-    sensors.push_back(std::make_shared<PowerSensor>(sensor_name, hwmon_id));
+void OsSensors::addPower(const std::string &sensor_name, const std::string &hwmon_id,
+                         const std::string &name) {
+    sensors.push_back(std::make_shared<PowerSensor>(sensor_name, hwmon_id, name));
 }
 
 void OsSensors::addIioVoltage(const std::string &raw_path, double multiplier, int offset_mv,
