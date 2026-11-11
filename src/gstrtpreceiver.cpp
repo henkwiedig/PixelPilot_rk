@@ -197,6 +197,12 @@ namespace {
     static constexpr uint64_t kDecodeStallMs = 700;
     static constexpr uint64_t kDecodeStallCooldownMs = 700;
     static constexpr uint64_t kDecodeStallPktWindowMs = 500;
+    // Packets arriving but nothing decoded yet: ask for an IDR this long after
+    // Stream UP, and again at this interval until the first frame decodes. A
+    // decoder that starts only on an IDR (wave5) never shows a picture from a
+    // GDR-only stream, and the air may drop the stream-up requests while it
+    // thinks the link is congested (it holds that for 1.5 s).
+    static constexpr uint64_t kNoPictureRetryMs = 2000;
     static constexpr uint64_t kRtpSeqResetMs = 1000;
 
     // Number of consecutive RTP packets that must classify as the *other* codec
@@ -244,6 +250,7 @@ namespace {
     static std::string g_last_hop_ip;
     static std::atomic<uint64_t> g_last_pkt_ms{0};
     static std::atomic<bool> g_stream_up{false};
+    static std::atomic<uint64_t> g_stream_up_ms{0};
     static std::atomic<bool> g_pending_rec_idr{false};
     static std::atomic<uint64_t> g_last_integrity_idr_ms{0};
     static std::atomic<uint64_t> g_last_rtp_gap_idr_ms{0};
@@ -880,6 +887,7 @@ namespace {
         maybe_update_last_hop_from_buffer(buf);
 
         if (!g_stream_up.exchange(true)) {
+            g_stream_up_ms.store(now_ms(), std::memory_order_relaxed);
             spdlog::info("[NET] Stream UP ({})", tag ? tag : "unknown");
             request_idr_bursts("stream-up", kIdrRepeatCount, false);
         }
@@ -908,11 +916,21 @@ namespace {
 
         const uint64_t last_pkt = g_last_pkt_ms.load(std::memory_order_relaxed);
         const uint64_t last_decoded = g_last_decoded_ms.load(std::memory_order_relaxed);
-        if (last_decoded == 0) {
+        if (last_pkt && (now - last_pkt) > kDecodeStallPktWindowMs) {
             return;
         }
 
-        if (last_pkt && (now - last_pkt) > kDecodeStallPktWindowMs) {
+        if (last_decoded == 0) {
+            // Nothing decoded since this pipeline started: the stall rule below
+            // has no reference point, so count from Stream UP instead.
+            const uint64_t up = g_stream_up_ms.load(std::memory_order_relaxed);
+            const uint64_t last_idr = g_last_decode_stall_idr_ms.load(std::memory_order_relaxed);
+            const uint64_t since = std::max(up, last_idr);
+            if (up && now >= since && (now - since) >= kNoPictureRetryMs) {
+                g_last_decode_stall_idr_ms.store(now, std::memory_order_relaxed);
+                spdlog::info("[IDR] No picture {} ms after Stream UP -> request IDR", now - up);
+                request_idr_bursts("no-picture", 1, false);
+            }
             return;
         }
 
@@ -956,6 +974,7 @@ namespace {
 
     static void reset_stream_tracking() {
         g_stream_up.store(false, std::memory_order_relaxed);
+        g_stream_up_ms.store(0, std::memory_order_relaxed);
         g_last_pkt_ms.store(0, std::memory_order_relaxed);
         g_last_decoded_ms.store(0, std::memory_order_relaxed);
         g_last_rtp_seq_valid.store(false, std::memory_order_relaxed);
