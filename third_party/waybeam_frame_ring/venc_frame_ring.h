@@ -1,0 +1,642 @@
+#ifndef VENC_FRAME_RING_H
+#define VENC_FRAME_RING_H
+
+/*
+ * SPSC lock-free ring buffer for whole encoded video frames over POSIX
+ * shared memory.  Designed for frame-aligned transfer between venc
+ * (producer) and waybeam-link (consumer) so the link layer can apply
+ * per-frame FEC without re-fragmenting pre-built RTP packets.
+ *
+ * Each slot carries an 8-byte metadata header (VencFrameMeta) followed
+ * by the Annex B frame data (NALs with start codes preserved).
+ *
+ * Differs from venc_ring (RTP-packet ring):
+ *   - uint32_t slot lengths (frames can exceed 64 KB)
+ *   - larger default slot_data_size (384 KB SigmaStar / 512 KB CV610,
+ *     vs ~4 KB)
+ *   - staged write API (begin/append/commit) to gather scattered NAL
+ *     data from the encoder without a separate staging buffer
+ *   - separate magic/version to prevent cross-type attach
+ *
+ * Memory ordering and futex wake follow the same pattern as venc_ring.
+ */
+
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
+#ifdef __linux__
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
+#endif
+
+#define VENC_FRAME_RING_MAGIC   0x5646524D  /* "VFRM" */
+/* v2 (0.69.0): offset 88 changed meaning -- it carried throttle_permille, the
+ * producer's self-imposed bitrate clamp, and now carries low_water_slots, the
+ * raw ring occupancy the clamp used to react to.  The two have OPPOSITE
+ * polarity (1000 was healthy; a HIGH slot count is now the unhealthy end), so
+ * this is deliberately a hard version break rather than a field rename: every
+ * consumer validates version and refuses to attach on a mismatch, which turns
+ * a silent misread into a loud one. */
+#define VENC_FRAME_RING_VERSION 2
+/* "VHLT" -- marks the producer-health fields on header line 1 as populated.
+ * A consumer MUST treat any other value (notably 0, from a pre-0.57
+ * producer) as "this producer does not report health" rather than as zero
+ * drops, and MUST NOT reject a ring because these bytes are non-zero. */
+#define VENC_FRAME_RING_HEALTH_MAGIC 0x56484C54u
+
+/* Metadata prepended to each frame in the slot's data[] */
+#define VENC_FRAME_META_SIZE    8
+#define VENC_FRAME_CODEC_H265   0x01
+/* RTP/Opus packets, one per entry, as the air unit's audio path sent them.
+ * Never in a video ring: ar8030-transport-rx publishes the AR8030 link's
+ * audio in a ring of its own (ar8030-transport docs/ground-frame-ring.md),
+ * so a consumer that only knows H.265 never meets one. */
+#define VENC_FRAME_CODEC_OPUS   0x02
+#define VENC_FRAME_FLAG_IDR     0x01
+#define VENC_FRAME_FLAG_GDR     0x02  /* GDR rolling intra stripe active */
+#define VENC_FRAME_FLAG_ENHANCE 0x04  /* SVC-T enhance layer (droppable) */
+/* Bit 3 is set by a RECEIVER, never by venc.  waybeam-link stamps it on a
+ * frame it rebuilt from an unrecoverable FEC block — synthesized skip slices
+ * over the lost region, or a whole-picture freeze (its PROTOCOL.md §6.3b) —
+ * so a downstream consumer can tell a repaired picture from an intact one and
+ * refuse to trust what it carries (waybeam-hub declines to advertise such an
+ * access unit as a seek point, or to learn parameter sets from it).
+ *
+ * It is reserved here because this header is the canonical definition of the
+ * format (protocols/frame-shm.md): a future encoder-side flag claiming 0x08
+ * would be read downstream as damage on every frame that set it.  Absence is
+ * not a guarantee of integrity -- only its presence is a positive statement. */
+#define VENC_FRAME_FLAG_SALVAGED 0x08
+/* This entry is one slice of an access unit, and more of the same access
+ * unit follows in the next entry: the producer publishes each slice the
+ * moment the encoder hands it out (CV610 video0.sliceOutput), so the link can
+ * start sending a picture while the rest of it is still being encoded.  The
+ * access unit's last slice is published WITHOUT this flag, so an entry
+ * without it ends an access unit -- or is one, as without slice output.
+ *
+ * Every slice of one access unit carries the same pts and the same
+ * IDR/GDR/ENHANCE flags and GDR position.  An entry whose pts differs from
+ * the open access unit's starts a new one: the open one has lost its end
+ * (the producer stops publishing an access unit's slices after one did not
+ * fit the ring) and is incomplete.  A consumer that does not handle this
+ * flag would take every slice for a picture, so a producer sets it only when
+ * slice output was asked for. */
+#define VENC_FRAME_FLAG_PARTIAL  0x10
+/* Bit 5 is set by a RECEIVER, never by venc, like SALVAGED.  The ground's
+ * ar8030-transport-rx republishes what came over the AR8030 link and stamps
+ * it on the first entry after something went missing in front of it: whole
+ * frames that never arrived (a frame counter gap), the rest of a picture whose
+ * first slices were already published, or entries it dropped itself because
+ * the ring was full.  A decoder that sees it must expect broken references
+ * until the next IDR or completed GDR cycle, and may ask the air for an IDR.
+ * Absence is not a guarantee: a producer that does not track loss never sets
+ * it. */
+#define VENC_FRAME_FLAG_DISCONT  0x20
+
+typedef struct {
+	uint32_t pts;        /* capture timestamp (µs, CLOCK_MONOTONIC, truncated to 32 bits) */
+	uint8_t  codec;      /* VENC_FRAME_CODEC_H265 */
+	uint8_t  flags;      /* VENC_FRAME_FLAG_*; venc sets IDR/GDR/ENHANCE */
+	uint8_t  gdr_pos;    /* 0-based position in GDR cycle (0 when inactive) */
+	uint8_t  gdr_len;    /* GDR cycle length in frames (0 when inactive) */
+} VencFrameMeta;
+
+/* ── Ring header (3 cache lines, 192 bytes) ──────────────────────────── */
+
+typedef struct __attribute__((aligned(64))) {
+	/* Line 0: Immutable config */
+	uint32_t magic;
+	uint32_t version;
+	uint32_t slot_count;      /* must be power of 2 */
+	uint32_t slot_data_size;  /* max payload per slot (meta + frame data) */
+	uint32_t total_size;      /* total mmap size */
+	uint32_t epoch;
+	uint32_t init_complete;
+	uint8_t  _pad0[36];
+
+	/* Line 1: Producer-owned.
+	 *
+	 * health_magic/full_drops/throttle_permille were carved out of the
+	 * old _pad1[52] in 0.57.0.  sizeof stays 192 and nothing before them
+	 * moves -- both external consumers address this header by byte offset
+	 * (radeon-vrx VFRM_OFF_*, waybeam-link kFrHdr*).  0.69.0 replaced
+	 * throttle_permille with low_water_slots in place at offset 88 and
+	 * bumped `version` to 2 to make that visible: the polarity inverts, so
+	 * an unrebuilt consumer must refuse the ring rather than misread it.
+	 * See protocols/frame-shm.md, which is the canonical spec.
+	 *
+	 * Why they exist: full_drops is otherwise process-local to the
+	 * producer (venc_frame_ring_t::stats below), so a consumer is
+	 * structurally blind to the drops it is causing.  health_magic is
+	 * what stops a new consumer reading an OLD producer's zeroed pad as
+	 * "no drops" -- it is set last, after everything else in the header
+	 * and before init_complete. */
+	uint64_t write_idx        __attribute__((aligned(64)));
+	uint32_t futex_seq;
+	uint32_t health_magic;      /* VENC_FRAME_RING_HEALTH_MAGIC, or 0 */
+	uint64_t full_drops;        /* lifetime full-ring drops */
+	uint16_t low_water_slots;   /* lowest ring occupancy, in SLOTS, reached
+	                             * in the producer's last measurement
+	                             * window.  <= 1 is the healthy band (the
+	                             * ring's idle occupancy is one frame, not
+	                             * zero -- the producer samples just after
+	                             * writing); >= 2 across a whole window is
+	                             * standing backlog.  Raw slots, not a
+	                             * fraction: permille of a small slot count
+	                             * cannot round-trip the 1-slot reading,
+	                             * which is the one that matters. */
+	uint8_t  _pad_lw[6];        /* 90-95: keeps other_drops 8-byte aligned */
+	uint64_t other_drops;       /* lifetime frames the PRODUCER discarded for
+	                             * a reason other than a full ring: an access
+	                             * unit it could not encode into a slot at
+	                             * all (oversize, or a malformed packet
+	                             * table).  Deliberately separate from
+	                             * full_drops, because the two demand
+	                             * opposite responses from a rate
+	                             * controller: full_drops is congestion the
+	                             * consumer is causing and should slow down
+	                             * for, other_drops is not congestion at all
+	                             * and slowing down fixes nothing.
+	                             * Producer-side only -- venc_frame_ring_t
+	                             * ::stats.oversize_drops is overloaded and
+	                             * also counts CONSUMER-side read failures,
+	                             * which have no business on this line. */
+	uint8_t  _pad1[24];
+
+	/* Line 2: Consumer-owned */
+	uint64_t read_idx          __attribute__((aligned(64)));
+	uint32_t consumer_waiting;
+	uint8_t  _pad2[52];
+} venc_frame_ring_hdr_t;
+
+#ifdef __cplusplus
+static_assert(sizeof(venc_frame_ring_hdr_t) == 192,
+              "venc_frame_ring_hdr_t must be exactly 192 bytes");
+static_assert(sizeof(VencFrameMeta) == VENC_FRAME_META_SIZE,
+              "VencFrameMeta must be exactly 8 bytes");
+/* Same offset pins as the C branch below -- a byte-addressed consumer is as
+ * likely to be C++ as C, and a reorder must fail to compile on both. */
+static_assert(offsetof(venc_frame_ring_hdr_t, write_idx) == 64, "off 64");
+static_assert(offsetof(venc_frame_ring_hdr_t, futex_seq) == 72, "off 72");
+static_assert(offsetof(venc_frame_ring_hdr_t, health_magic) == 76, "off 76");
+static_assert(offsetof(venc_frame_ring_hdr_t, full_drops) == 80, "off 80");
+static_assert(offsetof(venc_frame_ring_hdr_t, low_water_slots) == 88, "off 88");
+static_assert(offsetof(venc_frame_ring_hdr_t, other_drops) == 96, "off 96");
+static_assert(offsetof(venc_frame_ring_hdr_t, read_idx) == 128, "off 128");
+static_assert(offsetof(venc_frame_ring_hdr_t, consumer_waiting) == 136, "off 136");
+#else
+_Static_assert(sizeof(venc_frame_ring_hdr_t) == 192,
+               "venc_frame_ring_hdr_t must be exactly 192 bytes");
+_Static_assert(sizeof(VencFrameMeta) == VENC_FRAME_META_SIZE,
+               "VencFrameMeta must be exactly 8 bytes");
+/* Consumers address these by byte offset, not through this struct, so a
+ * reorder here would silently move them out from under radeon-vrx and
+ * waybeam-link with nothing failing to compile.  Pin them. */
+_Static_assert(offsetof(venc_frame_ring_hdr_t, write_idx) == 64, "off 64");
+_Static_assert(offsetof(venc_frame_ring_hdr_t, futex_seq) == 72, "off 72");
+_Static_assert(offsetof(venc_frame_ring_hdr_t, health_magic) == 76, "off 76");
+_Static_assert(offsetof(venc_frame_ring_hdr_t, full_drops) == 80, "off 80");
+_Static_assert(offsetof(venc_frame_ring_hdr_t, low_water_slots) == 88,
+               "off 88");
+_Static_assert(offsetof(venc_frame_ring_hdr_t, other_drops) == 96, "off 96");
+_Static_assert(offsetof(venc_frame_ring_hdr_t, read_idx) == 128, "off 128");
+_Static_assert(offsetof(venc_frame_ring_hdr_t, consumer_waiting) == 136,
+               "off 136");
+#endif
+
+/* Per-slot layout: 4-byte length prefix + data */
+typedef struct {
+	uint32_t length;
+	uint8_t  data[];  /* [slot_data_size] */
+} venc_frame_ring_slot_t;
+
+typedef struct {
+	uint64_t writes;
+	uint64_t reads;
+	uint64_t full_drops;
+	uint64_t oversize_drops;
+	uint64_t bad_slot_drops;
+	uint64_t other_drops;   /* producer-side subset, mirrored to the header */
+} venc_frame_ring_stats_t;
+
+typedef struct {
+	venc_frame_ring_hdr_t *hdr;
+	uint8_t               *slots_base;
+	uint32_t               slot_stride;
+	uint32_t               slot_data_size;
+	uint32_t               map_size;
+	int                    is_owner;
+	char                   name[256];
+	venc_frame_ring_stats_t stats;
+	/* Staged write state (producer only) */
+	uint32_t               write_offset;
+	int                    write_active;
+} venc_frame_ring_t;
+
+/* ── Create / attach / destroy ───────────────────────────────────────── */
+
+venc_frame_ring_t *venc_frame_ring_create(const char *shm_name,
+	uint32_t slot_count, uint32_t slot_data_size);
+
+venc_frame_ring_t *venc_frame_ring_attach(const char *shm_name);
+
+void venc_frame_ring_destroy(venc_frame_ring_t *r);
+
+/* ── Producer-side observability ─────────────────────────────────────── */
+
+typedef struct {
+	uint32_t slot_count;
+	uint32_t used_slots;
+	uint8_t  fill_pct;
+	uint64_t writes;
+	uint64_t reads;
+	uint64_t full_drops;
+	uint64_t oversize_drops;
+	uint64_t bad_slot_drops;
+	uint64_t other_drops;
+} venc_frame_ring_fill_t;
+
+static inline int venc_frame_ring_get_fill(const venc_frame_ring_t *r,
+	venc_frame_ring_fill_t *out)
+{
+	if (!r || !r->hdr || !out)
+		return -1;
+	uint64_t w = __atomic_load_n(&r->hdr->write_idx, __ATOMIC_ACQUIRE);
+	uint64_t rd = __atomic_load_n(&r->hdr->read_idx, __ATOMIC_RELAXED);
+	uint32_t used = (w >= rd) ? (uint32_t)(w - rd) : 0;
+	uint32_t slot_count = r->hdr->slot_count;
+	if (used > slot_count)
+		used = slot_count;
+	out->slot_count = slot_count;
+	out->used_slots = used;
+	out->fill_pct = slot_count
+		? (uint8_t)((uint64_t)used * 100u / slot_count)
+		: 0u;
+	out->writes = r->stats.writes;
+	out->reads = r->stats.reads;
+	out->full_drops = r->stats.full_drops;
+	out->oversize_drops = r->stats.oversize_drops;
+	out->bad_slot_drops = r->stats.bad_slot_drops;
+	out->other_drops = r->stats.other_drops;
+	return 0;
+}
+
+/* Record a frame the producer discarded for a reason other than a full ring
+ * (oversize, or an access unit it could not build at all) and mirror the
+ * running count into the shared header.  Producer-only; a no-op on an attached
+ * (consumer) ring, and safe to call with a NULL ring so a caller on a
+ * non-frame-shm transport does not need to branch.
+ *
+ * Relaxed store for the same reason as full_drops: our own cache line, and the
+ * value is evidence for a rate controller rather than exact accounting. */
+static inline void venc_frame_ring_note_other_drop(venc_frame_ring_t *r)
+{
+	if (!r || !r->hdr || !r->is_owner)
+		return;
+	r->stats.other_drops++;
+	__atomic_store_n(&r->hdr->other_drops, r->stats.other_drops,
+		__ATOMIC_RELAXED);
+}
+
+/* Publish the window low-water occupancy in slots.  Producer-only; a no-op on
+ * an attached (consumer) ring. */
+static inline void venc_frame_ring_set_low_water(venc_frame_ring_t *r,
+	uint16_t slots)
+{
+	if (!r || !r->hdr || !r->is_owner)
+		return;
+	__atomic_store_n(&r->hdr->low_water_slots, slots, __ATOMIC_RELAXED);
+}
+
+/* ── Ring low-water tracker ──────────────────────────────────────────────
+ *
+ * venc measures ring pressure and publishes it; it does not act on it.  The
+ * rate controller (waybeam-link) is co-located on the same SoC, reads this
+ * ring, and owns every response to what the measurement says.
+ *
+ * Low-water, not high-water, and that distinction is what makes the signal
+ * usable.  Measured on a Star6E at 100 fps into an 8-slot ring with a
+ * perfectly healthy consumer, the ring routinely spikes to 2-3 slots inside a
+ * 200 ms window and drains again -- the consumer reads one frame per
+ * event-loop iteration, so short bursts are normal.  High-water reports those
+ * bursts as congestion 15-25 % of the time with nothing wrong.  Low-water
+ * asks the question that actually discriminates: did the ring fail to drain
+ * *at any point* in the whole window?
+ *
+ * SLOTS, not a fraction of capacity.  The healthy band is "at most one frame
+ * queued" -- the caller samples just after writing, so a perfectly drained
+ * ring still reads 1, which is why the clamp this replaced recovered at
+ * <= 1 slot and engaged at >= 2.  Whether a permille encoding can round-trip
+ * that 1 depends on the geometry: at the 8 slots every venc backend currently
+ * creates it does (125 permille exactly), but at 16 it does not (62.5 truncates
+ * to 62, which converts back to 0 -- a healthy ring indistinguishable from a
+ * drained one).  The header does not fix slot_count, so an encoding whose
+ * fidelity varies with it is the wrong choice regardless of what today's
+ * producers happen to pick.  Raw slots have no such dependence, and a consumer
+ * that wants a fraction already has slot_count at header offset 8.
+ *
+ * The consumer cannot derive this for itself.  It can sample instantaneous
+ * occupancy from write_idx/read_idx whenever it likes, but the low-water mark
+ * *between* its own reads is producer-side knowledge.
+ *
+ * No SDK dependency, no syscalls, no clock of its own -- the caller passes
+ * now_us.  Pure and host-unit-testable; see tests/test_venc_frame_ring.c.
+ *
+ * Threading: one instance per output, owned by the pipeline thread that
+ * writes the ring.  Not internally synchronised and does not need to be. */
+#define VENC_RING_LOW_WATER_WINDOW_US 200000u  /* measurement period */
+
+typedef struct {
+	uint32_t low_slots;    /* lowest occupancy seen this window */
+	uint32_t slot_count;   /* capacity, for the defensive clamp below */
+	uint64_t window_us;    /* start of the current window */
+	uint16_t slots;        /* last completed window's result */
+	int      seen;         /* any observation this window? */
+} VencRingLowWater;
+
+static inline void venc_ring_low_water_reset(VencRingLowWater *t,
+	uint64_t now_us)
+{
+	if (!t)
+		return;
+	t->low_slots = 0;
+	t->slot_count = 0;
+	t->window_us = now_us;
+	__atomic_store_n(&t->slots, (uint16_t)0, __ATOMIC_RELAXED);
+	t->seen = 0;
+}
+
+static inline void venc_ring_low_water_observe(VencRingLowWater *t,
+	uint32_t used_slots, uint32_t slot_count)
+{
+	if (!t)
+		return;
+	if (!t->seen || used_slots < t->low_slots) {
+		t->low_slots = used_slots;
+		t->seen = 1;
+	}
+	/* Track the live capacity so a ring resize mid-window still clamps
+	 * against the geometry the samples were taken from. */
+	t->slot_count = slot_count;
+}
+
+/* Closes the window if it has elapsed.  Returns 1 when a new result was
+ * published (so the caller writes it to the ring header), 0 otherwise. */
+static inline int venc_ring_low_water_tick(VencRingLowWater *t,
+	uint64_t now_us)
+{
+	uint32_t low;
+
+	if (!t)
+		return 0;
+	if (now_us - t->window_us < VENC_RING_LOW_WATER_WINDOW_US)
+		return 0;
+
+	low = t->seen ? t->low_slots : 0;
+	/* venc_frame_ring_get_fill() already clamps, but this value crosses a
+	 * process boundary -- keep it in range at the point of publication. */
+	if (low > t->slot_count)
+		low = t->slot_count;
+	/* Relaxed store: the pipeline thread publishes, the httpd thread
+	 * reads.  Same producer/consumer pair -- and same reasoning -- as
+	 * bad_au_drops; the throttle_permille field this replaced used
+	 * relaxed atomics for it too. */
+	__atomic_store_n(&t->slots, (uint16_t)low, __ATOMIC_RELAXED);
+
+	t->window_us = now_us;
+	t->low_slots = 0;
+	t->seen = 0;
+	return 1;
+}
+
+static inline uint16_t venc_ring_low_water_slots(const VencRingLowWater *t)
+{
+	return t ? __atomic_load_n(&t->slots, __ATOMIC_RELAXED) : 0u;
+}
+
+/* ── Inline helpers ──────────────────────────────────────────────────── */
+
+static inline venc_frame_ring_slot_t *venc_frame_ring_slot_at(
+	const venc_frame_ring_t *r, uint32_t idx)
+{
+	return (venc_frame_ring_slot_t *)(r->slots_base +
+		(uint64_t)idx * r->slot_stride);
+}
+
+/* ── Staged write API (producer) ─────────────────────────────────────
+ *
+ * Usage:
+ *   venc_frame_ring_begin_write(r, &meta)   // reserves a slot
+ *   venc_frame_ring_append(r, nal1, len1)   // append NAL data
+ *   venc_frame_ring_append(r, nal2, len2)   // append more
+ *   venc_frame_ring_commit_write(r)         // publish to consumer
+ *
+ * If any append fails (oversize), call abort_write() instead of commit.
+ */
+
+static inline int venc_frame_ring_begin_write(venc_frame_ring_t *r,
+	const VencFrameMeta *meta)
+{
+	uint64_t w, rd;
+	uint32_t idx;
+	venc_frame_ring_slot_t *slot;
+
+	if (!r || !r->hdr || !meta || r->write_active)
+		return -1;
+
+	w = __atomic_load_n(&r->hdr->write_idx, __ATOMIC_RELAXED);
+	rd = __atomic_load_n(&r->hdr->read_idx, __ATOMIC_ACQUIRE);
+
+	if (w - rd >= r->hdr->slot_count) {
+		r->stats.full_drops++;
+		/* Mirror into the shared header so the consumer can see the
+		 * drops it is causing.  Relaxed: our own cache line, and the
+		 * value is evidence for a rate controller, not an exact
+		 * accounting -- a reader may lag by a frame. */
+		if (r->is_owner)
+			__atomic_store_n(&r->hdr->full_drops,
+				r->stats.full_drops, __ATOMIC_RELAXED);
+		return -1;
+	}
+
+	if (VENC_FRAME_META_SIZE > r->slot_data_size) {
+		r->stats.oversize_drops++;
+		venc_frame_ring_note_other_drop(r);
+		return -1;
+	}
+
+	idx = (uint32_t)(w & (r->hdr->slot_count - 1));
+	slot = venc_frame_ring_slot_at(r, idx);
+	memcpy(slot->data, meta, VENC_FRAME_META_SIZE);
+
+	r->write_offset = VENC_FRAME_META_SIZE;
+	r->write_active = 1;
+	return 0;
+}
+
+static inline int venc_frame_ring_append(venc_frame_ring_t *r,
+	const void *data, uint32_t len)
+{
+	uint64_t w;
+	uint32_t idx;
+	venc_frame_ring_slot_t *slot;
+
+	if (!r || !r->write_active || !data || len == 0)
+		return -1;
+
+	if ((uint64_t)r->write_offset + len > r->slot_data_size) {
+		r->stats.oversize_drops++;
+		venc_frame_ring_note_other_drop(r);
+		return -1;
+	}
+
+	w = __atomic_load_n(&r->hdr->write_idx, __ATOMIC_RELAXED);
+	idx = (uint32_t)(w & (r->hdr->slot_count - 1));
+	slot = venc_frame_ring_slot_at(r, idx);
+	memcpy(slot->data + r->write_offset, data, len);
+	r->write_offset += len;
+	return 0;
+}
+
+static inline void venc_frame_ring_commit_write(venc_frame_ring_t *r)
+{
+	uint64_t w;
+	uint32_t idx;
+	venc_frame_ring_slot_t *slot;
+
+	if (!r || !r->write_active)
+		return;
+
+	w = __atomic_load_n(&r->hdr->write_idx, __ATOMIC_RELAXED);
+	idx = (uint32_t)(w & (r->hdr->slot_count - 1));
+	slot = venc_frame_ring_slot_at(r, idx);
+	slot->length = r->write_offset;
+
+	__atomic_store_n(&r->hdr->write_idx, w + 1, __ATOMIC_RELEASE);
+	r->stats.writes++;
+	r->write_active = 0;
+	r->write_offset = 0;
+
+#ifdef __linux__
+	__atomic_fetch_add(&r->hdr->futex_seq, 1, __ATOMIC_RELEASE);
+	if (__atomic_load_n(&r->hdr->consumer_waiting, __ATOMIC_RELAXED))
+		syscall(SYS_futex, &r->hdr->futex_seq,
+		        FUTEX_WAKE, 1, NULL, NULL, 0);
+#endif
+}
+
+static inline void venc_frame_ring_abort_write(venc_frame_ring_t *r)
+{
+	if (!r)
+		return;
+	r->write_active = 0;
+	r->write_offset = 0;
+}
+
+/* ── Bulk write (producer convenience) ───────────────────────────────── */
+
+static inline int venc_frame_ring_write(venc_frame_ring_t *r,
+	const VencFrameMeta *meta, const void *data, uint32_t len)
+{
+	if (venc_frame_ring_begin_write(r, meta) != 0)
+		return -1;
+	if (len > 0 && venc_frame_ring_append(r, data, len) != 0) {
+		venc_frame_ring_abort_write(r);
+		return -1;
+	}
+	venc_frame_ring_commit_write(r);
+	return 0;
+}
+
+/* ── Read (consumer) ─────────────────────────────────────────────────── */
+
+static inline int venc_frame_ring_read(venc_frame_ring_t *r,
+	void *buf, uint32_t buf_size, uint32_t *out_len)
+{
+	uint64_t rd, w;
+	uint32_t idx, len;
+	venc_frame_ring_slot_t *slot;
+
+	if (!r || !r->hdr)
+		return -1;
+
+	rd = __atomic_load_n(&r->hdr->read_idx, __ATOMIC_RELAXED);
+	w = __atomic_load_n(&r->hdr->write_idx, __ATOMIC_ACQUIRE);
+
+	if (rd >= w)
+		return -1;
+
+	idx = (uint32_t)(rd & (r->hdr->slot_count - 1));
+	slot = venc_frame_ring_slot_at(r, idx);
+	len = slot->length;
+
+	if (len > r->slot_data_size) {
+		r->stats.bad_slot_drops++;
+		__atomic_store_n(&r->hdr->read_idx, rd + 1, __ATOMIC_RELEASE);
+		return -1;
+	}
+
+	if (len > buf_size) {
+		r->stats.oversize_drops++;
+		__atomic_store_n(&r->hdr->read_idx, rd + 1, __ATOMIC_RELEASE);
+		return -1;
+	}
+
+	memcpy(buf, slot->data, len);
+	if (out_len) *out_len = len;
+
+	__atomic_store_n(&r->hdr->read_idx, rd + 1, __ATOMIC_RELEASE);
+	r->stats.reads++;
+	return 0;
+}
+
+static inline int venc_frame_ring_read_wait(venc_frame_ring_t *r,
+	void *buf, uint32_t buf_size, uint32_t *out_len, int timeout_ms)
+{
+	if (!r || !r->hdr)
+		return -1;
+
+	for (;;) {
+		if (venc_frame_ring_read(r, buf, buf_size, out_len) == 0)
+			return 0;
+
+#ifdef __linux__
+		uint32_t seq = __atomic_load_n(&r->hdr->futex_seq,
+			__ATOMIC_ACQUIRE);
+		__atomic_store_n(&r->hdr->consumer_waiting, 1,
+			__ATOMIC_RELEASE);
+
+		if (venc_frame_ring_read(r, buf, buf_size, out_len) == 0) {
+			__atomic_store_n(&r->hdr->consumer_waiting, 0,
+				__ATOMIC_RELEASE);
+			return 0;
+		}
+
+		struct timespec ts;
+		struct timespec *tsp = NULL;
+		if (timeout_ms > 0) {
+			ts.tv_sec = timeout_ms / 1000;
+			ts.tv_nsec = (long)(timeout_ms % 1000) * 1000000L;
+			tsp = &ts;
+		}
+
+		syscall(SYS_futex, &r->hdr->futex_seq,
+		        FUTEX_WAIT, seq, tsp, NULL, 0);
+
+		__atomic_store_n(&r->hdr->consumer_waiting, 0,
+			__ATOMIC_RELEASE);
+#else
+		usleep(1000);
+#endif
+		if (venc_frame_ring_read(r, buf, buf_size, out_len) == 0)
+			return 0;
+
+		if (timeout_ms > 0)
+			return -1;
+	}
+}
+
+#endif /* VENC_FRAME_RING_H */

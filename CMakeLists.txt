@@ -34,6 +34,8 @@ find_package(fmt REQUIRED)
 find_package(spdlog REQUIRED)
 
 include_directories(${PNG_INCLUDE_DIR})
+# The frame-shm ring (--frame-shm: video from ar8030-transport-rx -R).
+include_directories(${PROJECT_SOURCE_DIR}/third_party/waybeam_frame_ring)
 
 # Simulator
 set(SIMULATOR_SOURCES
@@ -146,6 +148,8 @@ set(LIB_SOURCE_FILES
         src/gstrtpreceiver.h
         src/timing_sei.h
         src/timing_sei.c
+        third_party/waybeam_frame_ring/venc_frame_ring.h
+        third_party/waybeam_frame_ring/venc_frame_ring.c
         src/vsync_lock.h
         src/vsync_lock.cpp)
 
