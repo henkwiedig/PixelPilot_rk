@@ -154,7 +154,9 @@ private:
     void loop_pull_samples();
     void start_frame_shm();
     void loop_read_frame_shm();
+    void loop_dvr_frame_shm();
     void on_frame_shm_entry(const uint8_t* slot, uint32_t len, std::vector<uint8_t>& au, bool& skip);
+    void dvr_push_raw(const std::shared_ptr<std::vector<uint8_t>>& au);
     void on_new_sample(std::shared_ptr<std::vector<uint8_t>> sample);
     // Drain the pipeline bus (on the pull thread) so error/warning spam from a
     // failing sink can't accumulate unbounded, and fall back to video-only if the
@@ -225,6 +227,9 @@ private:
     std::mutex m_dvr_cfg_mutex;             // guards m_dvr_base_path_fn / m_dvr_max_size
     GstElement* m_dvr_rec_bin = nullptr;
     GstPad* m_dvr_tee_video_pad = nullptr;
+    GstElement* m_dvr_raw_appsrc = nullptr; // frame-shm: the raw recorder's input
+    std::mutex m_dvr_raw_src_mutex;         // guards it: pushed from the ring thread
+    std::unique_ptr<std::thread> m_dvr_thread; // frame-shm: DVR start/stop, bus; never the ring thread
     GstPad* m_dvr_tee_audio_pad = nullptr;
 
     // Re-encode recorder (appsrc video + Opus). Same pull-thread-driven lifecycle

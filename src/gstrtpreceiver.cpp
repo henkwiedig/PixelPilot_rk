@@ -1433,6 +1433,21 @@ static void split_annexb(const uint8_t* d, uint32_t n, std::vector<std::pair<uin
         out.emplace_back((uint32_t)start, n - (uint32_t)start);
 }
 
+// An access unit for the raw recorder, while it records from the ring. No copy:
+// the buffer holds a reference to the vector the decoder was handed too.
+void GstRtpReceiver::dvr_push_raw(const std::shared_ptr<std::vector<uint8_t>>& au) {
+    if (!au || au->empty())
+        return;
+    std::lock_guard<std::mutex> lk(m_dvr_raw_src_mutex);
+    if (!m_dvr_raw_appsrc)
+        return;
+    auto* keep = new std::shared_ptr<std::vector<uint8_t>>(au);
+    GstBuffer* buf = gst_buffer_new_wrapped_full(
+        GST_MEMORY_FLAG_READONLY, au->data(), au->size(), 0, au->size(), keep,
+        [](gpointer p) { delete static_cast<std::shared_ptr<std::vector<uint8_t>>*>(p); });
+    gst_app_src_push_buffer(GST_APP_SRC(m_dvr_raw_appsrc), buf); // takes the buffer; a full queue drops
+}
+
 // The H.265 NAL unit type of the NAL at d (start code included).
 static int h265_nal_type(const uint8_t* d, uint32_t len) {
     const uint32_t sc = (len >= 3 && d[2] == 1) ? 3 : 4;
@@ -1476,6 +1491,13 @@ void GstRtpReceiver::on_frame_shm_entry(const uint8_t* slot, uint32_t len, std::
             on_new_sample(std::make_shared<std::vector<uint8_t>>(data + nals[i].first,
                                                                  data + nals[i].first + nals[i].second));
         }
+        if (m_dvr_active.load(std::memory_order_relaxed) && m_ring_params_seen) { // raw DVR: whole AUs
+            au.insert(au.end(), data, data + n);
+            if (!partial) {
+                dvr_push_raw(std::make_shared<std::vector<uint8_t>>(std::move(au)));
+                au.clear();
+            }
+        }
         return;
     }
 
@@ -1498,8 +1520,10 @@ void GstRtpReceiver::on_frame_shm_entry(const uint8_t* slot, uint32_t len, std::
             spdlog::info("[RING] parameter sets seen, feeding the decoder");
         }
         if (!au.empty()) {
+            auto sample = std::make_shared<std::vector<uint8_t>>(std::move(au));
             t_last_buffer_au_end = true;
-            on_new_sample(std::make_shared<std::vector<uint8_t>>(std::move(au)));
+            on_new_sample(sample);
+            dvr_push_raw(sample);
         }
         au.clear();
     }
@@ -1566,11 +1590,22 @@ void GstRtpReceiver::loop_read_frame_shm() {
             }
         }
         tick_stream_presence();
-        dvr_tick();
-        handle_bus_messages();
     }
     if (ring)
         venc_frame_ring_destroy(ring);
+}
+
+// Starting or stopping a recorder blocks for up to a second or two (the bin's
+// state change, the file, waiting for the mp4 to close). On the RTP path the
+// pull thread doing that only delays frames the socket buffer holds; the ring
+// has 8 entries, ~4 frames, so it runs here, off the ring thread.
+void GstRtpReceiver::loop_dvr_frame_shm() {
+    pthread_setname_np(pthread_self(), "frame-shm-dvr");
+    while (m_pull_samples_run) {
+        dvr_tick();
+        handle_bus_messages();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
 }
 
 void GstRtpReceiver::start_frame_shm() {
@@ -1592,6 +1627,7 @@ void GstRtpReceiver::start_frame_shm() {
     spdlog::info("[RING] live video from frame-shm ring '{}' (no RTP)", m_frame_shm);
     m_pull_samples_run = true;
     m_pull_samples_thread = std::make_unique<std::thread>(&GstRtpReceiver::loop_read_frame_shm, this);
+    m_dvr_thread = std::make_unique<std::thread>(&GstRtpReceiver::loop_dvr_frame_shm, this);
 }
 
 void GstRtpReceiver::handle_bus_messages()
@@ -1758,6 +1794,10 @@ void GstRtpReceiver::stop_receiving() {
     if (m_pull_samples_thread) {
         m_pull_samples_thread->join();
         m_pull_samples_thread = nullptr;
+    }
+    if (m_dvr_thread) {
+        m_dvr_thread->join();
+        m_dvr_thread = nullptr;
     }
     
     if (m_read_socket_thread) {
@@ -2468,10 +2508,17 @@ void GstRtpReceiver::dvr_tick() {
 
 void GstRtpReceiver::dvr_add_record_bin() {
     if (!m_gst_pipeline) return;
+    const auto t_start = std::chrono::steady_clock::now();
+    auto ms_since = [](std::chrono::steady_clock::time_point t) {
+        return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t).count();
+    };
+    // From the frame-shm ring there is no RTP tee: the pull thread pushes each
+    // access unit into an appsrc at the head of the bin instead (dvr_push_raw).
+    const bool from_ring = !m_frame_shm.empty();
     GstElement* tee = gst_bin_get_by_name(GST_BIN(m_gst_pipeline), "rtp_tee");
-    if (!tee) {
-        // The frame-shm source has no RTP tee (not yet: raw DVR from the ring).
-        spdlog::warn("[DVR] no rtp_tee in pipeline; cannot record raw");
+    if (!tee && !from_ring) {
+        spdlog::warn("[DVR] no rtp_tee in pipeline; cannot record");
         m_dvr_want.store(false, std::memory_order_relaxed);
         return;
     }
@@ -2483,26 +2530,30 @@ void GstRtpReceiver::dvr_add_record_bin() {
         if (m_dvr_base_path_fn) base = m_dvr_base_path_fn();
         max_bytes = m_dvr_max_size;
     }
+    const long long path_ms = ms_since(t_start);
     if (base.empty()) {
         spdlog::error("[DVR] no output path resolved; recording disabled");
         m_dvr_want.store(false, std::memory_order_relaxed); // avoid per-tick retry spam
-        gst_object_unref(tee);
+        if (tee) gst_object_unref(tee);
         return;
     }
 
     const bool h265 = (m_video_codec == VideoCodec::H265);
     // Only mux an audio track when Opus is actually flowing: recording an empty
     // audio track (--audio on but the air sends none) yields an unplayable mp4.
-    const bool audio = m_audio_active && audio_recently_seen();
+    const bool audio = tee && m_audio_active && audio_recently_seen();
     // Native video (no re-encode) + muxed Opus (when active) into one mp4 via
     // splitmuxsink. A leading queue on each input decouples the record branch
     // from the tee so a slow disk cannot back-pressure and stall the live video.
     std::stringstream ss;
+    if (from_ring)
+        ss << "appsrc name=dvr_raw_src is-live=true do-timestamp=true format=time ! ";
     ss << "queue name=dvr_vq max-size-buffers=0 max-size-bytes=" << kDvrQueueBytes
-       << " max-size-time=0 leaky=downstream ! "
-       << pipeline::gst_rtp_video_caps_fields(m_video_codec) << " ! "
-       << (h265 ? "rtph265depay" : "rtph264depay") << " name=dvr_vdepay ! "
-       << (h265 ? "h265parse" : "h264parse") << " name=dvr_vparse config-interval=-1 ! "
+       << " max-size-time=0 leaky=downstream ! ";
+    if (!from_ring)
+        ss << pipeline::gst_rtp_video_caps_fields(m_video_codec) << " ! "
+           << (h265 ? "rtph265depay" : "rtph264depay") << " name=dvr_vdepay ! ";
+    ss << (h265 ? "h265parse" : "h264parse") << " name=dvr_vparse config-interval=-1 ! "
        << "splitmuxsink name=dvr_sms muxer=mp4mux max-size-bytes=" << static_cast<guint64>(max_bytes);
     if (audio) {
         // capssetter (ANY sink template) hands Opus RTP caps to the depayloader
@@ -2518,7 +2569,7 @@ void GstRtpReceiver::dvr_add_record_bin() {
     if (!bin) {
         spdlog::error("[DVR] failed to build record bin: {}", err ? err->message : "unknown");
         if (err) g_error_free(err);
-        gst_object_unref(tee);
+        if (tee) gst_object_unref(tee);
         m_dvr_want.store(false, std::memory_order_relaxed);
         return;
     }
@@ -2556,8 +2607,18 @@ void GstRtpReceiver::dvr_add_record_bin() {
         attach_pt_filter(m_gst_pipeline, "dvr_adepay", pt, /*drop_when_match=*/false);
     }
 
+    // The ring's appsrc: whole access units, byte-stream.
+    GstElement* rsrc = from_ring ? gst_bin_get_by_name(GST_BIN(bin), "dvr_raw_src") : nullptr;
+    if (rsrc) {
+        GstCaps* caps = gst_caps_new_simple(h265 ? "video/x-h265" : "video/x-h264",
+                                            "stream-format", G_TYPE_STRING, "byte-stream",
+                                            "alignment", G_TYPE_STRING, "au", NULL);
+        g_object_set(rsrc, "caps", caps, "max-bytes", (guint64)(8 * 1024 * 1024), "block", FALSE, NULL);
+        gst_caps_unref(caps);
+    }
+
     // Expose the input queue sinks as ghost pads so the tee can link into the bin.
-    GstPad* gv = dvr_ghost_sink(bin, "dvr_vq", "vsink");
+    GstPad* gv = from_ring ? nullptr : dvr_ghost_sink(bin, "dvr_vq", "vsink");
     GstPad* ga = audio ? dvr_ghost_sink(bin, "dvr_aq", "asink") : nullptr;
 
     // Sync to PLAYING BEFORE linking to the live tee: linking a still-NULL branch
@@ -2566,28 +2627,36 @@ void GstRtpReceiver::dvr_add_record_bin() {
         spdlog::error("[DVR] record bin failed to reach PLAYING; aborting record");
         if (gv) gst_object_unref(gv);
         if (ga) gst_object_unref(ga);
+        if (rsrc) gst_object_unref(rsrc);
         gst_element_set_state(bin, GST_STATE_NULL);
         gst_bin_remove(GST_BIN(m_gst_pipeline), bin);
-        gst_object_unref(tee);
+        if (tee) gst_object_unref(tee);
         m_dvr_want.store(false, std::memory_order_relaxed);
         return;
     }
 
-    m_dvr_tee_video_pad = dvr_request_tee_pad(tee);
-    if (gv) gst_pad_link(m_dvr_tee_video_pad, gv);
+    if (gv) {
+        m_dvr_tee_video_pad = dvr_request_tee_pad(tee);
+        gst_pad_link(m_dvr_tee_video_pad, gv);
+    }
     if (ga) {
         m_dvr_tee_audio_pad = dvr_request_tee_pad(tee);
         gst_pad_link(m_dvr_tee_audio_pad, ga);
     }
     if (gv) gst_object_unref(gv);
     if (ga) gst_object_unref(ga);
-    gst_object_unref(tee);
+    if (tee) gst_object_unref(tee);
 
+    {
+        std::lock_guard<std::mutex> lk(m_dvr_raw_src_mutex);
+        m_dvr_raw_appsrc = rsrc; // holds the ref until dvr_remove_record_bin()
+    }
     m_dvr_rec_bin = bin;
     m_dvr_active.store(true, std::memory_order_relaxed);
-    spdlog::info("[DVR] recording -> {}.mp4 (video={}, audio={}, split={}MB)",
+    spdlog::info("[DVR] recording -> {}.mp4 (video={}, audio={}, split={}MB; started in {} ms, {} of them "
+                 "for the file name)",
                  base, h265 ? "H.265" : "H.264", audio ? "opus" : "none",
-                 max_bytes / 1000000);
+                 max_bytes / 1000000, ms_since(t_start), path_ms);
 
     // Ask the air side for a keyframe so the first fragment opens promptly
     // (splitmuxsink starts a file only on a keyframe boundary).
@@ -2610,8 +2679,17 @@ void GstRtpReceiver::dvr_remove_record_bin() {
     // Finalize: EOS the bin inputs so the splitmuxsink writes the mp4 moov, then
     // wait (bounded) for THIS stop's fragment-closed. Stale fragment-closed
     // messages from earlier size-splits are drained first so we don't stop early.
+    // From the ring: no more pushes, and the end of stream comes through the appsrc.
+    GstElement* rsrc = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(m_dvr_raw_src_mutex);
+        rsrc = m_dvr_raw_appsrc;
+        m_dvr_raw_appsrc = nullptr;
+    }
+
     GstBus* bus = m_gst_pipeline ? gst_element_get_bus(m_gst_pipeline) : nullptr;
     dvr_drain_element_messages(bus);
+    if (rsrc) gst_app_src_end_of_stream(GST_APP_SRC(rsrc));
     if (gv) gst_pad_send_event(gv, gst_event_new_eos());
     if (ga) gst_pad_send_event(ga, gst_event_new_eos());
     dvr_sync_recording_async(dvr_wait_fragment_closed(bus));
@@ -2619,6 +2697,7 @@ void GstRtpReceiver::dvr_remove_record_bin() {
 
     if (gv) gst_object_unref(gv);
     if (ga) gst_object_unref(ga);
+    if (rsrc) gst_object_unref(rsrc);
 
     gst_element_set_state(bin, GST_STATE_NULL);
     if (m_gst_pipeline) gst_bin_remove(GST_BIN(m_gst_pipeline), bin);
