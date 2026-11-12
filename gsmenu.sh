@@ -416,13 +416,16 @@ case "$@" in
 
 # ── Air: Artosyn ─────────────────────────────────────────────────────────────
 # ar8030-lifecycled's HTTP control API on the air unit ($REMOTE_IP:8899).
-# All three are lifecycled-persisted:
+# All four are lifecycled-persisted:
 #   bandwidth  GET /api/v1/status .bandwidth_mhz, POST /api/v1/bandwidth?mhz=N
 #   power      GET /api/v1/power (.power, .power_levels -- the air side's own
 #              levels), POST /api/v1/power?level=<mW|auto>; shown as "N mW"
 #   channel    owned by the air unit: GET /api/v1/channel (.channel,
 #              .table_mhz), POST /api/v1/channel?chan=<index|auto>; shown as
 #              "auto" or "<index> (<MHz> MHz)", set takes the first word
+#   frame_change  owned by the air unit: GET /api/v1/frame-change
+#              (.frame_change), POST /api/v1/frame-change?mode=<0|1|2>; shown
+#              as "<mode> (<what it does>)", set takes the first word
 
     "get air artosyn bandwidth")
         echo 20
@@ -436,10 +439,15 @@ case "$@" in
         echo "25 (5805 MHz)"
         emit_values "auto\n24 (5770 MHz)\n25 (5805 MHz)\n26 (5878 MHz)"  # integrator: GET /api/v1/channel's channel/table_mhz
         ;;
+    "get air artosyn frame_change")
+        echo "1 (most throughput)"
+        emit_values "1 (most throughput)\n2 (low latency)\n0 (chip default)"  # integrator: GET /api/v1/frame-change's frame_change
+        ;;
 
     "set air artosyn bandwidth"*)   : ;;
     "set air artosyn power"*)       : ;;
     "set air artosyn channel"*)     : ;;
+    "set air artosyn frame_change"*) : ;;
 
 # ── GS: WFB-NG ──────────────────────────────────────────────────────────────
 

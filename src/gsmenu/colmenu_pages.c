@@ -320,17 +320,20 @@ static const colmenu_item_t air_aalink_items[] = {
 static const colmenu_page_t air_aalink_page = { "AALink", "air", "aalink", air_aalink_items, 11 };
 
 static const colmenu_item_t air_artosyn_items[] = {
-    /* All three are ar8030-lifecycled's own persisted settings (survive
+    /* All four are ar8030-lifecycled's own persisted settings (survive
      * reboots). Channel is owned by the air unit (AP): "auto" or an entry of
      * the chip's own channel table ("<index> (<MHz> MHz)", listed by
      * gsmenu.sh from the live device, so it can't go stale); changing it
      * retunes both ends together over the live link. Output Power offers
-     * this side's own levels (air: 400/200/100/25 mW). */
-    { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Bandwidth",    .param="bandwidth" },
-    { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Output Power", .param="power" },
-    { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Channel",      .param="channel" },
+     * this side's own levels (air: 400/200/100/25 mW). Frame Structure is
+     * the AP's BB_SET_FRAME_CHANGE mode: 1 most throughput, 2 a short
+     * uplink slot (lower latency, ~15% less throughput), 0 the chip's own. */
+    { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Bandwidth",       .param="bandwidth" },
+    { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Output Power",    .param="power" },
+    { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Channel",         .param="channel" },
+    { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Frame Structure", .param="frame_change" },
 };
-static const colmenu_page_t air_artosyn_page = { "Artosyn", "air", "artosyn", air_artosyn_items, 3 };
+static const colmenu_page_t air_artosyn_page = { "Artosyn", "air", "artosyn", air_artosyn_items, 4 };
 
 /* Camera sub-pages (all type=air page=camera) */
 static const colmenu_item_t cam_video_items[] = {
