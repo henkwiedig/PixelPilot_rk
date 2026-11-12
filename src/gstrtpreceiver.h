@@ -88,6 +88,10 @@ public:
     // of RTP on the UDP port: whole access units, or in slice mode one NAL per
     // callback as on the RTP path. Set before start_receiving().
     void set_frame_shm(const std::string& name) { m_frame_shm = name; }
+    // With --audio: the air unit's RTP/Opus audio from this frame-shm ring
+    // (ar8030-transport-rx -A <name>), into the same playback branch and DVR
+    // audio tap as on the RTP path.
+    void set_frame_shm_audio(const std::string& name) { m_frame_shm_audio = name; }
     bool nal_aligned() const { return m_nal_active.load(std::memory_order_relaxed); }
     // In the callback (on the pull thread): the buffer it was given ends an
     // access unit (it carried the RTP marker). Meaningful in NAL mode only.
@@ -158,6 +162,7 @@ private:
     void loop_read_frame_shm();
     void loop_dvr_frame_shm();
     void loop_feed_frame_shm();
+    void loop_read_frame_shm_audio();
     void on_frame_shm_entry(const uint8_t* slot, uint32_t len, std::vector<uint8_t>& au, bool& skip);
     void dvr_push_raw(const std::shared_ptr<std::vector<uint8_t>>& au);
     void queue_frame_shm_entry(const uint8_t* slot, uint32_t len);
@@ -190,6 +195,9 @@ private:
     // Slice mode (set_nal_mode()), and whether the pipeline up now is built for it.
     bool m_nal_mode = false;
     std::string m_frame_shm;   // --frame-shm ring name, empty = RTP on the UDP port
+    std::string m_frame_shm_audio; // --frame-shm-audio ring name
+    std::unique_ptr<std::thread> m_ring_audio_thread;
+    GstElement* m_ring_audio_src = nullptr; // the audio ring's appsrc in front of rtp_tee
     bool m_ring_params_seen = false; // the decoder has had VPS/SPS since the (re)attach
     std::atomic<bool> m_nal_active{false};
     // Serializes switch_to_stream() so a menu audio-toggle and an automatic

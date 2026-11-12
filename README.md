@@ -330,8 +330,9 @@ decoder, with no GStreamer element in the live path; an empty pipeline remains f
 recorders (the raw one gets the access units through an appsrc). Keyframe requests go to rx's relay
 on 127.0.0.1, a `DISCONT` entry (frames missing in front of it) asks for one, and nothing reaches the
 decoder before an access unit with an SPS. Recorders start and stop in a thread of their own, never
-the one reading the ring (it holds only ~4 frames). Not in this mode: the network restream and
-audio.
+the one reading the ring (it holds only ~4 frames). With `--audio --frame-shm-audio <name>` the air
+unit's RTP/Opus audio comes from rx's audio ring (`rx -A <name>`) into the same playback branch and
+DVR audio tap as on the RTP path. Not in this mode: the network restream.
 
 There are many facts based on Mavlink telemetry, see `mavlink.c`. All of them have tags "sysid" and
 "compid", but some have extra tags.

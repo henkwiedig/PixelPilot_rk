@@ -204,6 +204,7 @@ uint16_t listen_port = 5600;
 const char* unix_socket = NULL;
 // --frame-shm: live video from ar8030-transport-rx's frame-shm ring, not RTP.
 const char* frame_shm = NULL;
+const char* frame_shm_audio = NULL; // --frame-shm-audio: and its audio ring
 // Opt-in Opus audio (muxed into the RTP stream, split by payload type).
 bool audio_enabled = false;
 std::string audio_device;   // empty = ALSA system default
@@ -2155,6 +2156,8 @@ void read_gstreamerpipe_stream(DecoderPacket *packet, int gst_udp_port, const ch
 	receiver->configure_audio(audio_enabled, audio_device, audio_pt, audio_volume / 100.0);
 	if (frame_shm)
 		receiver->set_frame_shm(frame_shm);
+	if (frame_shm_audio)
+		receiver->set_frame_shm_audio(frame_shm_audio);
 	// Realign the MPP decoder whenever the receiver detects a mid-stream codec
 	// switch and rebuilds its pipeline.
 	receiver->set_codec_changed_callback([](VideoCodec c) {
@@ -2309,6 +2312,8 @@ void printHelp() {
     "    --socket <socket>      - read data from socket\n"
     "    --frame-shm <name>     - live video from frame-shm ring <name> (ar8030-transport-rx -R)\n"
     "                             instead of RTP on the UDP port\n"
+    "    --frame-shm-audio <name> - with --audio: the audio from frame-shm ring <name>\n"
+    "                             (ar8030-transport-rx -A)\n"
     "\n"
     "    --mavlink-port <port>  - UDP port for mavlink telemetry        (Default: 14550)\n"
     "\n"
@@ -2447,6 +2452,11 @@ int main(int argc, char **argv)
 
 	__OnArgument("--frame-shm") {
 		frame_shm = const_cast<char*>(__ArgValue);
+		continue;
+	}
+
+	__OnArgument("--frame-shm-audio") {
+		frame_shm_audio = const_cast<char*>(__ArgValue);
 		continue;
 	}
 

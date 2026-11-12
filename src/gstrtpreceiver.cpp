@@ -1413,6 +1413,66 @@ void GstRtpReceiver::loop_pull_samples()
  * goes through GStreamer; an empty pipeline stays only for the DVR recorders
  * to attach to. */
 
+// One frame-shm ring as a reader holds it: attach (dropping what waited),
+// and tell when rx replaced it with a new one under the same name.
+struct FrameShmAttach {
+    std::string name, path;
+    venc_frame_ring_t* ring = nullptr;
+    dev_t dev = 0;
+    ino_t ino = 0;
+    bool waiting_logged = false;
+
+    explicit FrameShmAttach(const std::string& n)
+        : name(n), path("/dev/shm/" + (n[0] == '/' ? n.substr(1) : n)) {}
+    ~FrameShmAttach() { close(); }
+
+    // True once attached; on failure waits a little (the caller loops).
+    bool attach(const char* what) {
+        ring = venc_frame_ring_attach(name.c_str());
+        if (!ring) {
+            if (!waiting_logged) {
+                spdlog::info("[RING] waiting for frame-shm {} ring '{}'", what, name);
+                waiting_logged = true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            return false;
+        }
+        struct stat st;
+        if (stat(path.c_str(), &st) == 0) {
+            dev = st.st_dev;
+            ino = st.st_ino;
+        } else {
+            dev = 0; // unknown: the first timeout reattaches
+            ino = 0;
+        }
+        // Whatever waited in the ring is old: start with what comes next.
+        __atomic_store_n(&ring->hdr->read_idx, __atomic_load_n(&ring->hdr->write_idx, __ATOMIC_ACQUIRE),
+                         __ATOMIC_RELEASE);
+        waiting_logged = false;
+        spdlog::info("[RING] attached to frame-shm {} ring '{}' ({} slots x {} bytes)", what, name,
+                     ring->hdr->slot_count, ring->slot_data_size);
+        return true;
+    }
+
+    // After a read timeout: is it still rx's current ring? A restarted rx
+    // makes a new one under the same name. Detaches if not.
+    bool replaced() {
+        struct stat st;
+        const bool exists = stat(path.c_str(), &st) == 0;
+        if (exists && st.st_dev == dev && st.st_ino == ino)
+            return false;
+        spdlog::info("[RING] frame-shm ring '{}' {}, reattaching", name, exists ? "replaced" : "gone");
+        close();
+        return true;
+    }
+
+    void close() {
+        if (ring)
+            venc_frame_ring_destroy(ring);
+        ring = nullptr;
+    }
+};
+
 // Between the ring reader and the decoder's feed: what the RTP path's socket
 // buffer (udpsrc buffer-size) held, ~0.75 s at 22 Mbit/s.
 static constexpr size_t kRingQueueBytes = 2 * 1024 * 1024;
@@ -1608,73 +1668,62 @@ void GstRtpReceiver::loop_read_frame_shm() {
         if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0)
             spdlog::warn("[RING] cannot make the ring reader SCHED_FIFO");
     }
-    const std::string name = m_frame_shm;
-    const std::string path = "/dev/shm/" + (name[0] == '/' ? name.substr(1) : name);
-    venc_frame_ring_t* ring = nullptr;
-    dev_t ring_dev = 0;
-    ino_t ring_ino = 0;
+    FrameShmAttach r(m_frame_shm);
     std::vector<uint8_t> slot;
-    bool waiting_logged = false;
 
     while (m_pull_samples_run) {
-        if (!ring) {
-            ring = venc_frame_ring_attach(name.c_str());
-            if (ring) {
-                struct stat st;
-                if (stat(path.c_str(), &st) == 0) {
-                    ring_dev = st.st_dev;
-                    ring_ino = st.st_ino;
-                } else {
-                    ring_dev = 0; // unknown: the first timeout reattaches
-                    ring_ino = 0;
-                }
-                // Whatever waited in the ring is old: start with what comes
-                // next (the stream-up keyframe request follows).
-                __atomic_store_n(&ring->hdr->read_idx,
-                                 __atomic_load_n(&ring->hdr->write_idx, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
-                slot.resize(ring->slot_data_size);
-                {
-                    // The feed thread starts over: the queued entries are the
-                    // old ring's, an empty one resets its state.
-                    std::lock_guard<std::mutex> lk(m_ring_q_mtx);
-                    m_ring_q.clear();
-                    m_ring_q_bytes = 0;
-                    m_ring_q_lost = false;
-                    m_ring_q.emplace_back();
-                }
-                m_ring_q_cv.notify_one();
-                waiting_logged = false;
-                spdlog::info("[RING] attached to frame-shm ring '{}' ({} slots x {} bytes)", name,
-                             ring->hdr->slot_count, ring->slot_data_size);
-            } else {
-                if (!waiting_logged) {
-                    spdlog::info("[RING] waiting for frame-shm ring '{}'", name);
-                    waiting_logged = true;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        if (!r.ring && r.attach("video")) {
+            slot.resize(r.ring->slot_data_size);
+            {
+                // The feed thread starts over: the queued entries are the
+                // old ring's, an empty one resets its state.
+                std::lock_guard<std::mutex> lk(m_ring_q_mtx);
+                m_ring_q.clear();
+                m_ring_q_bytes = 0;
+                m_ring_q_lost = false;
+                m_ring_q.emplace_back();
             }
+            m_ring_q_cv.notify_one();
         }
-        if (ring) {
+        if (r.ring) {
             uint32_t len = 0;
-            if (venc_frame_ring_read_wait(ring, slot.data(), (uint32_t)slot.size(), &len, 100) == 0) {
+            if (venc_frame_ring_read_wait(r.ring, slot.data(), (uint32_t)slot.size(), &len, 100) == 0)
                 queue_frame_shm_entry(slot.data(), len);
-            } else {
-                // Nothing for 100 ms: is it still rx's current ring? A
-                // restarted rx makes a new one under the same name.
-                struct stat st;
-                const bool exists = stat(path.c_str(), &st) == 0;
-                if (!exists || st.st_dev != ring_dev || st.st_ino != ring_ino) {
-                    spdlog::info("[RING] frame-shm ring '{}' {}, reattaching", name,
-                                 exists ? "replaced" : "gone");
-                    venc_frame_ring_destroy(ring);
-                    ring = nullptr;
-                }
-            }
+            else
+                r.replaced();
         }
         tick_stream_presence();
     }
-    if (ring)
-        venc_frame_ring_destroy(ring);
+}
+
+// The air unit's audio (rx -A): each RTP/Opus packet into the appsrc in front
+// of rtp_tee. No hurry: the audio ring holds ~1.3 s.
+void GstRtpReceiver::loop_read_frame_shm_audio() {
+    pthread_setname_np(pthread_self(), "frame-shm-audio");
+    FrameShmAttach r(m_frame_shm_audio);
+    std::vector<uint8_t> slot;
+    while (m_pull_samples_run) {
+        if (!r.ring && r.attach("audio"))
+            slot.resize(r.ring->slot_data_size);
+        if (!r.ring)
+            continue;
+        uint32_t len = 0;
+        if (venc_frame_ring_read_wait(r.ring, slot.data(), (uint32_t)slot.size(), &len, 100) != 0) {
+            r.replaced();
+            continue;
+        }
+        if (len <= VENC_FRAME_META_SIZE)
+            continue;
+        VencFrameMeta m;
+        memcpy(&m, slot.data(), VENC_FRAME_META_SIZE);
+        if (m.codec != VENC_FRAME_CODEC_OPUS)
+            continue;
+        const uint32_t n = len - VENC_FRAME_META_SIZE;
+        g_last_audio_pkt_ms.store(now_ms(), std::memory_order_relaxed);
+        GstBuffer* buf = gst_buffer_new_allocate(nullptr, n, nullptr);
+        gst_buffer_fill(buf, 0, slot.data() + VENC_FRAME_META_SIZE, n);
+        gst_app_src_push_buffer(GST_APP_SRC(m_ring_audio_src), buf); // takes the buffer
+    }
 }
 
 // Starting or stopping a recorder blocks for up to a second or two (the bin's
@@ -1696,12 +1745,50 @@ void GstRtpReceiver::start_frame_shm() {
         m_video_codec = VideoCodec::H265;
     }
     m_nal_active.store(m_nal_mode, std::memory_order_relaxed);
-    m_audio_active = false;
-    g_audio_pt.store(-1, std::memory_order_relaxed);
-    if (m_audio_enabled)
-        spdlog::warn("[RING] no audio with --frame-shm yet");
-    // No video elements: the pipeline is only there for the DVR recorders.
-    m_gst_pipeline = gst_pipeline_new("frame-shm");
+    // No video elements: the pipeline is there for the DVR recorders and, with
+    // audio, for the audio ring's packets. Those enter an rtp_tee as on the RTP
+    // path, so the playback branch and the recorders' audio tap are unchanged.
+    const bool audio = m_audio_enabled && !m_frame_shm_audio.empty();
+    if (m_audio_enabled && !audio)
+        spdlog::warn("[RING] --audio without --frame-shm-audio: no audio");
+    m_audio_active = audio && audio_stack_available(pipeline::resolve_alsa_device(m_audio_device));
+    g_audio_pt.store(audio ? m_audio_pt : -1, std::memory_order_relaxed);
+    if (audio) {
+        std::stringstream ss;
+        ss << "appsrc name=ring_audio_src is-live=true do-timestamp=true format=time ! "
+              "tee name=rtp_tee allow-not-linked=true";
+        if (m_audio_active)
+            ss << pipeline::create_audio_branch(m_audio_pt, m_audio_device);
+        GError* error = nullptr;
+        m_gst_pipeline = gst_parse_launch(ss.str().c_str(), &error);
+        if (error) {
+            spdlog::error("[RING] audio pipeline: {}", error->message);
+            g_error_free(error);
+            if (m_gst_pipeline) gst_object_unref(m_gst_pipeline);
+            m_gst_pipeline = nullptr;
+        }
+    }
+    if (m_gst_pipeline) {
+        m_ring_audio_src = gst_bin_get_by_name(GST_BIN(m_gst_pipeline), "ring_audio_src");
+        GstCaps* caps = gst_caps_new_simple("application/x-rtp", "media", G_TYPE_STRING, "audio",
+                                            "clock-rate", G_TYPE_INT, 48000, "encoding-name", G_TYPE_STRING,
+                                            "OPUS", "payload", G_TYPE_INT, m_audio_pt, NULL);
+        g_object_set(m_ring_audio_src, "caps", caps, "max-bytes", (guint64)(64 * 1024), "block", FALSE, NULL);
+        gst_caps_unref(caps);
+        if (m_audio_active) {
+            attach_pt_filter(m_gst_pipeline, "audio_depay", static_cast<uint8_t>(m_audio_pt), false);
+            if (GstElement* vol = gst_bin_get_by_name(GST_BIN(m_gst_pipeline), "audio_volume")) {
+                g_object_set(vol, "volume", static_cast<gdouble>(m_audio_volume), NULL);
+                gst_object_unref(vol);
+            }
+        }
+        spdlog::info("[AUDIO] Opus audio from frame-shm ring '{}' ({})", m_frame_shm_audio,
+                     m_audio_active ? "playing" : "output unavailable: for recordings only");
+    } else {
+        m_audio_active = false;
+        g_audio_pt.store(-1, std::memory_order_relaxed);
+        m_gst_pipeline = gst_pipeline_new("frame-shm");
+    }
     gst_element_set_state(m_gst_pipeline, GST_STATE_PLAYING);
     set_last_hop_ip("127.0.0.1"); // rx's keyframe relay
     g_codec_auto.store(false, std::memory_order_relaxed);
@@ -1711,6 +1798,8 @@ void GstRtpReceiver::start_frame_shm() {
     m_pull_samples_thread = std::make_unique<std::thread>(&GstRtpReceiver::loop_read_frame_shm, this);
     m_dvr_thread = std::make_unique<std::thread>(&GstRtpReceiver::loop_dvr_frame_shm, this);
     m_ring_feed_thread = std::make_unique<std::thread>(&GstRtpReceiver::loop_feed_frame_shm, this);
+    if (m_ring_audio_src)
+        m_ring_audio_thread = std::make_unique<std::thread>(&GstRtpReceiver::loop_read_frame_shm_audio, this);
 }
 
 void GstRtpReceiver::handle_bus_messages()
@@ -1881,6 +1970,14 @@ void GstRtpReceiver::stop_receiving() {
     if (m_dvr_thread) {
         m_dvr_thread->join();
         m_dvr_thread = nullptr;
+    }
+    if (m_ring_audio_thread) {
+        m_ring_audio_thread->join();
+        m_ring_audio_thread = nullptr;
+    }
+    if (m_ring_audio_src) {
+        gst_object_unref(m_ring_audio_src);
+        m_ring_audio_src = nullptr;
     }
     if (m_ring_feed_thread) {
         {
