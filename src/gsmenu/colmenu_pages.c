@@ -476,7 +476,9 @@ static void run_reboot_gs (void * c) { (void)c; colmenu_exec("gsmenu.sh button g
 static void run_action(void * ctx)   { colmenu_exec((const char *)ctx); }
 
 /* ── Drone → Actions → OTA update (Artosyn air units) ─────────────────────────
- * Lists the air-unit update images in the SD card's root and hands the chosen
+ * Lists the air-unit update images in the SD card's root -- *.img, and *.bin
+ * for the SinYine F1 TX's (SinYine_F1_TX_*.bin, the P1 board's image under the
+ * name SinYine's goggles take; the header decides) -- and hands the chosen
  * one to `air-ota` (sbc-gs ar8030-transport-rx), which runs the matching tool
  * (p1-ota for the BetaFPV P1, ascent-ota for the Caddx Ascent) over the link.
  * The run shows in the scripts' output window and cannot be closed while it
@@ -529,7 +531,8 @@ static void build_air_ota(colmenu_emit_t * e)
         struct dirent * de;
         while((de = readdir(d)) && n < (int)(sizeof(names) / sizeof(names[0]))) {
             size_t l = strlen(de->d_name);
-            if(de->d_name[0] == '.' || l < 5 || strcasecmp(de->d_name + l - 4, ".img") != 0)
+            if(de->d_name[0] == '.' || l < 5 ||
+               (strcasecmp(de->d_name + l - 4, ".img") != 0 && strcasecmp(de->d_name + l - 4, ".bin") != 0))
                 continue;
             char path[512];
             struct stat st;
