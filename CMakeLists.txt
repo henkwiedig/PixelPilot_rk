@@ -146,6 +146,8 @@ set(LIB_SOURCE_FILES
         src/scheduling_helper.hpp
         src/gstrtpreceiver.cpp
         src/gstrtpreceiver.h
+        src/ring_restream.cpp
+        src/ring_restream.h
         src/timing_sei.h
         src/timing_sei.c
         third_party/waybeam_frame_ring/venc_frame_ring.h

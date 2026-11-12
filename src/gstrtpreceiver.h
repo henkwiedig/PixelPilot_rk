@@ -22,6 +22,8 @@
 #include <deque>
 #include <condition_variable>
 
+#include "ring_restream.h"
+
 #define MAX_PACKET_SIZE 4096
 #define RTP_HEADER_LEN 12
 
@@ -198,6 +200,8 @@ private:
     std::string m_frame_shm_audio; // --frame-shm-audio ring name
     std::unique_ptr<std::thread> m_ring_audio_thread;
     GstElement* m_ring_audio_src = nullptr; // the audio ring's appsrc in front of rtp_tee
+    // Restream in frame-shm mode (no rtp_tee to tap): RTP packed from the ring.
+    std::unique_ptr<RingRestream> m_ring_restream;
     bool m_ring_params_seen = false; // the decoder has had VPS/SPS since the (re)attach
     std::atomic<bool> m_nal_active{false};
     // Serializes switch_to_stream() so a menu audio-toggle and an automatic

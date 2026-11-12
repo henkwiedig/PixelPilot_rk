@@ -250,6 +250,8 @@ namespace {
     static std::string g_restream_target_ip;
     static std::string g_restream_manual_ip; // user's active selection; empty = auto-discover
     static std::string g_restream_pinned_ip;  // always shown in dropdown, set from config
+    // frame-shm mode's restream output instead of the valve + udpsink.
+    static RingRestream* g_ring_restream = nullptr;
 
     static std::mutex g_last_hop_mutex;
     static std::string g_last_hop_ip;
@@ -320,10 +322,18 @@ namespace {
     }
 
     static void set_restream_valve_locked(bool enabled) {
+        if (g_ring_restream) {
+            g_ring_restream->set_target(enabled ? g_restream_target_ip : std::string());
+        }
         if (!g_restream_valve) {
             return;
         }
         g_object_set(G_OBJECT(g_restream_valve), "drop", enabled ? FALSE : TRUE, NULL);
+    }
+
+    // Either output is there to stream with.
+    static bool restream_output_bound_locked() {
+        return (g_restream_valve && g_restream_sink) || g_ring_restream;
     }
 
     static void update_restream_valve(bool enabled) {
@@ -337,8 +347,13 @@ namespace {
 
     static void clear_restream_valve() {
         std::lock_guard<std::mutex> lock(g_restream_mutex);
+        if (g_ring_restream) {
+            g_ring_restream->set_target(std::string());
+            g_ring_restream = nullptr;
+        }
         if (!g_restream_valve) {
             if (!g_restream_sink) {
+                g_restream_target_ip.clear();
                 return;
             }
         }
@@ -378,6 +393,17 @@ namespace {
             set_restream_valve_locked(false);
         }
 
+        maybe_update_restream_target(true);
+    }
+
+    // frame-shm mode: the restream goes out through rr (until clear_restream_valve()).
+    static void bind_ring_restream(RingRestream* rr) {
+        clear_restream_valve();
+        {
+            std::lock_guard<std::mutex> lock(g_restream_mutex);
+            g_ring_restream = rr;
+            g_restream_target_ip.clear();
+        }
         maybe_update_restream_target(true);
     }
 
@@ -425,7 +451,7 @@ namespace {
         bool new_target = false;
         {
             std::lock_guard<std::mutex> lock(g_restream_mutex);
-            if (!g_restream_valve || !g_restream_sink) {
+            if (!restream_output_bound_locked()) {
                 return;
             }
             if (!g_restream_enabled.load(std::memory_order_relaxed)) {
@@ -448,7 +474,8 @@ namespace {
 
             if (next_ip != g_restream_target_ip) {
                 g_restream_target_ip = next_ip;
-                g_object_set(G_OBJECT(g_restream_sink), "host", g_restream_target_ip.c_str(), NULL);
+                if (g_restream_sink)
+                    g_object_set(G_OBJECT(g_restream_sink), "host", g_restream_target_ip.c_str(), NULL);
                 spdlog::info("[RESTREAM] Streaming to {}:{}",
                              g_restream_target_ip,
                              5600);
@@ -1553,6 +1580,8 @@ void GstRtpReceiver::on_frame_shm_entry(const uint8_t* slot, uint32_t len, std::
             on_new_sample(std::make_shared<std::vector<uint8_t>>(data + nals[i].first,
                                                                  data + nals[i].first + nals[i].second));
         }
+        if (m_ring_params_seen && m_ring_restream && m_ring_restream->active())
+            m_ring_restream->push_video(std::make_shared<const std::vector<uint8_t>>(data, data + n), m.pts, !partial);
         if (m_dvr_active.load(std::memory_order_relaxed) && m_ring_params_seen) { // raw DVR: whole AUs
             au.insert(au.end(), data, data + n);
             if (!partial) {
@@ -1586,6 +1615,8 @@ void GstRtpReceiver::on_frame_shm_entry(const uint8_t* slot, uint32_t len, std::
             t_last_buffer_au_end = true;
             on_new_sample(sample);
             dvr_push_raw(sample);
+            if (m_ring_restream)
+                m_ring_restream->push_video(sample, m.pts, true);
         }
         au.clear();
     }
@@ -1697,7 +1728,8 @@ void GstRtpReceiver::loop_read_frame_shm() {
 }
 
 // The air unit's audio (rx -A): each RTP/Opus packet into the appsrc in front
-// of rtp_tee. No hurry: the audio ring holds ~1.3 s.
+// of rtp_tee, and to the restream. No hurry: the audio ring holds ~1.3 s.
+// Read with the audio off here too, so a restream client still gets it.
 void GstRtpReceiver::loop_read_frame_shm_audio() {
     pthread_setname_np(pthread_self(), "frame-shm-audio");
     FrameShmAttach r(m_frame_shm_audio);
@@ -1720,6 +1752,10 @@ void GstRtpReceiver::loop_read_frame_shm_audio() {
             continue;
         const uint32_t n = len - VENC_FRAME_META_SIZE;
         g_last_audio_pkt_ms.store(now_ms(), std::memory_order_relaxed);
+        if (m_ring_restream)
+            m_ring_restream->push_audio(slot.data() + VENC_FRAME_META_SIZE, n);
+        if (!m_ring_audio_src)
+            continue; // audio off here: only for the restream
         GstBuffer* buf = gst_buffer_new_allocate(nullptr, n, nullptr);
         gst_buffer_fill(buf, 0, slot.data() + VENC_FRAME_META_SIZE, n);
         gst_app_src_push_buffer(GST_APP_SRC(m_ring_audio_src), buf); // takes the buffer
@@ -1735,6 +1771,7 @@ void GstRtpReceiver::loop_dvr_frame_shm() {
     while (m_pull_samples_run) {
         dvr_tick();
         handle_bus_messages();
+        maybe_update_restream_target(false); // once a second: the client list
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 }
@@ -1794,11 +1831,14 @@ void GstRtpReceiver::start_frame_shm() {
     g_codec_auto.store(false, std::memory_order_relaxed);
     note_pipeline_codec(m_video_codec);
     spdlog::info("[RING] live video from frame-shm ring '{}' (no RTP)", m_frame_shm);
+    m_ring_restream = std::make_unique<RingRestream>();
+    m_ring_restream->start();
+    bind_ring_restream(m_ring_restream.get());
     m_pull_samples_run = true;
     m_pull_samples_thread = std::make_unique<std::thread>(&GstRtpReceiver::loop_read_frame_shm, this);
     m_dvr_thread = std::make_unique<std::thread>(&GstRtpReceiver::loop_dvr_frame_shm, this);
     m_ring_feed_thread = std::make_unique<std::thread>(&GstRtpReceiver::loop_feed_frame_shm, this);
-    if (m_ring_audio_src)
+    if (!m_frame_shm_audio.empty())
         m_ring_audio_thread = std::make_unique<std::thread>(&GstRtpReceiver::loop_read_frame_shm_audio, this);
 }
 
@@ -1988,6 +2028,11 @@ void GstRtpReceiver::stop_receiving() {
         m_ring_q_cv.notify_all();
         m_ring_feed_thread->join();
         m_ring_feed_thread = nullptr;
+    }
+    if (m_ring_restream) {
+        clear_restream_valve(); // the menu must not reach it any more
+        m_ring_restream->stop();
+        m_ring_restream = nullptr;
     }
     
     if (m_read_socket_thread) {
