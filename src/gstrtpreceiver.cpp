@@ -35,6 +35,7 @@
 #include <pthread.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <sched.h>
 extern "C" {
 #include "venc_frame_ring.h"
 }
@@ -1412,6 +1413,10 @@ void GstRtpReceiver::loop_pull_samples()
  * goes through GStreamer; an empty pipeline stays only for the DVR recorders
  * to attach to. */
 
+// Between the ring reader and the decoder's feed: what the RTP path's socket
+// buffer (udpsrc buffer-size) held, ~0.75 s at 22 Mbit/s.
+static constexpr size_t kRingQueueBytes = 2 * 1024 * 1024;
+
 // Start offsets and lengths of the NAL units in data[0..n), each with its
 // start code (a 00 in front of 00 00 01 counts as part of it).
 static void split_annexb(const uint8_t* d, uint32_t n, std::vector<std::pair<uint32_t, uint32_t>>& out) {
@@ -1465,11 +1470,8 @@ void GstRtpReceiver::on_frame_shm_entry(const uint8_t* slot, uint32_t len, std::
     const uint32_t n = len - VENC_FRAME_META_SIZE;
     const bool partial = (m.flags & VENC_FRAME_FLAG_PARTIAL) != 0;
 
-    on_incoming_stream_buffer(nullptr, "frame-shm");
-    if (m.flags & VENC_FRAME_FLAG_DISCONT) {
+    if (m.flags & VENC_FRAME_FLAG_DISCONT)
         au.clear(); // a picture cut short in front of this one is of no use
-        maybe_request_idr_for_discont();
-    }
     if (skip) { // attached mid access unit: from the next one on
         if (!partial)
             skip = false;
@@ -1529,16 +1531,89 @@ void GstRtpReceiver::on_frame_shm_entry(const uint8_t* slot, uint32_t len, std::
     }
 }
 
+// Ring reader side of an entry: stream presence and the keyframe request for
+// a DISCONT here, where they reflect what rx publishes, then the queue to the
+// feed thread. A full queue drops the entry (the next one then says DISCONT).
+void GstRtpReceiver::queue_frame_shm_entry(const uint8_t* slot, uint32_t len) {
+    if (len < VENC_FRAME_META_SIZE)
+        return;
+    VencFrameMeta m;
+    memcpy(&m, slot, VENC_FRAME_META_SIZE);
+    if (m.codec != VENC_FRAME_CODEC_H265)
+        return;
+    on_incoming_stream_buffer(nullptr, "frame-shm");
+    bool dropped = false, discont = (m.flags & VENC_FRAME_FLAG_DISCONT) != 0;
+    uint64_t total_dropped = 0;
+    {
+        std::lock_guard<std::mutex> lk(m_ring_q_mtx);
+        if (m_ring_q_bytes + len > kRingQueueBytes) {
+            m_ring_q_lost = true;
+            m_ring_q_dropped++;
+            total_dropped = m_ring_q_dropped;
+            dropped = true;
+        } else {
+            m_ring_q.emplace_back(slot, slot + len);
+            if (m_ring_q_lost) {
+                VencFrameMeta* qm = reinterpret_cast<VencFrameMeta*>(m_ring_q.back().data());
+                qm->flags |= VENC_FRAME_FLAG_DISCONT;
+                m_ring_q_lost = false;
+                discont = true;
+            }
+            m_ring_q_bytes += len;
+        }
+    }
+    if (dropped) {
+        if (total_dropped == 1 || total_dropped % 100 == 0)
+            spdlog::warn("[RING] decoder behind by {} KB: entry dropped ({} so far)", kRingQueueBytes / 1024,
+                         total_dropped);
+        return;
+    }
+    m_ring_q_cv.notify_one();
+    if (discont)
+        maybe_request_idr_for_discont();
+}
+
+// The feed side: the decoder (and the raw DVR's appsrc) from the queue.
+void GstRtpReceiver::loop_feed_frame_shm() {
+    pthread_setname_np(pthread_self(), "frame-shm-feed");
+    std::vector<uint8_t> au;
+    bool skip = true;
+    for (;;) {
+        std::vector<uint8_t> e;
+        {
+            std::unique_lock<std::mutex> lk(m_ring_q_mtx);
+            m_ring_q_cv.wait(lk, [this] { return !m_ring_q.empty() || !m_pull_samples_run; });
+            if (m_ring_q.empty())
+                break; // stopping
+            e = std::move(m_ring_q.front());
+            m_ring_q.pop_front();
+            m_ring_q_bytes -= e.size();
+        }
+        if (e.empty()) { // (re)attached: from the next access unit with an SPS on
+            au.clear();
+            skip = true;
+            m_ring_params_seen = false;
+            continue;
+        }
+        on_frame_shm_entry(e.data(), (uint32_t)e.size(), au, skip);
+    }
+}
+
 void GstRtpReceiver::loop_read_frame_shm() {
     pthread_setname_np(pthread_self(), "frame-shm");
+    {
+        // It only copies, but it must keep up with rx: 8 entries are ~4 frames.
+        struct sched_param sp = {};
+        sp.sched_priority = 30;
+        if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0)
+            spdlog::warn("[RING] cannot make the ring reader SCHED_FIFO");
+    }
     const std::string name = m_frame_shm;
     const std::string path = "/dev/shm/" + (name[0] == '/' ? name.substr(1) : name);
     venc_frame_ring_t* ring = nullptr;
     dev_t ring_dev = 0;
     ino_t ring_ino = 0;
     std::vector<uint8_t> slot;
-    std::vector<uint8_t> au;
-    bool skip = true;
     bool waiting_logged = false;
 
     while (m_pull_samples_run) {
@@ -1558,9 +1633,16 @@ void GstRtpReceiver::loop_read_frame_shm() {
                 __atomic_store_n(&ring->hdr->read_idx,
                                  __atomic_load_n(&ring->hdr->write_idx, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
                 slot.resize(ring->slot_data_size);
-                au.clear();
-                skip = true;
-                m_ring_params_seen = false;
+                {
+                    // The feed thread starts over: the queued entries are the
+                    // old ring's, an empty one resets its state.
+                    std::lock_guard<std::mutex> lk(m_ring_q_mtx);
+                    m_ring_q.clear();
+                    m_ring_q_bytes = 0;
+                    m_ring_q_lost = false;
+                    m_ring_q.emplace_back();
+                }
+                m_ring_q_cv.notify_one();
                 waiting_logged = false;
                 spdlog::info("[RING] attached to frame-shm ring '{}' ({} slots x {} bytes)", name,
                              ring->hdr->slot_count, ring->slot_data_size);
@@ -1575,7 +1657,7 @@ void GstRtpReceiver::loop_read_frame_shm() {
         if (ring) {
             uint32_t len = 0;
             if (venc_frame_ring_read_wait(ring, slot.data(), (uint32_t)slot.size(), &len, 100) == 0) {
-                on_frame_shm_entry(slot.data(), len, au, skip);
+                queue_frame_shm_entry(slot.data(), len);
             } else {
                 // Nothing for 100 ms: is it still rx's current ring? A
                 // restarted rx makes a new one under the same name.
@@ -1628,6 +1710,7 @@ void GstRtpReceiver::start_frame_shm() {
     m_pull_samples_run = true;
     m_pull_samples_thread = std::make_unique<std::thread>(&GstRtpReceiver::loop_read_frame_shm, this);
     m_dvr_thread = std::make_unique<std::thread>(&GstRtpReceiver::loop_dvr_frame_shm, this);
+    m_ring_feed_thread = std::make_unique<std::thread>(&GstRtpReceiver::loop_feed_frame_shm, this);
 }
 
 void GstRtpReceiver::handle_bus_messages()
@@ -1798,6 +1881,16 @@ void GstRtpReceiver::stop_receiving() {
     if (m_dvr_thread) {
         m_dvr_thread->join();
         m_dvr_thread = nullptr;
+    }
+    if (m_ring_feed_thread) {
+        {
+            std::lock_guard<std::mutex> lk(m_ring_q_mtx);
+            m_ring_q.clear();
+            m_ring_q_bytes = 0;
+        }
+        m_ring_q_cv.notify_all();
+        m_ring_feed_thread->join();
+        m_ring_feed_thread = nullptr;
     }
     
     if (m_read_socket_thread) {

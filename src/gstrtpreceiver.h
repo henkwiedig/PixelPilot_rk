@@ -19,6 +19,8 @@
 #include <mutex>
 #include <atomic>
 #include <string>
+#include <deque>
+#include <condition_variable>
 
 #define MAX_PACKET_SIZE 4096
 #define RTP_HEADER_LEN 12
@@ -155,8 +157,10 @@ private:
     void start_frame_shm();
     void loop_read_frame_shm();
     void loop_dvr_frame_shm();
+    void loop_feed_frame_shm();
     void on_frame_shm_entry(const uint8_t* slot, uint32_t len, std::vector<uint8_t>& au, bool& skip);
     void dvr_push_raw(const std::shared_ptr<std::vector<uint8_t>>& au);
+    void queue_frame_shm_entry(const uint8_t* slot, uint32_t len);
     void on_new_sample(std::shared_ptr<std::vector<uint8_t>> sample);
     // Drain the pipeline bus (on the pull thread) so error/warning spam from a
     // failing sink can't accumulate unbounded, and fall back to video-only if the
@@ -230,6 +234,16 @@ private:
     GstElement* m_dvr_raw_appsrc = nullptr; // frame-shm: the raw recorder's input
     std::mutex m_dvr_raw_src_mutex;         // guards it: pushed from the ring thread
     std::unique_ptr<std::thread> m_dvr_thread; // frame-shm: DVR start/stop, bus; never the ring thread
+    // frame-shm: the ring reader hands entries to the decoder's feed thread
+    // through this queue, so a decoder that stops taking input for a moment
+    // (the re-encoding DVR next to it) does not stop the reading of the ring.
+    std::unique_ptr<std::thread> m_ring_feed_thread;
+    std::mutex m_ring_q_mtx;
+    std::condition_variable m_ring_q_cv;
+    std::deque<std::vector<uint8_t>> m_ring_q; // whole entries, meta included; empty = reset
+    size_t m_ring_q_bytes = 0;
+    bool m_ring_q_lost = false;                // entries dropped: DISCONT on the next one
+    uint64_t m_ring_q_dropped = 0;
     GstPad* m_dvr_tee_audio_pad = nullptr;
 
     // Re-encode recorder (appsrc video + Opus). Same pull-thread-driven lifecycle
