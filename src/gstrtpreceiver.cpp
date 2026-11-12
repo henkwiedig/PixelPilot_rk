@@ -34,6 +34,10 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <errno.h>
+#include <sys/stat.h>
+extern "C" {
+#include "venc_frame_ring.h"
+}
 #if defined(__linux__)
 #include <sys/random.h>
 #endif
@@ -535,6 +539,13 @@ namespace {
         return g_last_hop_ip;
     }
 
+    // Where the keyframe requests go when no packet says (the frame-shm ring:
+    // rx's relay is on this host).
+    static void set_last_hop_ip(const char* ip) {
+        std::lock_guard<std::mutex> lock(g_last_hop_mutex);
+        g_last_hop_ip = ip;
+    }
+
     static bool extract_rtp_sequence(GstBuffer* buf, uint16_t* out_seq) {
         if (!buf || !out_seq) {
             return false;
@@ -573,6 +584,22 @@ namespace {
 
         g_last_rtp_gap_idr_ms.store(now, std::memory_order_relaxed);
         spdlog::info("[IDR] RTP gap detected (missing {} packet(s)) -> request IDR", gap_count);
+        request_idr_bursts("rtp-gap", 1, false);
+    }
+
+    // The frame-shm ring's counterpart of an RTP gap: rx marked an entry
+    // DISCONT (frames or parts missing in front of it). Same cooldown.
+    static void maybe_request_idr_for_discont() {
+        if (!g_idr_enabled.load(std::memory_order_relaxed) || !g_stream_up.load(std::memory_order_relaxed)) {
+            return;
+        }
+        const uint64_t now = now_ms();
+        const uint64_t last = g_last_rtp_gap_idr_ms.load(std::memory_order_relaxed);
+        if (last && (now - last) < kRtpGapCooldownMs) {
+            return;
+        }
+        g_last_rtp_gap_idr_ms.store(now, std::memory_order_relaxed);
+        spdlog::info("[IDR] frame-shm: frames missing (DISCONT) -> request IDR");
         request_idr_bursts("rtp-gap", 1, false);
     }
 
@@ -884,7 +911,8 @@ namespace {
         }
 
         g_last_pkt_ms.store(now_ms(), std::memory_order_relaxed);
-        maybe_update_last_hop_from_buffer(buf);
+        if (buf) // a frame-shm entry has no sender address
+            maybe_update_last_hop_from_buffer(buf);
 
         if (!g_stream_up.exchange(true)) {
             g_stream_up_ms.store(now_ms(), std::memory_order_relaxed);
@@ -1377,6 +1405,195 @@ void GstRtpReceiver::loop_pull_samples()
                               [this]{ this->dvr_tick(); this->handle_bus_messages(); });
 }
 
+/* ── frame-shm ring (--frame-shm) ─────────────────────────────────────────
+ * ar8030-transport-rx -R publishes each frame it reassembled as one ring
+ * entry, or a frame it streams slice by slice as PARTIAL entries plus a last
+ * one without the flag (its docs/ground-frame-ring.md). The video then never
+ * goes through GStreamer; an empty pipeline stays only for the DVR recorders
+ * to attach to. */
+
+// Start offsets and lengths of the NAL units in data[0..n), each with its
+// start code (a 00 in front of 00 00 01 counts as part of it).
+static void split_annexb(const uint8_t* d, uint32_t n, std::vector<std::pair<uint32_t, uint32_t>>& out) {
+    out.clear();
+    int64_t start = -1;
+    uint32_t i = 0;
+    while (i + 2 < n) {
+        if (d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1) {
+            const uint32_t sc = (i > 0 && d[i - 1] == 0 && (int64_t)(i - 1) > start) ? i - 1 : i;
+            if (start >= 0)
+                out.emplace_back((uint32_t)start, sc - (uint32_t)start);
+            start = sc;
+            i += 3;
+        } else {
+            i++;
+        }
+    }
+    if (start >= 0)
+        out.emplace_back((uint32_t)start, n - (uint32_t)start);
+}
+
+// The H.265 NAL unit type of the NAL at d (start code included).
+static int h265_nal_type(const uint8_t* d, uint32_t len) {
+    const uint32_t sc = (len >= 3 && d[2] == 1) ? 3 : 4;
+    return len > sc ? (d[sc] >> 1) & 0x3f : -1;
+}
+
+void GstRtpReceiver::on_frame_shm_entry(const uint8_t* slot, uint32_t len, std::vector<uint8_t>& au, bool& skip) {
+    if (len < VENC_FRAME_META_SIZE)
+        return;
+    VencFrameMeta m;
+    memcpy(&m, slot, VENC_FRAME_META_SIZE);
+    if (m.codec != VENC_FRAME_CODEC_H265)
+        return;
+    const uint8_t* data = slot + VENC_FRAME_META_SIZE;
+    const uint32_t n = len - VENC_FRAME_META_SIZE;
+    const bool partial = (m.flags & VENC_FRAME_FLAG_PARTIAL) != 0;
+
+    on_incoming_stream_buffer(nullptr, "frame-shm");
+    if (m.flags & VENC_FRAME_FLAG_DISCONT) {
+        au.clear(); // a picture cut short in front of this one is of no use
+        maybe_request_idr_for_discont();
+    }
+    if (skip) { // attached mid access unit: from the next one on
+        if (!partial)
+            skip = false;
+        return;
+    }
+
+    if (m_nal_active.load(std::memory_order_relaxed)) {
+        // Slice mode: one NAL per callback, the access unit's end on its last.
+        std::vector<std::pair<uint32_t, uint32_t>> nals;
+        split_annexb(data, n, nals);
+        for (size_t i = 0; i < nals.size(); i++) {
+            if (!m_ring_params_seen) { // from the parameter sets on, see below
+                const int t = h265_nal_type(data + nals[i].first, nals[i].second);
+                if (t != 32 && t != 33)
+                    continue;
+                m_ring_params_seen = true;
+            }
+            t_last_buffer_au_end = !partial && i + 1 == nals.size();
+            on_new_sample(std::make_shared<std::vector<uint8_t>>(data + nals[i].first,
+                                                                 data + nals[i].first + nals[i].second));
+        }
+        return;
+    }
+
+    au.insert(au.end(), data, data + n);
+    if (!partial) {
+        // Nothing before an access unit with an SPS: on the RTP path
+        // h265parse holds everything back until it has seen the parameter
+        // sets, and the wave5 decoder fed GDR pictures without them first
+        // never started (its input queue filled up, "Cannot feed decoder").
+        if (!m_ring_params_seen) {
+            std::vector<std::pair<uint32_t, uint32_t>> nals;
+            split_annexb(au.data(), (uint32_t)au.size(), nals);
+            for (const auto& nl : nals)
+                if (h265_nal_type(au.data() + nl.first, nl.second) == 33)
+                    m_ring_params_seen = true;
+            if (!m_ring_params_seen) {
+                au.clear();
+                return;
+            }
+            spdlog::info("[RING] parameter sets seen, feeding the decoder");
+        }
+        if (!au.empty()) {
+            t_last_buffer_au_end = true;
+            on_new_sample(std::make_shared<std::vector<uint8_t>>(std::move(au)));
+        }
+        au.clear();
+    }
+}
+
+void GstRtpReceiver::loop_read_frame_shm() {
+    pthread_setname_np(pthread_self(), "frame-shm");
+    const std::string name = m_frame_shm;
+    const std::string path = "/dev/shm/" + (name[0] == '/' ? name.substr(1) : name);
+    venc_frame_ring_t* ring = nullptr;
+    dev_t ring_dev = 0;
+    ino_t ring_ino = 0;
+    std::vector<uint8_t> slot;
+    std::vector<uint8_t> au;
+    bool skip = true;
+    bool waiting_logged = false;
+
+    while (m_pull_samples_run) {
+        if (!ring) {
+            ring = venc_frame_ring_attach(name.c_str());
+            if (ring) {
+                struct stat st;
+                if (stat(path.c_str(), &st) == 0) {
+                    ring_dev = st.st_dev;
+                    ring_ino = st.st_ino;
+                } else {
+                    ring_dev = 0; // unknown: the first timeout reattaches
+                    ring_ino = 0;
+                }
+                // Whatever waited in the ring is old: start with what comes
+                // next (the stream-up keyframe request follows).
+                __atomic_store_n(&ring->hdr->read_idx,
+                                 __atomic_load_n(&ring->hdr->write_idx, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+                slot.resize(ring->slot_data_size);
+                au.clear();
+                skip = true;
+                m_ring_params_seen = false;
+                waiting_logged = false;
+                spdlog::info("[RING] attached to frame-shm ring '{}' ({} slots x {} bytes)", name,
+                             ring->hdr->slot_count, ring->slot_data_size);
+            } else {
+                if (!waiting_logged) {
+                    spdlog::info("[RING] waiting for frame-shm ring '{}'", name);
+                    waiting_logged = true;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            }
+        }
+        if (ring) {
+            uint32_t len = 0;
+            if (venc_frame_ring_read_wait(ring, slot.data(), (uint32_t)slot.size(), &len, 100) == 0) {
+                on_frame_shm_entry(slot.data(), len, au, skip);
+            } else {
+                // Nothing for 100 ms: is it still rx's current ring? A
+                // restarted rx makes a new one under the same name.
+                struct stat st;
+                const bool exists = stat(path.c_str(), &st) == 0;
+                if (!exists || st.st_dev != ring_dev || st.st_ino != ring_ino) {
+                    spdlog::info("[RING] frame-shm ring '{}' {}, reattaching", name,
+                                 exists ? "replaced" : "gone");
+                    venc_frame_ring_destroy(ring);
+                    ring = nullptr;
+                }
+            }
+        }
+        tick_stream_presence();
+        dvr_tick();
+        handle_bus_messages();
+    }
+    if (ring)
+        venc_frame_ring_destroy(ring);
+}
+
+void GstRtpReceiver::start_frame_shm() {
+    if (m_video_codec != VideoCodec::H265) {
+        spdlog::warn("[RING] the frame-shm ring carries H.265; decoding H.265");
+        m_video_codec = VideoCodec::H265;
+    }
+    m_nal_active.store(m_nal_mode, std::memory_order_relaxed);
+    m_audio_active = false;
+    g_audio_pt.store(-1, std::memory_order_relaxed);
+    if (m_audio_enabled)
+        spdlog::warn("[RING] no audio with --frame-shm yet");
+    // No video elements: the pipeline is only there for the DVR recorders.
+    m_gst_pipeline = gst_pipeline_new("frame-shm");
+    gst_element_set_state(m_gst_pipeline, GST_STATE_PLAYING);
+    set_last_hop_ip("127.0.0.1"); // rx's keyframe relay
+    g_codec_auto.store(false, std::memory_order_relaxed);
+    note_pipeline_codec(m_video_codec);
+    spdlog::info("[RING] live video from frame-shm ring '{}' (no RTP)", m_frame_shm);
+    m_pull_samples_run = true;
+    m_pull_samples_thread = std::make_unique<std::thread>(&GstRtpReceiver::loop_read_frame_shm, this);
+}
+
 void GstRtpReceiver::handle_bus_messages()
 {
     if (!m_gst_pipeline) return;
@@ -1649,6 +1866,11 @@ void GstRtpReceiver::switch_to_stream() {
     if (m_video_codec == VideoCodec::UNKNOWN) {
         m_video_codec = VideoCodec::H265;
         spdlog::info("[CODEC] Auto mode: defaulting to H.265; mid-stream detection will correct if needed");
+    }
+
+    if (!m_frame_shm.empty()) {
+        start_frame_shm();
+        return;
     }
 
     // Resolve the effective audio state: only build the Opus branch if the user
@@ -2247,7 +2469,12 @@ void GstRtpReceiver::dvr_tick() {
 void GstRtpReceiver::dvr_add_record_bin() {
     if (!m_gst_pipeline) return;
     GstElement* tee = gst_bin_get_by_name(GST_BIN(m_gst_pipeline), "rtp_tee");
-    if (!tee) { spdlog::warn("[DVR] no rtp_tee in pipeline; cannot record"); return; }
+    if (!tee) {
+        // The frame-shm source has no RTP tee (not yet: raw DVR from the ring).
+        spdlog::warn("[DVR] no rtp_tee in pipeline; cannot record raw");
+        m_dvr_want.store(false, std::memory_order_relaxed);
+        return;
+    }
 
     std::string base;
     int64_t max_bytes;
@@ -2464,8 +2691,8 @@ void GstRtpReceiver::dvr_reenc_tick() {
 
 void GstRtpReceiver::dvr_add_reenc_bin() {
     if (!m_gst_pipeline) return;
+    // The tee only feeds the audio track; the frame-shm source has none.
     GstElement* tee = gst_bin_get_by_name(GST_BIN(m_gst_pipeline), "rtp_tee");
-    if (!tee) { spdlog::warn("[DVR/reenc] no rtp_tee; cannot record"); return; }
 
     std::string base;
     int64_t max_bytes;
@@ -2481,14 +2708,14 @@ void GstRtpReceiver::dvr_add_reenc_bin() {
     if (base.empty()) {
         spdlog::error("[DVR/reenc] no output path resolved; recording disabled");
         m_dvr_reenc_want.store(false, std::memory_order_relaxed);
-        gst_object_unref(tee);
+        if (tee) gst_object_unref(tee);
         return;
     }
 
     const bool h265 = (codec == VideoCodec::H265);
     // Only mux audio when Opus is actually flowing — an empty audio track (--audio
     // on but the air sends none) makes the mp4 unplayable.
-    const bool audio = m_audio_active && audio_recently_seen();
+    const bool audio = tee && m_audio_active && audio_recently_seen();
     // Video is pushed in from the encoder thread (do-timestamp => live mux). Audio
     // taps the same tee/Opus as the raw recorder.
     std::stringstream ss;
@@ -2507,7 +2734,7 @@ void GstRtpReceiver::dvr_add_reenc_bin() {
     if (!bin) {
         spdlog::error("[DVR/reenc] failed to build record bin: {}", err ? err->message : "unknown");
         if (err) g_error_free(err);
-        gst_object_unref(tee);
+        if (tee) gst_object_unref(tee);
         m_dvr_reenc_want.store(false, std::memory_order_relaxed);
         return;
     }
@@ -2548,7 +2775,7 @@ void GstRtpReceiver::dvr_add_reenc_bin() {
         if (src) gst_object_unref(src);
         gst_element_set_state(bin, GST_STATE_NULL);
         gst_bin_remove(GST_BIN(m_gst_pipeline), bin);
-        gst_object_unref(tee);
+        if (tee) gst_object_unref(tee);
         m_dvr_reenc_want.store(false, std::memory_order_relaxed);
         return;
     }
@@ -2557,7 +2784,7 @@ void GstRtpReceiver::dvr_add_reenc_bin() {
         gst_pad_link(m_dvr_reenc_tee_audio_pad, ga);
         gst_object_unref(ga);
     }
-    gst_object_unref(tee);
+    if (tee) gst_object_unref(tee);
 
     // Publish the appsrc for the encoder thread's dvr_reenc_push() (transfers ref).
     {

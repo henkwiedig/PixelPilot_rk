@@ -82,6 +82,10 @@ public:
     // starts on it before it is all in. Set before start_receiving(). File
     // playback still hands out access units; nal_aligned() says which.
     void set_nal_mode(bool on) { m_nal_mode = on; }
+    // Live video from a frame-shm ring (ar8030-transport-rx -R <name>) instead
+    // of RTP on the UDP port: whole access units, or in slice mode one NAL per
+    // callback as on the RTP path. Set before start_receiving().
+    void set_frame_shm(const std::string& name) { m_frame_shm = name; }
     bool nal_aligned() const { return m_nal_active.load(std::memory_order_relaxed); }
     // In the callback (on the pull thread): the buffer it was given ends an
     // access unit (it carried the RTP marker). Meaningful in NAL mode only.
@@ -148,6 +152,9 @@ private:
     std::string construct_gstreamer_pipeline();
     std::string construct_file_playback_pipeline(const char * file_path);
     void loop_pull_samples();
+    void start_frame_shm();
+    void loop_read_frame_shm();
+    void on_frame_shm_entry(const uint8_t* slot, uint32_t len, std::vector<uint8_t>& au, bool& skip);
     void on_new_sample(std::shared_ptr<std::vector<uint8_t>> sample);
     // Drain the pipeline bus (on the pull thread) so error/warning spam from a
     // failing sink can't accumulate unbounded, and fall back to video-only if the
@@ -176,6 +183,8 @@ private:
     bool m_file_playback = false;
     // Slice mode (set_nal_mode()), and whether the pipeline up now is built for it.
     bool m_nal_mode = false;
+    std::string m_frame_shm;   // --frame-shm ring name, empty = RTP on the UDP port
+    bool m_ring_params_seen = false; // the decoder has had VPS/SPS since the (re)attach
     std::atomic<bool> m_nal_active{false};
     // Serializes switch_to_stream() so a menu audio-toggle and an automatic
     // codec-switch rebuild can never tear down/rebuild the pipeline at once.

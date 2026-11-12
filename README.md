@@ -323,6 +323,14 @@ after the same capture -> scan-out latency (see `src/vsync_lock.h`). It publishe
 | `video.sync.drops_per_s`     | double | frames never shown (late for their vblank), over the last 10 s             |
 | `video.sync.misses_per_s`    | double | commits that missed their vblank, over the last 10 s                       |
 
+With `--frame-shm <name>` the live video comes from a frame-shm ring that ar8030-transport-rx
+fills (`rx -R <name>`, ar8030-transport `docs/ground-frame-ring.md`) instead of RTP on the UDP
+port: whole access units (or, in slice mode, one NAL per feed) go straight from the ring to the
+decoder, with no GStreamer element in the live path; an empty pipeline remains for the re-encoding
+DVR. Keyframe requests go to rx's relay on 127.0.0.1, a `DISCONT` entry (frames missing in front of
+it) asks for one, and nothing reaches the decoder before an access unit with an SPS. Not yet in
+this mode: the raw DVR, the network restream and audio.
+
 There are many facts based on Mavlink telemetry, see `mavlink.c`. All of them have tags "sysid" and
 "compid", but some have extra tags.
 Currently implemented fact categories are grouped by Mavlink message types:
