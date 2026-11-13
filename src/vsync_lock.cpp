@@ -61,6 +61,18 @@ void VsyncLock::set_spread(double spread_quantile, double max_margin_ms) {
 	             max_margin_ms);
 }
 
+// The target latency falls at most this share of what the trim can move the
+// vblanks against the camera ((kMaxPpm - camera) ppm = us per second), its
+// slope fed forward into the trim, so the vblanks follow it in phase. Falling
+// faster only opened a phase error the loop then chased, the lock "lost" with
+// its integral wound up: at Smoothness 5 the margin (the 2nd latest frame of
+// 10 s) drops 5-10 ms whenever a late burst leaves the window, a lost lock
+// every ~30 s in flight. It rises as before: a later slot at once is what
+// saves the frames when the link gets slower. Offline, replaying a bench dump
+// with flight-like stalls through this loop: 15 -> 1.6 losses per 18 min at
+// Smoothness 5, the same drops and latency, fewer drops after a latency step.
+static const double kTargetFallShare = 0.5;
+
 // Locked once the error stays under kLockMs for kLockTicks ticks, lost when
 // it exceeds kUnlockMs.
 static const double kLockMs = 1.0, kUnlockMs = 3.0;
@@ -409,6 +421,7 @@ void VsyncLock::tick(uint64_t now_us) {
 	}
 
 	double err_ms = 0;
+	double slope_ppm = 0;  // the target latency's own move, fed forward
 	double lat_p50_ms = 0, lat_p99_ms = 0, lat_max_ms = 0;
 	if (ratio) {
 		// The camera's frame period from the capture timestamps: a trimmed
@@ -475,7 +488,17 @@ void VsyncLock::tick(uint64_t now_us) {
 			}
 			update_margin();
 			const double target = median_lat + margin_us_ + guard_us_ + lead_us_;
-			target_lat_us_ = slot_mode_ ? target_lat_us_ + 0.2 * (target - target_lat_us_) : target;
+			if (slot_mode_ && dt_s > 0) {
+				double step = 0.2 * (target - target_lat_us_);
+				const double max_fall_us =
+					kTargetFallShare * (kMaxPpm - (ff_valid_ ? ff_ppm_ : 0.0)) * dt_s;
+				step = std::max(step, -max_fall_us);
+				target_lat_us_ += step;
+				// A later target needs later vblanks: a slower refresh.
+				slope_ppm = -step / dt_s;
+			} else {
+				target_lat_us_ = target;
+			}
 			slot_mode_ = true;
 			wait_ms = (target_lat_us_ - median_lat) / 1000.0;
 
@@ -526,7 +549,7 @@ void VsyncLock::tick(uint64_t now_us) {
 		}
 
 		// Late frames need later vblanks: a slower refresh, negative ppm.
-		const double p = (ff_valid_ ? ff_ppm_ : 0) - kKp * err_ms;
+		const double p = (ff_valid_ ? ff_ppm_ : 0) + slope_ppm - kKp * err_ms;
 		const double integ = integ_ppm_ - kKi * err_ms * dt_s;
 		const double out = p + integ;
 		// No integral wind-up while the output is pinned at the limit.
