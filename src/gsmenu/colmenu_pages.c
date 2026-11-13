@@ -481,15 +481,19 @@ static void run_action(void * ctx)   { colmenu_exec((const char *)ctx); }
  * name SinYine's goggles take; the header decides) -- and hands the chosen
  * one to `air-ota` (sbc-gs ar8030-transport-rx), which runs the matching tool
  * (p1-ota for the BetaFPV P1, ascent-ota for the Caddx Ascent) over the link.
+ * Stock images are listed too (p1-ota warns that the drone is then gone
+ * from this link).
  * The run shows in the scripts' output window and cannot be closed while it
  * flashes. */
 #define OTA_DIR "/media/dvr"
 
 /* An image the OTA tools take, by its header: an Artosyn ARTO image ("OTRA")
  * for NAND (byte 6 = 2) whose product (at 0x80) is a P1 air unit's ("HM" since
- * 2.1, "P1_SKY..." before; BetaFPV's ground images say IGNORE or P1_GND_...),
- * or a Caddx ASW container ("ASW\0"). */
-static bool is_air_image(const char * path)
+ * 2.1, "P1_SKY..." before; BetaFPV's ground images say IGNORE or P1_GND_...)
+ * or SinYine's stock one, Artosyn's reference firmware ("0.17.11-00", the SDK
+ * release -- its VRX image says the same, so that one goes by SinYine's file
+ * name), or a Caddx ASW container ("ASW\0"). */
+static bool is_air_image(const char * path, const char * name)
 {
     unsigned char h[0xc0];
     FILE * f = fopen(path, "rb");
@@ -498,10 +502,13 @@ static bool is_air_image(const char * path)
     fclose(f);
     if(n >= 4 && memcmp(h, "ASW\0", 4) == 0) return true;
     if(n < sizeof(h) || memcmp(h, "OTRA", 4) != 0 || h[6] != 2) return false;
-    char product[0x41];
+    char product[0x41], c;
+    unsigned a, b, d, e;
     memcpy(product, h + 0x80, 0x40);
     product[0x40] = '\0';
-    return strcmp(product, "HM") == 0 || strncmp(product, "P1_SKY", 6) == 0;
+    if(strcmp(product, "HM") == 0 || strncmp(product, "P1_SKY", 6) == 0) return true;
+    return sscanf(product, "%u.%u.%u-%u%c", &a, &b, &d, &e, &c) == 4 &&
+           strncasecmp(name, "SinYine_F1_VR", 13) != 0;
 }
 
 static void run_air_ota(void * ctx)
@@ -537,7 +544,7 @@ static void build_air_ota(colmenu_emit_t * e)
             char path[512];
             struct stat st;
             snprintf(path, sizeof(path), "%s/%s", OTA_DIR, de->d_name);
-            if(stat(path, &st) != 0 || !S_ISREG(st.st_mode) || !is_air_image(path))
+            if(stat(path, &st) != 0 || !S_ISREG(st.st_mode) || !is_air_image(path, de->d_name))
                 continue;
             names[n++] = strdup(de->d_name);
         }
