@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <assert.h>
+#include <ctype.h>
 #include <time.h>
 #include <string.h>
 #include <errno.h>
@@ -194,6 +195,10 @@ bool front_buffer_mode = false;
 // so the frames arrive just before their flip (vsync_lock.h).
 bool vsync_lock_mode = false;
 static unsigned vsync_lock_guard_us = 1000;
+static int vsync_lock_smoothness = VsyncLock::kDefaultSmoothness;
+static double vsync_lock_quantile = 0;       // 0: from the smoothness level
+static double vsync_lock_window_s = 10;
+static double vsync_lock_max_margin_ms = 0;  // 0: from the smoothness level
 static const char *vsync_lock_dump = nullptr;
 static VsyncLock vsync_lock;
 bool disable_gregidr = false;
@@ -1413,6 +1418,16 @@ static void *dvr_shutdown_worker(void *arg) {
     return nullptr;
 }
 
+// C-compatible interface for gsmenu: GS -> System -> Display -> Smoothness.
+extern "C" {
+    int vsync_lock_active(void) { return vsync_lock_mode; }
+    void vsync_lock_set_smoothness(int level) {
+        double quantile, max_margin_ms;
+        VsyncLock::smoothness(level, &quantile, &max_margin_ms);
+        vsync_lock.set_spread(quantile, max_margin_ms);
+    }
+}
+
 // C-compatible interface for gsmenu live control of the DVR.
 extern "C" {
     void dvr_reenc_set_fps(int fps) {
@@ -2388,6 +2403,19 @@ void printHelp() {
     "\n"
     "    --vsync-lock-guard <ms> - How early the late frames should be ready (Default: 1.0)\n"
     "\n"
+    "    --vsync-lock-smoothness <0-5> - How many late frames the latency target waits for:\n"
+    "                             higher = fewer dropped frames, more latency (Default: 4;\n"
+    "                             2 = the old behaviour, ~2.5x the drops for ~4 ms less)\n"
+    "\n"
+    "    --vsync-lock-quantile <q> - Instead of the level's: share of the frames the target\n"
+    "                             waits for, the later ones are dropped (0.9-0.9999)\n"
+    "\n"
+    "    --vsync-lock-window <s> - Over how many seconds of frames that share is taken (2-120,\n"
+    "                             Default: 10); longer also covers rarer late frames\n"
+    "\n"
+    "    --vsync-lock-max-margin <ms> - Instead of the level's: most the target may wait beyond\n"
+    "                             the median frame for the late ones (2-50)\n"
+    "\n"
     "    --vsync-lock-dump <path> - Write every frame's, vblank's and controller tick's timing\n"
     "                             to path (strftime template, e.g. /media/dvr/vsync_%%Y%%m%%d_%%H%%M%%S.txt)\n"
     "\n"
@@ -2692,6 +2720,55 @@ int main(int argc, char **argv)
 		continue;
 	}
 
+	// __ArgValue takes the next argument each time: read it once.
+	__OnArgument("--vsync-lock-smoothness") {
+		const char *v = __ArgValue;
+		const int l = atoi(v);
+		if (l < 0 || l >= VsyncLock::kSmoothnessLevels || !isdigit((unsigned char)v[0])) {
+			fprintf(stderr, "--vsync-lock-smoothness must be 0-%d, not %s\n", VsyncLock::kSmoothnessLevels - 1, v);
+			printHelp();
+			return -1;
+		}
+		vsync_lock_smoothness = l;
+		continue;
+	}
+
+	__OnArgument("--vsync-lock-quantile") {
+		const char *v = __ArgValue;
+		const double q = atof(v);
+		if (q < 0.9 || q > 0.9999) {
+			fprintf(stderr, "--vsync-lock-quantile must be 0.9-0.9999, not %s\n", v);
+			printHelp();
+			return -1;
+		}
+		vsync_lock_quantile = q;
+		continue;
+	}
+
+	__OnArgument("--vsync-lock-window") {
+		const char *v = __ArgValue;
+		const double w = atof(v);
+		if (w < 2 || w > 120) {
+			fprintf(stderr, "--vsync-lock-window must be 2-120 s, not %s\n", v);
+			printHelp();
+			return -1;
+		}
+		vsync_lock_window_s = w;
+		continue;
+	}
+
+	__OnArgument("--vsync-lock-max-margin") {
+		const char *v = __ArgValue;
+		const double m = atof(v);
+		if (m < 2 || m > 50) {
+			fprintf(stderr, "--vsync-lock-max-margin must be 2-50 ms, not %s\n", v);
+			printHelp();
+			return -1;
+		}
+		vsync_lock_max_margin_ms = m;
+		continue;
+	}
+
 	__OnArgument("--disable-gregidr") {
 		disable_gregidr = true;
 		continue;
@@ -2987,8 +3064,14 @@ int main(int argc, char **argv)
 	}
 	if (vsync_lock_mode) {
 		const drmModeModeInfo &m = output_list->mode;
+		double quantile, max_margin_ms;
+		VsyncLock::smoothness(vsync_lock_smoothness, &quantile, &max_margin_ms);
+		if (vsync_lock_quantile > 0)
+			quantile = vsync_lock_quantile;
+		if (vsync_lock_max_margin_ms > 0)
+			max_margin_ms = vsync_lock_max_margin_ms;
 		vsync_lock.init(drm_fd, output_list->crtc_index, (double)m.htotal * m.vtotal * 1000.0 / m.clock,
-		                m.clock, vsync_lock_guard_us);
+		                m.clock, vsync_lock_guard_us, quantile, vsync_lock_window_s, max_margin_ms);
 		signal(SIGTERM, vsync_lock_sigterm);
 		if (vsync_lock_dump)
 			vsync_lock.open_dump(vsync_lock_dump);

@@ -1,9 +1,11 @@
 #ifndef VSYNC_LOCK_H
 #define VSYNC_LOCK_H
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <mutex>
+#include <vector>
 
 // --vsync-lock: paced page flips, and the display phase locked to the video.
 //
@@ -29,8 +31,17 @@
 // The trim is the camera's rate against the display's (feed-forward, from
 // the capture timestamps) plus a PI loop on the phase of the due times (of
 // the median frame, without capture timestamps). The target latency is the
-// median plus the 99th percentile of the deviations from it, over the last
-// ~10 s.
+// median plus a high quantile of the deviations from it (spread_quantile,
+// --vsync-lock-quantile) over the last spread_window_s (--vsync-lock-window),
+// at most max_margin_ms (--vsync-lock-max-margin): the frames later than
+// that come in after their vblank and are dropped. The smoothness levels
+// (--vsync-lock-smoothness, the menu's GS -> System -> Display -> Smoothness)
+// set the quantile and the limit together: 2 = 0.99 / 12 ms drops ~0.6 % on
+// the bench, 4 (default) = 0.998 / 16 ms ~0.25 % for ~4 ms more latency. The
+// late frames that remain are rare outliers, which a short window mostly
+// doesn't hold: 0.9999 over 60 s with a 25 ms cap kept ~1 drop a minute for
+// ~9 ms more, but after a link outage it held the latency up to 19 ms higher
+// for over a minute -- hence the 10 s default window.
 //
 // The capture timestamps come mapped onto this clock by the receiver's
 // clock sync, and that mapping steps whenever the sync moves to another
@@ -43,8 +54,18 @@ class VsyncLock {
 public:
 	// period_us: the display mode's nominal refresh period, clock_khz: its
 	// pixel clock. guard_us: how long before the commit deadline the late
-	// frames should be ready.
-	void init(int drm_fd, uint32_t crtc_index, double period_us, uint32_t clock_khz, unsigned guard_us);
+	// frames should be ready. spread_quantile, spread_window_s,
+	// max_margin_ms: the share of the frames the target latency waits for,
+	// over how long, and its limit (see above).
+	void init(int drm_fd, uint32_t crtc_index, double period_us, uint32_t clock_khz, unsigned guard_us,
+	          double spread_quantile = 0.998, double spread_window_s = 10, double max_margin_ms = 16);
+	// Any thread, any time: a new quantile and margin limit (the menu).
+	void set_spread(double spread_quantile, double max_margin_ms);
+	// Smoothness level -> quantile and margin limit, 0 (least latency, most
+	// drops) .. kSmoothnessLevels - 1; out-of-range levels are clamped.
+	static const int kSmoothnessLevels = 6;
+	static const int kDefaultSmoothness = 4;
+	static void smoothness(int level, double *spread_quantile, double *max_margin_ms);
 	// Back to the nominal refresh rate.
 	void shutdown();
 	// The same from a signal handler: async-signal-safe.
@@ -103,7 +124,6 @@ private:
 		double phase_us;      // since the vblank before it, in [0, period)
 	};
 	static const int kSamples = 256;
-	static const int kDeviations = 600;
 	static const uint64_t kTickUs = 500000;
 	static const uint64_t kWindowUs = 2000000;
 	static const int kRateTicks = 20;  // drops and misses per second over ~10 s
@@ -122,6 +142,9 @@ private:
 	int knob_reset_len_ = 0;
 	double nominal_period_us_ = 0;
 	unsigned guard_us_ = 0;
+	// Read by tick() on the display thread, set from the menu: atomic.
+	std::atomic<double> spread_quantile_{0.998};
+	std::atomic<double> max_margin_us_{16000};
 
 	// Vblank timeline: written by the display thread under mutex_, read
 	// under it by the frame thread.
@@ -150,8 +173,9 @@ private:
 	double largest_step_us_ = 0;
 	uint64_t last_bad_capture_log_us_ = 0;
 
-	// Each frame's phase against its window's median (ring), for the margin.
-	double deviations_[kDeviations];
+	// Each frame's phase against its window's median (ring, spread_window_s
+	// at one frame per refresh), for the margin.
+	std::vector<double> deviations_ = std::vector<double>(600);
 	int deviation_next_ = 0;
 	int deviation_count_ = 0;
 

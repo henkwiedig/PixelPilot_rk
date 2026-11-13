@@ -48,6 +48,10 @@ extern float live_colortrans_offset;
 extern gamma_lut_controller lut_ctrl;
 void dvr_reenc_notify_colortrans(int enabled);
 void drm_set_video_scale(float factor);
+#ifndef USE_SIMULATOR
+int vsync_lock_active(void);                 /* main.cpp */
+void vsync_lock_set_smoothness(int level);   /* main.cpp */
+#endif
 /* DVR backend live setters — mirror the old gs_system.c widget callbacks so a
  * change takes effect immediately (a gsmenu.sh set alone only applies on restart). */
 void dvr_reenc_set_osd(int enabled);
@@ -92,6 +96,29 @@ static void on_video_scale(const char * value)
 #else
     printf("drm_set_video_scale(%.2f);\n", factor);
     fflush(stdout);
+#endif
+}
+
+/* Smoothness: the vsync lock's quantile + margin limit (VsyncLock::smoothness),
+ * applied live as the slider moves; gsmenu.sh keeps the level in
+ * /etc/default/pixelpilot (PIXELPILOT_VSYNC_SMOOTHNESS) for the next start.
+ * Only while the display is locked to the video (--vsync-lock). */
+static void on_smoothness(const char * value)
+{
+    int level = value ? atoi(value) : 4;
+#ifndef USE_SIMULATOR
+    vsync_lock_set_smoothness(level);
+#else
+    printf("vsync_lock_set_smoothness(%d);\n", level);
+    fflush(stdout);
+#endif
+}
+static bool smoothness_available(void)
+{
+#ifndef USE_SIMULATOR
+    return vsync_lock_active() != 0;
+#else
+    return true;
 #endif
 }
 
@@ -657,13 +684,16 @@ static const colmenu_item_t sys_display_items[] = {
     { .kind=COLMENU_SWITCH,   .icon=LV_SYMBOL_SETTINGS, .label="GS Rendering",   .param="gs_rendering" },
     { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Connector",      .param="connector" },
     { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Resolution",     .param="resolution", .on_change=notify_restart },
+    /* 0 = least latency, most dropped frames; 5 = fewest drops, ~5 ms more. */
+    { .kind=COLMENU_SLIDER,   .icon=LV_SYMBOL_SETTINGS, .label="Smoothness",     .param="vsync_smoothness",
+      .on_change=on_smoothness, .on_live=on_smoothness, .available=smoothness_available },
     { .kind=COLMENU_SLIDER,   .icon=LV_SYMBOL_SETTINGS, .label="Video scale factor", .precision=2, .param="video_scale", .on_change=on_video_scale, .on_live=on_video_scale, ROCKCHIP_ONLY },
     { .kind=COLMENU_SWITCH,   .icon=LV_SYMBOL_SETTINGS, .label="Live Colortrans", .param="gs_live_colortrans", .on_change=on_live_colortrans, ROCKCHIP_ONLY },
     /* --front-buffer: RGA copy into the scanned-out buffer, no vblank wait,
      * may tear. The buffer is set up with the decoder, so it needs a restart. */
     { .kind=COLMENU_SWITCH,   .icon=LV_SYMBOL_SETTINGS, .label="Front Buffer",   .param="gs_front_buffer", .on_change=notify_restart, ROCKCHIP_ONLY },
 };
-static const colmenu_page_t sys_display_page = { "Display", "gs", "system", sys_display_items, 6 };
+static const colmenu_page_t sys_display_page = { "Display", "gs", "system", sys_display_items, 7 };
 static const colmenu_item_t sys_dvr_items[] = {
     { .kind=COLMENU_SWITCH,   .label="Enabled",           .param="rec_enabled",          .on_change=on_rec_enabled },
     { .kind=COLMENU_DROPDOWN, .label="Mode",              .param="dvr_mode",             .on_change=on_dvr_mode },

@@ -32,11 +32,34 @@ static const int kMaxPpm = 1000;   // the kernel knob's range
 // per write instead.
 static const int kPclkStepPpm = 400;
 
-// The median frame is held this far ahead of the late ones: the kSpreadQuantile
+// The median frame is held this far ahead of the late ones: spread_quantile_
 // of the deviations from the median, kDefaultMarginUs until there are enough.
-static constexpr double kSpreadQuantile = 0.99;
 static const unsigned kDefaultMarginUs = 6000;
-static const unsigned kMaxMarginUs = 12000;
+
+// Smoothness levels: the quantile and the margin limit go up together. Bench
+// (P1 + VR04, 22 Mbit/s, 10 s window), drops relative to level 2 / wait over
+// the median frame: 0: ~3x / 6.6 ms, 1: 1.6x / 8.1, 2: 1x / 9.5 (0.4 drops/s),
+// 3: 0.6x / 11.2, 4: 0.36x / 13.3 (measured: 0.15 drops/s, +4.3 ms),
+// 5: 0.27x / 14.6. The higher limits matter where the link's tail is longer
+// than the bench's (in flight the margin sat at 12 ms).
+static const struct {
+	double quantile, max_margin_ms;
+} kSmoothness[VsyncLock::kSmoothnessLevels] = {
+	{0.95, 6}, {0.98, 9}, {0.99, 12}, {0.995, 14}, {0.998, 16}, {0.999, 20},
+};
+
+void VsyncLock::smoothness(int level, double *spread_quantile, double *max_margin_ms) {
+	level = std::max(0, std::min(kSmoothnessLevels - 1, level));
+	*spread_quantile = kSmoothness[level].quantile;
+	*max_margin_ms = kSmoothness[level].max_margin_ms;
+}
+
+void VsyncLock::set_spread(double spread_quantile, double max_margin_ms) {
+	spread_quantile_.store(spread_quantile);
+	max_margin_us_.store(max_margin_ms * 1000);
+	spdlog::info("vsync lock: waits for {:.2f} % of the frames, margin up to {:.0f} ms", spread_quantile * 100,
+	             max_margin_ms);
+}
 
 // Locked once the error stays under kLockMs for kLockTicks ticks, lost when
 // it exceeds kUnlockMs.
@@ -72,11 +95,16 @@ static uint64_t monotonic_us() {
 	return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
 
-void VsyncLock::init(int drm_fd, uint32_t crtc_index, double period_us, uint32_t clock_khz, unsigned guard_us) {
+void VsyncLock::init(int drm_fd, uint32_t crtc_index, double period_us, uint32_t clock_khz, unsigned guard_us,
+                     double spread_quantile, double spread_window_s, double max_margin_ms) {
 	drm_fd_ = drm_fd;
 	crtc_index_ = crtc_index;
 	nominal_period_us_ = period_us_ = period_us;
 	guard_us_ = guard_us;
+	spread_quantile_.store(spread_quantile);
+	max_margin_us_.store(max_margin_ms * 1000);
+	deviations_.assign(std::max(120, (int)std::lround(spread_window_s * 1e6 / period_us)), 0.0);
+	deviation_next_ = deviation_count_ = 0;
 
 	// VOP2: debugfs names the DRM device by its minor, the video port by
 	// the CRTC's index (VOP2 registers one CRTC per video port, in order).
@@ -107,7 +135,9 @@ void VsyncLock::init(int drm_fd, uint32_t crtc_index, double period_us, uint32_t
 	knob_reset_len_ = knob_nominal_hz_ ?
 		snprintf(knob_reset_, sizeof(knob_reset_), "%llu\n", (unsigned long long)knob_nominal_hz_) :
 		snprintf(knob_reset_, sizeof(knob_reset_), "0\n");
-	spdlog::info("vsync lock: refresh period {:.3f} us, trimmed through {}", period_us, path);
+	spdlog::info("vsync lock: refresh period {:.3f} us, trimmed through {}, waits for {:.2f} % of the frames "
+	             "(over {} frames, margin up to {:.0f} ms)",
+	             period_us, path, spread_quantile_.load() * 100, deviations_.size(), max_margin_us_.load() / 1000);
 	// A previous run may have left a trim behind.
 	write_knob(0);
 }
@@ -309,13 +339,13 @@ bool VsyncLock::wait_vblank() {
 	return true;
 }
 
-// The late frames' margin over the median: kSpreadQuantile of the
+// The late frames' margin over the median: spread_quantile_ of the
 // deviations, smoothed.
 void VsyncLock::update_margin() {
 	double margin = kDefaultMarginUs;
 	if (deviation_count_ >= 120) {
-		std::vector<double> dev(deviations_, deviations_ + deviation_count_);
-		margin = std::max(0.0, std::min((double)kMaxMarginUs, quantile(dev, kSpreadQuantile)));
+		std::vector<double> dev(deviations_.begin(), deviations_.begin() + deviation_count_);
+		margin = std::max(0.0, std::min(max_margin_us_.load(), quantile(dev, spread_quantile_.load())));
 	}
 	margin_us_ = margin_us_ ? margin_us_ + 0.2 * (margin - margin_us_) : margin;
 }
@@ -439,8 +469,8 @@ void VsyncLock::tick(uint64_t now_us) {
 				if (x.t_us <= prev_tick_us || !x.capture_us)
 					continue;
 				deviations_[deviation_next_] = (double)(int64_t)(x.t_us - x.capture_us) - median_lat;
-				deviation_next_ = (deviation_next_ + 1) % kDeviations;
-				if (deviation_count_ < kDeviations)
+				deviation_next_ = (deviation_next_ + 1) % (int)deviations_.size();
+				if (deviation_count_ < (int)deviations_.size())
 					deviation_count_++;
 			}
 			update_margin();
@@ -485,8 +515,8 @@ void VsyncLock::tick(uint64_t now_us) {
 				if (win[i].t_us <= prev_tick_us)
 					continue;
 				deviations_[deviation_next_] = u[i] - median;
-				deviation_next_ = (deviation_next_ + 1) % kDeviations;
-				if (deviation_count_ < kDeviations)
+				deviation_next_ = (deviation_next_ + 1) % (int)deviations_.size();
+				if (deviation_count_ < (int)deviations_.size())
 					deviation_count_++;
 			}
 			update_margin();
