@@ -2389,7 +2389,7 @@ void printHelp() {
     "    --vsync-lock-guard <ms> - How early the late frames should be ready (Default: 1.0)\n"
     "\n"
     "    --vsync-lock-dump <path> - Write every frame's, vblank's and controller tick's timing\n"
-    "                             to path (strftime template, e.g. /media/dvr/vsync_%Y%m%d_%H%M%S.txt)\n"
+    "                             to path (strftime template, e.g. /media/dvr/vsync_%%Y%%m%%d_%%H%%M%%S.txt)\n"
     "\n"
     "    --no-slices            - Feed the decoder whole pictures only, even where it could\n"
     "                             start on a picture's first slice (VRX Pro, sliced stream)\n"
