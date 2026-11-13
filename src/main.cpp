@@ -1136,16 +1136,15 @@ static void sleep_until_us(uint64_t t_us) {
 	while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {}
 }
 
-#ifdef PIXELPILOT_V4L2
-// The paced flips commit from this thread: on the AR9311's two busy cores the
-// kernel worker that writes a NONBLOCK commit to the hardware, an ordinary
-// thread, came too late for its vblank a few times every 10 s, even with a
-// 4 ms lead. A blocking commit returns right after the vblank, which the loop
-// waits for anyway.
+// The paced flips commit from this thread. A NONBLOCK commit is written to
+// the hardware by a kernel worker, an ordinary thread, which any real-time
+// thread on its core holds off: on the AR9311's two busy cores it came too
+// late for its vblank a few times every 10 s, even with a 4 ms lead; on the
+// VRX Pro (RK3568) the frame-shm feed thread (FIFO 30), appending the P1's 9
+// slices a picture to the decoder, held it off for up to 9 ms, 16 misses a
+// minute, while two cores idled. A blocking commit returns right after the
+// vblank, which the loop waits for anyway.
 static const uint32_t kPacedFlipFlags = 0;
-#else
-static const uint32_t kPacedFlipFlags = DRM_MODE_ATOMIC_NONBLOCK;
-#endif
 
 // --vsync-lock: one commit per refresh, vsync_lock.lead_us() before the
 // vblank, with the newest frame and the OSD together (vsync_lock.h).
