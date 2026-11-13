@@ -842,7 +842,11 @@ public:
 	virtual ~Widget() = default;
 
 	virtual void createLvObjects(lv_obj_t* parent, int screen_w, int screen_h) {}
+	// Every refresh_frequency_ms (1 s by default): refresh from the facts.
 	virtual void tick() {}
+	// Every pass of the OSD render loop (~60 Hz), for a widget that presents
+	// frames of its own (the MSP DisplayPort OSD). Keep it cheap.
+	virtual void frameTick() {}
 
 	// Stop internal threads before the widget is torn down (e.g. rebuilt by the
 	// OSD editor); called with the LVGL objects still alive.
@@ -2099,7 +2103,9 @@ public:
 		parser_thread = std::thread(&MspDisplayPortWidget::mspParserLoop, this);
 	}
 
-	void tick() override {
+	// Per frame, not per tick(): tick() runs only every refresh_frequency_ms
+	// (1 s by default), which held the FC's OSD to one update a second.
+	void frameTick() override {
 		if (!canvas || !display_buffer) return;
 
 		// Apply a grid change requested by the parser thread (SET_OPTIONS).
@@ -2115,7 +2121,7 @@ public:
 			pending_grid_change.store(false, std::memory_order_release);
 		}
 
-		// Render at ~60Hz independently of main OSD tick
+		// At most ~60 Hz; MSP frames come in at the FC's OSD rate
 		auto now = std::chrono::steady_clock::now();
 		auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_refresh);
 		if (elapsed.count() < 16) return;  // ~60Hz
@@ -2133,6 +2139,7 @@ public:
 				uint32_t bytes = (uint32_t)display_info.char_width * display_info.font_width
 				               * display_info.char_height * display_info.font_height * 4;
 				memset(display_buffer, 0, bytes);
+				memset(drawn_map, 0, sizeof(drawn_map));
 				lv_obj_invalidate(canvas);
 			}
 			return;  // nothing to render until data resumes
@@ -2147,11 +2154,8 @@ public:
 		// (DRAW_SCREEN, or the next CLEAR), so this always draws a whole frame.
 		// Between frames nothing is redrawn; the last full frame stays on screen.
 		if (frame_ready.exchange(false, std::memory_order_acq_rel)) {
-			{
-				std::lock_guard<std::mutex> lock(char_map_mutex);
-				renderDisplay();
-			}
-			lv_obj_invalidate(canvas);
+			std::lock_guard<std::mutex> lock(char_map_mutex);
+			renderDisplay();
 		}
 	}
 
@@ -2190,8 +2194,11 @@ private:
 		if (display_buffer) free(display_buffer);
 		display_buffer = (uint32_t*)malloc(display_width * display_height * 4);
 		memset(display_buffer, 0, display_width * display_height * 4);
+		memset(drawn_map, 0, sizeof(drawn_map));  // an empty buffer = every cell blank
+		glyph_scale_valid = false;                // the cell size may have changed
 
 		lv_canvas_set_buffer(canvas, display_buffer, display_width, display_height, LV_COLOR_FORMAT_ARGB8888);
+		lv_obj_invalidate(canvas);
 		int canvas_x = absX(screen_w_);
 		int canvas_y = absY(screen_h_);
 		lv_obj_set_pos(canvas, canvas_x, canvas_y);
@@ -2516,20 +2523,68 @@ private:
 		fclose(fp);
 	}
 
+	// The atlas geometry and the cell scaling, once per font and cell size.
+	// The atlas is N pages (columns) x 256 chars (rows). The page count comes
+	// from the atlas geometry instead of being hardcoded, the way msposd does
+	// it (font_pages = width / glyph_w): BF/INAV/HDZero/Ardu glyphs are all
+	// ~2:3 (w:h), so the native glyph width is atlas_char_height * 2/3 whatever
+	// the on-screen cell size. That gives 4 pages for btfl, 2 for inav, 1 for
+	// ardu, and no horizontal squeeze on 1- and 2-page fonts.
+	void prepareGlyphScale() {
+		atlas_char_height = font_height_atlas / 256;
+		uint32_t glyph_w = atlas_char_height * 2 / 3;
+		uint32_t font_pages = (glyph_w > 0) ? (font_width_atlas / glyph_w) : 4;
+		if (font_pages == 0) font_pages = 1;
+		atlas_char_width = font_width_atlas / font_pages;
+		// Cell pixel -> glyph pixel (nearest neighbour), so drawing a cell
+		// takes no division per pixel.
+		glyph_x.resize(display_info.font_width);
+		glyph_y.resize(display_info.font_height);
+		for (uint32_t x = 0; x < display_info.font_width; x++)
+			glyph_x[x] = x * atlas_char_width / display_info.font_width;
+		for (uint32_t y = 0; y < display_info.font_height; y++)
+			glyph_y[y] = y * atlas_char_height / display_info.font_height;
+		glyph_scale_valid = true;
+	}
+
+	// One cell of the canvas: blank (code 0), the glyph, or a placeholder
+	// while there is no font.
+	void drawCell(uint8_t row, uint8_t col, uint16_t char_code) {
+		const uint32_t fw = display_info.font_width, fh = display_info.font_height;
+		const uint32_t display_width = display_info.char_width * fw;
+		uint32_t* cell = display_buffer + (size_t)row * fh * display_width + (size_t)col * fw;
+		for (uint32_t y = 0; y < fh; y++)
+			memset(cell + (size_t)y * display_width, 0, fw * 4);  // transparent: video shows through
+		if (char_code == 0)
+			return;
+		if (!font_data) {
+			uint8_t brightness = 200 + ((char_code & 0x3F) >> 1);
+			uint32_t color = (0xFFu << 24) | (brightness << 16) | (brightness << 8) | brightness;
+			for (uint32_t y = 0; y < fh; y++)
+				std::fill_n(cell + (size_t)y * display_width, fw, color);
+			return;
+		}
+		const uint32_t src_x = ((char_code >> 8) & 0x3) * atlas_char_width;
+		const uint32_t src_y = (char_code & 0xFF) * atlas_char_height;
+		if (src_x + atlas_char_width > font_width_atlas || src_y + atlas_char_height > font_height_atlas)
+			return;  // a page this font doesn't have: blank
+		for (uint32_t y = 0; y < fh; y++) {
+			const uint32_t* src = font_data + (size_t)(src_y + glyph_y[y]) * font_width_atlas + src_x;
+			uint32_t* dst = cell + (size_t)y * display_width;
+			for (uint32_t x = 0; x < fw; x++)
+				dst[x] = src[glyph_x[x]];
+		}
+	}
+
+	// Present the committed frame: redraw only the cells whose code changed
+	// since the last one and invalidate only those rows. The canvas covers the
+	// whole screen: redrawing and invalidating all of it made LVGL blend and
+	// the flush convert every pixel for each MSP frame (most of a core on the
+	// AR9311 goggles), although typically only a few values change per frame.
 	void renderDisplay() {
 		if (!canvas || !display_buffer) {
 			SPDLOG_WARN("renderDisplay: canvas={} buffer={}", (void*)canvas, (void*)display_buffer);
 			return;
-		}
-
-		uint32_t display_width = display_info.char_width * display_info.font_width;
-		uint32_t display_height = display_info.char_height * display_info.font_height;
-
-		// Clear buffer with transparent background so video shows through
-		uint32_t* buf = display_buffer;
-		uint32_t transparent = 0x00000000;  // ARGB8888: fully transparent
-		for (uint32_t i = 0; i < display_width * display_height; i++) {
-			buf[i] = transparent;
 		}
 
 		// Load font atlas if not loaded yet
@@ -2539,80 +2594,73 @@ private:
 				SPDLOG_WARN("renderDisplay: font_data still null after loadFontAtlas()");
 			} else {
 				SPDLOG_DEBUG("renderDisplay: font atlas loaded, {}x{}", font_width_atlas, font_height_atlas);
+				// Cells drawn as placeholders before: draw them all again.
+				std::fill_n(&drawn_map[0][0], sizeof(drawn_map) / sizeof(drawn_map[0][0]), kCellUnknown);
 			}
 		}
+		if (font_data && !glyph_scale_valid)
+			prepareGlyphScale();
 
-		// Count and draw characters from the committed front buffer.
-		int char_count = 0;
-		for (uint8_t row = 0; row < display_info.char_height; row++) {
-			for (uint8_t col = 0; col < display_info.char_width; col++) {
-				uint16_t char_code = render_map[row][col];
-				if (char_code == 0) continue;
-
-				uint8_t page = (char_code >> 8) & 0x3;
-				uint8_t char_idx = char_code & 0xFF;
-
-				// Atlas is organized as N pages (columns) × 256 chars (rows).
-				// Derive the page count from the atlas geometry instead of
-				// hardcoding it, the way msposd does (font_pages = width / glyph_w).
-				// BF/INAV/HDZero/Ardu glyphs are all ~2:3 (w:h), so the native glyph
-				// width is atlas_char_height * 2/3 regardless of the on-screen cell
-				// size. This gives 4 pages for btfl, 2 for inav, 1 for ardu, avoiding
-				// horizontal squeeze on 1- and 2-page fonts.
-				uint32_t atlas_char_height = font_height_atlas / 256;
-				uint32_t glyph_w = atlas_char_height * 2 / 3;
-				uint32_t font_pages = (glyph_w > 0) ? (font_width_atlas / glyph_w) : 4;
-				if (font_pages == 0) font_pages = 1;
-				uint32_t atlas_char_width = font_width_atlas / font_pages;
-
-				// Calculate source position in font atlas
-				int src_x = page * atlas_char_width;
-				int src_y = char_idx * atlas_char_height;
-
-				// Debug first character
-				if (char_count == 0) {
-					SPDLOG_DEBUG("First char: code=0x{:04x} page={} idx={} atlas_char_size={}x{}",
-						char_code, page, char_idx, atlas_char_width, atlas_char_height);
+		// Changed cells as runs within their row (changes up to kRunGap cells
+		// apart share one run: a voltage on the left and a timer on the right
+		// of the same row stay two small areas). A busier frame, more than
+		// kMaxRuns runs (a menu, a whole new screen), goes as bands of
+		// consecutive changed rows, each the column span of its changes.
+		lv_area_t runs[kMaxRuns];
+		int nruns = 0, cells = 0;
+		int span_c1[32], span_c2[32];
+		for (int row = 0; row < display_info.char_height; row++) {
+			int run_c1 = -1, run_c2 = -1;
+			span_c1[row] = span_c2[row] = -1;
+			auto close_run = [&]() {
+				if (run_c1 < 0) return;
+				if (nruns < kMaxRuns) runs[nruns] = {run_c1, row, run_c2, row};
+				nruns++;
+			};
+			for (int col = 0; col < display_info.char_width; col++) {
+				const uint16_t code = render_map[row][col];
+				if (code == drawn_map[row][col]) continue;
+				drawCell(row, col, code);
+				drawn_map[row][col] = code;
+				cells++;
+				if (span_c1[row] < 0) span_c1[row] = col;
+				span_c2[row] = col;
+				if (run_c1 >= 0 && col - run_c2 <= kRunGap + 1) {
+					run_c2 = col;
+				} else {
+					close_run();
+					run_c1 = run_c2 = col;
 				}
-
-				// Calculate destination position on canvas
-				int dst_x = col * display_info.font_width;
-				int dst_y = row * display_info.font_height;
-
-				// Copy character from atlas to canvas buffer with scaling
-				if (font_data && font_width_atlas > 0 && font_height_atlas > 0) {
-					for (int y = 0; y < (int)display_info.font_height && dst_y + y < (int)display_height; y++) {
-						for (int x = 0; x < (int)display_info.font_width && dst_x + x < (int)display_width; x++) {
-							// Scale from display coordinates back to atlas coordinates
-							int atlas_x = src_x + (x * atlas_char_width) / display_info.font_width;
-							int atlas_y = src_y + (y * atlas_char_height) / display_info.font_height;
-
-							// Bounds check on atlas
-							if (atlas_x >= 0 && atlas_x < (int)font_width_atlas &&
-								atlas_y >= 0 && atlas_y < (int)font_height_atlas) {
-								// Copy pixel from atlas to canvas
-								uint32_t pixel = font_data[atlas_y * font_width_atlas + atlas_x];
-								buf[(dst_y + y) * display_width + (dst_x + x)] = pixel;
-							}
-						}
-					}
-					char_count++;
-				} else if (!font_data) {
-					// Fallback: draw placeholder rectangle
-					uint8_t brightness = 200 + ((char_code & 0x3F) >> 1);
-					uint32_t color = (0xFF << 24) | (brightness << 16) | (brightness << 8) | brightness;
-					for (int y = 0; y < (int)display_info.font_height && dst_y + y < (int)display_height; y++) {
-						for (int x = 0; x < (int)display_info.font_width && dst_x + x < (int)display_width; x++) {
-							buf[(dst_y + y) * display_width + (dst_x + x)] = color;
-						}
-					}
-					char_count++;
+			}
+			close_run();
+		}
+		if (nruns > kMaxRuns) {
+			nruns = 0;
+			for (int row = 0; row < display_info.char_height; row++) {
+				if (span_c1[row] < 0) continue;
+				lv_area_t* last = nruns ? &runs[nruns - 1] : nullptr;
+				if (last && (last->y2 == row - 1 || nruns == kMaxRuns)) {
+					// the band goes on (or: no room left, the rest joins the last one)
+					last->x1 = std::min(last->x1, (int32_t)span_c1[row]);
+					last->x2 = std::max(last->x2, (int32_t)span_c2[row]);
+					last->y2 = row;
+				} else {
+					runs[nruns++] = {span_c1[row], row, span_c2[row], row};
 				}
 			}
 		}
 
-		if (char_count > 0) {
-			SPDLOG_DEBUG("renderDisplay: {} characters drawn", char_count);
+		// Cells -> screen coordinates.
+		lv_area_t c;
+		lv_obj_get_coords(canvas, &c);
+		const int fw = display_info.font_width, fh = display_info.font_height;
+		for (int i = 0; i < nruns; i++) {
+			lv_area_t a = {c.x1 + runs[i].x1 * fw, c.y1 + runs[i].y1 * fh,
+			               c.x1 + (runs[i].x2 + 1) * fw - 1, c.y1 + (runs[i].y2 + 1) * fh - 1};
+			lv_obj_invalidate_area(canvas, &a);
+		}
+		if (cells > 0) {
+			SPDLOG_DEBUG("renderDisplay: {} cells redrawn in {} area(s)", cells, nruns);
 		}
 	}
 
@@ -2644,6 +2692,21 @@ private:
 
 	uint16_t character_map[32][64];  // Working buffer (parser thread): CLEAR/DRAW_STRING
 	uint16_t render_map[32][64];     // Front buffer: committed on DRAW_SCREEN, read by renderDisplay
+	// What display_buffer holds per cell (LVGL thread); kCellUnknown (no valid
+	// code: page bits are 0-3) makes renderDisplay draw the cell again.
+	static constexpr uint16_t kCellUnknown = 0xFFFF;
+	uint16_t drawn_map[32][64] = {};
+
+	// Glyph geometry and cell scaling (prepareGlyphScale), per font and cell size.
+	uint32_t atlas_char_width = 0;
+	uint32_t atlas_char_height = 0;
+	std::vector<uint16_t> glyph_x, glyph_y;
+	bool glyph_scale_valid = false;
+	// Invalidated areas per MSP frame, at most (LVGL keeps 32 in all, and
+	// turns more into one full-screen refresh), and how many unchanged cells
+	// two changes in a row may be apart to share one.
+	static constexpr int kMaxRuns = 16;
+	static constexpr int kRunGap = 3;
 
 	// Frame commit: only present whole frames, committed on a frame boundary
 	// (DRAW_SCREEN, or the next CLEAR), to avoid the top-to-bottom tearing you get
@@ -3108,6 +3171,17 @@ public:
 		}
 	}
 
+	void frameTick() {
+		for (auto& e : entries_) {
+			if (!e.widget) continue;
+			try {
+				e.widget->frameTick();
+			} catch (const std::exception& ex) {
+				logWidgetError(e, ex.what());
+			}
+		}
+	}
+
 	// Reset the bound facts whose name starts with one of `prefixes` to undefined.
 	// The sources owning them re-publish right after, so this is a clean slate for
 	// stale facts (e.g. the previous RX mode's link stats). Scoped by name rather
@@ -3564,7 +3638,9 @@ extern "C" void osd_unlock(void) { lvgl_mutex.unlock(); }
 extern "C" void osd_tick_if_due(void) {
 	static auto last_tick_at = std::chrono::steady_clock::now();
 	auto now = std::chrono::steady_clock::now();
-	if (g_osd && now - last_tick_at >= std::chrono::milliseconds(refresh_frequency_ms)) {
+	if (!g_osd) return;
+	g_osd->frameTick();
+	if (now - last_tick_at >= std::chrono::milliseconds(refresh_frequency_ms)) {
 		g_osd->tick();
 		last_tick_at = now;
 	}

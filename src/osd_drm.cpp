@@ -48,21 +48,44 @@ static uint32_t lvgl_shadow_stride;
 /* An ARGB4444 OSD plane (no ARGB8888 one on this display): LVGL still renders
  * ARGB8888 into the shadow, the flush converts. Only what changed is
  * converted -- the areas of this frame, plus those of the frame before, which
- * went to the other buffer -- since a full screen is 2M pixels. */
-static lv_area_t osd_dirty, osd_dirty_prev;
-static bool osd_dirty_valid, osd_dirty_prev_valid;
+ * went to the other buffer -- since a full screen is 2M pixels. The areas stay
+ * separate, as LVGL hands them over: one bounding box around a timer in one
+ * corner and a voltage in the other is most of the screen. */
+#define OSD_MAX_AREAS 32  /* = LVGL's LV_INV_BUF_SIZE: it never hands over more */
+struct osd_area_list {
+	lv_area_t a[OSD_MAX_AREAS];
+	int n;
+};
+static osd_area_list osd_dirty, osd_dirty_prev;
 
-static void osd_area_join(lv_area_t *acc, bool *valid, const lv_area_t *a)
+static void osd_area_join(lv_area_t *acc, const lv_area_t *a)
 {
-	if (!*valid) {
-		*acc = *a;
-		*valid = true;
-		return;
-	}
 	if (a->x1 < acc->x1) acc->x1 = a->x1;
 	if (a->y1 < acc->y1) acc->y1 = a->y1;
 	if (a->x2 > acc->x2) acc->x2 = a->x2;
 	if (a->y2 > acc->y2) acc->y2 = a->y2;
+}
+
+/* More areas than the list holds (a busy frame): one box around all of them. */
+static void osd_area_add(osd_area_list *l, const lv_area_t *a)
+{
+	if (l->n < OSD_MAX_AREAS) {
+		l->a[l->n++] = *a;
+		return;
+	}
+	for (int i = 1; i < l->n; i++)
+		osd_area_join(&l->a[0], &l->a[i]);
+	osd_area_join(&l->a[0], a);
+	l->n = 1;
+}
+
+static bool osd_area_in(const lv_area_t *in, const osd_area_list *l)
+{
+	for (int i = 0; i < l->n; i++)
+		if (in->x1 >= l->a[i].x1 && in->y1 >= l->a[i].y1 &&
+		    in->x2 <= l->a[i].x2 && in->y2 <= l->a[i].y2)
+			return true;
+	return false;
 }
 
 static void osd_convert_argb4444(struct modeset_buf *dst, const lv_area_t *a)
@@ -85,7 +108,7 @@ void my_flush_cb(lv_display_t * display, const lv_area_t * area, uint8_t * px_ma
 
 	const bool argb4444 = p->out->osd_bufs[0].format == DRM_FORMAT_ARGB4444;
 	if (argb4444)
-		osd_area_join(&osd_dirty, &osd_dirty_valid, area);
+		osd_area_add(&osd_dirty, area);
 
 	/* Direct mode calls flush once per invalidated area. Acting on the
 	 * intermediate calls used to flip the visible buffer mid-frame — the
@@ -102,13 +125,15 @@ void my_flush_cb(lv_display_t * display, const lv_area_t * area, uint8_t * px_ma
 	int back = p->out->osd_buf_switch ^ 1;
 	struct modeset_buf *dst = &p->out->osd_bufs[back];
 	if (argb4444) {
-		if (osd_dirty_valid)
-			osd_convert_argb4444(dst, &osd_dirty);
-		if (osd_dirty_prev_valid)
-			osd_convert_argb4444(dst, &osd_dirty_prev);
+		for (int i = 0; i < osd_dirty.n; i++)
+			osd_convert_argb4444(dst, &osd_dirty.a[i]);
+		/* The previous frame's areas, unless this frame's cover them again
+		 * (the same few values changing frame after frame). */
+		for (int i = 0; i < osd_dirty_prev.n; i++)
+			if (!osd_area_in(&osd_dirty_prev.a[i], &osd_dirty))
+				osd_convert_argb4444(dst, &osd_dirty_prev.a[i]);
 		osd_dirty_prev = osd_dirty;
-		osd_dirty_prev_valid = osd_dirty_valid;
-		osd_dirty_valid = false;
+		osd_dirty.n = 0;
 	} else {
 		memcpy(dst->map, lvgl_shadow, dst->size);
 	}

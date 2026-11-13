@@ -55,7 +55,9 @@ void osd_engine_start(struct lv_obj_t *parent, int screen_w, int screen_h,
 // runs the menu callbacks) and the fact processor thread. Not recursive.
 void osd_lock(void);
 void osd_unlock(void);
-// Let the widgets refresh from their latest facts, at most once per
+// Call once per pass of the OSD render loop: runs the widgets' frameTick()
+// (widgets presenting their own frames, like the MSP OSD) every time, and
+// lets them refresh from their latest facts (tick()) at most once per
 // refresh_frequency_ms. Call with the OSD lock held.
 void osd_tick_if_due(void);
 
