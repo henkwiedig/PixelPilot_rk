@@ -502,6 +502,31 @@ static void run_reboot_air(void * c) { (void)c; colmenu_exec("gsmenu.sh button a
 static void run_reboot_gs (void * c) { (void)c; colmenu_exec("gsmenu.sh button gs actions Reboot"); }
 static void run_action(void * ctx)   { colmenu_exec((const char *)ctx); }
 
+/* Factory reset: gsmenu.sh runs `firstboot` on the unit, which puts its
+ * settings back to the firmware's and reboots it. Behind a confirm dialog,
+ * with its output in the scripts' window. */
+static void run_factory_reset_air(void * c)
+{
+    (void)c;
+    const char * argv[] = { "gsmenu.sh", "button", "air", "actions", "Factory reset", NULL };
+    gs_scripts_run_cmd("Factory reset",
+        RXMODE == ARTOSYN ?
+        "Reset the drone's settings to its firmware's defaults?\n\n"
+        "It reboots and forgets its pairing: bind it again afterwards "
+        "(GS -> Artosyn -> Bind)." :
+        "Reset the drone's settings to its firmware's defaults?\n\n"
+        "It reboots, with its default link settings.", argv);
+}
+static void run_factory_reset_gs(void * c)
+{
+    (void)c;
+    const char * argv[] = { "gsmenu.sh", "button", "gs", "actions", "Factory reset", NULL };
+    gs_scripts_run_cmd("Factory reset",
+        "Reset this ground station's settings to its firmware's defaults?\n\n"
+        "It reboots. Its settings, WiFi networks and drone pairing are lost; "
+        "recordings on the SD card stay.", argv);
+}
+
 /* ── Drone → Actions → OTA update (Artosyn air units) ─────────────────────────
  * Lists the air-unit update images in the SD card's root -- *.img, and *.bin
  * for the SinYine F1 TX's (SinYine_F1_TX_*.bin, the P1 board's image under the
@@ -588,6 +613,7 @@ static const colmenu_page_t air_ota_page = { .title="OTA update", .type="air", .
 static void build_air_actions(colmenu_emit_t * e)
 {
     colmenu_emit_action(e, LV_SYMBOL_POWER, "Reboot", run_reboot_air, NULL);
+    colmenu_emit_action(e, LV_SYMBOL_TRASH, "Factory reset", run_factory_reset_air, NULL);
     if(RXMODE == ARTOSYN)
         colmenu_emit_submenu(e, LV_SYMBOL_UPLOAD, "OTA update", &air_ota_page);
     for(size_t i = 0; i < airactions_count; i++)
@@ -600,6 +626,7 @@ static void build_gs_actions(colmenu_emit_t * e)
     colmenu_emit_action(e, LV_SYMBOL_REFRESH, "Restart PixelPilot", run_restart_pp, NULL);
     colmenu_emit_action(e, LV_SYMBOL_CLOSE,   "Exit PixelPilot",    run_exit_pp,    NULL);
     colmenu_emit_action(e, LV_SYMBOL_POWER, "Reboot", run_reboot_gs, NULL);
+    colmenu_emit_action(e, LV_SYMBOL_TRASH, "Factory reset", run_factory_reset_gs, NULL);
     for(size_t i = 0; i < gsactions_count; i++)
         colmenu_emit_action(e, LV_SYMBOL_PLAY, gsactions[i].label, run_action, strdup(gsactions[i].action));
 

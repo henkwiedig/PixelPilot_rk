@@ -651,6 +651,8 @@ case "$@" in
 
     "button air actions Reboot")    : ;; # integrator: reboot air unit
     "button gs actions Reboot")     : ;; # integrator: reboot ground station
+    "button air actions Factory reset") : ;; # integrator: air unit's settings to defaults, reboot (OpenIPC: firstboot)
+    "button gs actions Factory reset")  : ;; # integrator: ground station's settings to defaults, reboot
     "search channel")
         echo "Not implemented"
         echo "Not implemented" >&2
