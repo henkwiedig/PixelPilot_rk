@@ -4,6 +4,7 @@
 //
 
 #include "gstrtpreceiver.h"
+#include "dvr_cache.h"
 #include "gst/gstparse.h"
 #include "gst/gstpipeline.h"
 #include "gst/net/gstnetaddressmeta.h"
@@ -2725,8 +2726,10 @@ gchar* GstRtpReceiver::dvr_format_location(GstElement* splitmux, guint fragment_
     if (!base || !base[0]) base = "/tmp/pixelpilot_record";
     // First fragment keeps the plain name; size-splits get _partN (N from 2), to
     // match the previous minimp4 recorder's split naming.
-    if (fragment_id == 0) return g_strdup_printf("%s.mp4", base);
-    return g_strdup_printf("%s_part%u.mp4", base, fragment_id + 1);
+    gchar* path = fragment_id == 0 ? g_strdup_printf("%s.mp4", base)
+                                   : g_strdup_printf("%s_part%u.mp4", base, fragment_id + 1);
+    dvr_cache::watch(path);
+    return path;
 }
 
 void GstRtpReceiver::dvr_tick() {

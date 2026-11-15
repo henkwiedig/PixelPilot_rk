@@ -148,6 +148,8 @@ set(LIB_SOURCE_FILES
         src/gstrtpreceiver.h
         src/ring_restream.cpp
         src/ring_restream.h
+        src/dvr_cache.cpp
+        src/dvr_cache.h
         src/timing_sei.h
         src/timing_sei.c
         third_party/waybeam_frame_ring/venc_frame_ring.h
