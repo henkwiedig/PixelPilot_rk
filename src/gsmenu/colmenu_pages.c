@@ -635,15 +635,17 @@ static bool bind_available(void) { return access("/usr/bin/bind", X_OK) == 0; }
  * radio's own state, queryable/settable whether or not the air unit is
  * currently linked. */
 static const colmenu_item_t gs_artosyn_items[] = {
-    /* No channel here: the air unit owns it (air_artosyn_page). Output
-     * Power offers the ground's own levels (auto/500/200/100/25 mW). */
+    /* No channel here: the air unit owns it (air_artosyn_page). No
+     * bandwidth: the ground's TX is the uplink, which stays at the chip
+     * config's 2.5 MHz (sbc-groundstations S98ar8030-transport-rx); Status
+     * shows it. Output Power offers the ground's own levels
+     * (auto/500/200/100/25 mW). */
     { .kind=COLMENU_VALUE,    .icon=LV_SYMBOL_WIFI,     .label="Status",       .param="status" },
-    { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Bandwidth",    .param="bandwidth" },
     { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Output Power", .param="power" },
     { .kind=COLMENU_ACTION,   .icon=LV_SYMBOL_REFRESH,  .label="Bind",
       .on_activate=bind_dialog_trigger, .available=bind_available },
 };
-static const colmenu_page_t gs_artosyn_page = { "Artosyn", "gs", "artosyn", gs_artosyn_items, 4 };
+static const colmenu_page_t gs_artosyn_page = { "Artosyn", "gs", "artosyn", gs_artosyn_items, 3 };
 
 /* System → Receiver / Display / DVR */
 static const colmenu_item_t sys_receiver_items[] = {

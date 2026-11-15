@@ -479,16 +479,11 @@ case "$@" in
     "get gs artosyn status")
         echo "not configured"       # integrator: GET /api/v1/status (role/state/bandwidth_mhz/power/paired)
         ;;
-    "get gs artosyn bandwidth")
-        echo 20
-        emit_values "1\n2\n5\n10\n20\n40"
-        ;;
     "get gs artosyn power")
         echo "500 mW"
         emit_values "auto\n500 mW\n200 mW\n100 mW\n25 mW"  # integrator: GET /api/v1/power (ground levels)
         ;;
 
-    "set gs artosyn bandwidth"*)   : ;;
     "set gs artosyn power"*)       : ;;
 
 # ── GS: System ──────────────────────────────────────────────────────────────
