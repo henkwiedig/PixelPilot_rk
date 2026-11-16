@@ -789,23 +789,6 @@ static const colmenu_item_t sys_datetime_items[] = {
 static const colmenu_page_t sys_datetime_page = { "Date & Time", "gs", "system", sys_datetime_items, 4 };
 #endif
 
-static const colmenu_item_t system_items[] = {
-    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_WIFI,  .label="Receiver", .sub=&sys_receiver_page },
-    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_AUDIO, .label="Audio",    .sub=&sys_audio_page, .available=audio_available },
-    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_IMAGE, .label="Display",  .sub=&sys_display_page },
-    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_VIDEO, .label="DVR",      .sub=&sys_dvr_page },
-    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_WIFI,  .label="Restream", .sub=&sys_restream_page },
-    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_EDIT,  .label="OSD",      .sub=&osd_editor_page },
-    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_REFRESH, .label="Fan",    .sub=&sys_fan_page, .available=gs_fan_available },
-    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_EYE_OPEN, .label="Head tracking", .sub=&sys_headtrack_page,
-      .mode_mask=COLMENU_MODE_ARTOSYN, .available=headtrack_available },
-#ifndef USE_SIMULATOR
-    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_BELL,  .label="Date & Time", .sub=&sys_datetime_page },
-#endif
-};
-static const colmenu_page_t system_page = { "System", "gs", "system", system_items,
-                                            sizeof(system_items) / sizeof(system_items[0]) };
-
 /* WiFi. The WiFi page shows the live connection (get gs wifi ssid) — entering the
  * connected network gives Disconnect / Forget. "Networks" lists only AVAILABLE
  * networks to join: open ones and those whose password the GS already saved
@@ -960,6 +943,31 @@ static void build_wifi(colmenu_emit_t * e)
 }
 static const colmenu_page_t wifi_page = { .title="WiFi", .type="gs", .page="wifi", .build=build_wifi };
 
+/* System → WiFi only with a wlan0: gsmenu.sh's `gs wifi` runs on wlan0 alone
+ * and does nothing without it (the VR04 has only the wlx video adapters). */
+static bool wifi_available(void)
+{
+    return access("/sys/class/net/wlan0", F_OK) == 0;
+}
+
+static const colmenu_item_t system_items[] = {
+    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_WIFI,  .label="Receiver", .sub=&sys_receiver_page },
+    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_AUDIO, .label="Audio",    .sub=&sys_audio_page, .available=audio_available },
+    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_IMAGE, .label="Display",  .sub=&sys_display_page },
+    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_VIDEO, .label="DVR",      .sub=&sys_dvr_page },
+    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_WIFI,  .label="Restream", .sub=&sys_restream_page },
+    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_WIFI,  .label="WiFi",     .sub=&wifi_page, .available=wifi_available },
+    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_EDIT,  .label="OSD",      .sub=&osd_editor_page },
+    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_REFRESH, .label="Fan",    .sub=&sys_fan_page, .available=gs_fan_available },
+    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_EYE_OPEN, .label="Head tracking", .sub=&sys_headtrack_page,
+      .mode_mask=COLMENU_MODE_ARTOSYN, .available=headtrack_available },
+#ifndef USE_SIMULATOR
+    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_BELL,  .label="Date & Time", .sub=&sys_datetime_page },
+#endif
+};
+static const colmenu_page_t system_page = { "System", "gs", "system", system_items,
+                                            sizeof(system_items) / sizeof(system_items[0]) };
+
 /* DVR-Player: a recordings browser (like the old create_gs_dvr_menu); selecting
  * a file starts playback on dvr_screen, and the player's Stop button returns. */
 static void play_recording(void * ctx)
@@ -1078,7 +1086,6 @@ static void build_root(colmenu_emit_t * e)
     }
     colmenu_emit_submenu(e, LV_SYMBOL_VIDEO,    "DVR-Player",      &dvr_page);
     colmenu_emit_submenu(e, LV_SYMBOL_SETTINGS, "System Settings", &system_page);
-    colmenu_emit_submenu(e, LV_SYMBOL_WIFI,     "WiFi",            &wifi_page);
     colmenu_emit_submenu(e, LV_SYMBOL_PLAY,     "Actions",         &gs_actions_page);
 }
 static const colmenu_page_t root_page = { .title="Menu", .build=build_root };
