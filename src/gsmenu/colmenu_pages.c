@@ -347,20 +347,25 @@ static const colmenu_item_t air_aalink_items[] = {
 static const colmenu_page_t air_aalink_page = { "AALink", "air", "aalink", air_aalink_items, 11 };
 
 static const colmenu_item_t air_artosyn_items[] = {
-    /* All four are ar8030-lifecycled's own persisted settings (survive
+    /* All five are ar8030-lifecycled's own persisted settings (survive
      * reboots). Channel is owned by the air unit (AP): "auto" or an entry of
      * the chip's own channel table ("<index> (<MHz> MHz)", listed by
      * gsmenu.sh from the live device, so it can't go stale); changing it
      * retunes both ends together over the live link. Output Power offers
      * this side's own levels (air: 400/200/100/25 mW). Frame Structure is
      * the AP's BB_SET_FRAME_CHANGE mode: 1 most throughput, 2 a short
-     * uplink slot (lower latency, ~15% less throughput), 0 the chip's own. */
+     * uplink slot (lower latency, ~15% less throughput), 0 the chip's own.
+     * Low Power When Disarmed: the air unit drops to its standby power
+     * (lifecycled --standby-dbm, 10 dBm) while the FC reports disarmed;
+     * the image sets the default (on for the P1 and Ascent, off for the
+     * SinYine F1). Off when the air unit has no low-power mode. */
     { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Bandwidth",       .param="bandwidth" },
     { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Output Power",    .param="power" },
     { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Channel",         .param="channel" },
     { .kind=COLMENU_DROPDOWN, .icon=LV_SYMBOL_SETTINGS, .label="Frame Structure", .param="frame_change" },
+    { .kind=COLMENU_SWITCH,   .icon=LV_SYMBOL_SETTINGS, .label="Low Power When Disarmed", .param="standby" },
 };
-static const colmenu_page_t air_artosyn_page = { "Artosyn", "air", "artosyn", air_artosyn_items, 4 };
+static const colmenu_page_t air_artosyn_page = { "Artosyn", "air", "artosyn", air_artosyn_items, 5 };
 
 /* Camera sub-pages (all type=air page=camera) */
 static const colmenu_item_t cam_video_items[] = {
