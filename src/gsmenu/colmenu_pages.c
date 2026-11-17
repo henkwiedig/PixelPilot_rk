@@ -99,7 +99,7 @@ static void on_video_scale(const char * value)
 #endif
 }
 
-/* Smoothness: the vsync lock's quantile + margin limit (VsyncLock::smoothness),
+/* Smoothness: the vsync lock's quantile + margin limit + extra wait (VsyncLock::smoothness),
  * applied live as the slider moves; gsmenu.sh keeps the level in
  * /etc/default/pixelpilot (PIXELPILOT_VSYNC_SMOOTHNESS) for the next start.
  * Only while the display is locked to the video (--vsync-lock). */

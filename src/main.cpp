@@ -145,7 +145,9 @@ struct PacedFrame {
 	FrameTiming timing;
 	uint64_t capture_us;  // VsyncLock::frame_ready()'s, for due_us()
 };
-static const int kPacedFrames = 4;
+// Smoothness 7 keeps up to ~3 waiting after an early burst; the one beyond
+// the array is dropped. (The V4L2 decoder simply waits for a free buffer.)
+static const int kPacedFrames = 6;
 static PacedFrame paced_frames[kPacedFrames];
 static int paced_head, paced_count;
 
@@ -1421,9 +1423,9 @@ static void *dvr_shutdown_worker(void *arg) {
 extern "C" {
     int vsync_lock_active(void) { return vsync_lock_mode; }
     void vsync_lock_set_smoothness(int level) {
-        double quantile, max_margin_ms;
-        VsyncLock::smoothness(level, &quantile, &max_margin_ms);
-        vsync_lock.set_spread(quantile, max_margin_ms);
+        double quantile, max_margin_ms, extra_ms;
+        VsyncLock::smoothness(level, &quantile, &max_margin_ms, &extra_ms);
+        vsync_lock.set_spread(quantile, max_margin_ms, extra_ms);
     }
 }
 
@@ -2402,9 +2404,10 @@ void printHelp() {
     "\n"
     "    --vsync-lock-guard <ms> - How early the late frames should be ready (Default: 1.0)\n"
     "\n"
-    "    --vsync-lock-smoothness <0-5> - How many late frames the latency target waits for:\n"
+    "    --vsync-lock-smoothness <0-7> - How many late frames the latency target waits for:\n"
     "                             higher = fewer dropped frames, more latency (Default: 4;\n"
-    "                             2 = the old behaviour, ~2.5x the drops for ~4 ms less)\n"
+    "                             2 = the old behaviour, ~2.5x the drops for ~4 ms less;\n"
+    "                             6, 7 = 5 plus a fixed 8 / 17 ms, nearly no late frames)\n"
     "\n"
     "    --vsync-lock-quantile <q> - Instead of the level's: share of the frames the target\n"
     "                             waits for, the later ones are dropped (0.9-0.9999)\n"
@@ -3063,14 +3066,14 @@ int main(int argc, char **argv)
 	}
 	if (vsync_lock_mode) {
 		const drmModeModeInfo &m = output_list->mode;
-		double quantile, max_margin_ms;
-		VsyncLock::smoothness(vsync_lock_smoothness, &quantile, &max_margin_ms);
+		double quantile, max_margin_ms, extra_ms;
+		VsyncLock::smoothness(vsync_lock_smoothness, &quantile, &max_margin_ms, &extra_ms);
 		if (vsync_lock_quantile > 0)
 			quantile = vsync_lock_quantile;
 		if (vsync_lock_max_margin_ms > 0)
 			max_margin_ms = vsync_lock_max_margin_ms;
 		vsync_lock.init(drm_fd, output_list->crtc_index, (double)m.htotal * m.vtotal * 1000.0 / m.clock,
-		                m.clock, vsync_lock_guard_us, quantile, vsync_lock_window_s, max_margin_ms);
+		                m.clock, vsync_lock_guard_us, quantile, vsync_lock_window_s, max_margin_ms, extra_ms);
 		signal(SIGTERM, vsync_lock_sigterm);
 		if (vsync_lock_dump)
 			vsync_lock.open_dump(vsync_lock_dump);

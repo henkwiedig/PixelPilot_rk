@@ -42,23 +42,40 @@ static const unsigned kDefaultMarginUs = 6000;
 // 3: 0.6x / 11.2, 4: 0.36x / 13.3 (measured: 0.15 drops/s, +4.3 ms),
 // 5: 0.27x / 14.6. The higher limits matter where the link's tail is longer
 // than the bench's (in flight the margin sat at 12 ms).
+//
+// Beyond 5 a higher quantile or limit hardly helps: over 10 s, 0.999 is
+// already the 2nd latest frame, and the rarer late frames are the ones the
+// window hasn't seen yet. Levels 6 and 7 wait a fixed extra_ms on top of 5.
+// Offline (scratchpad locksim.py, bench dumps P1 + VR04 / VRX Pro, with and
+// without flight-like 15-40 ms stalls every ~25 s), drops per second and
+// capture -> vblank latency:
+//   5: 0.15-0.18 /s, 42-53 ms;  6 (+8 ms): 0.01-0.05 /s, +8 ms;
+//   7 (+17 ms): 0.00-0.03 /s, +17 ms;  lock losses and unlocked time as 5.
+// Measured (P1 + VR04 bench, 2 x 2 min each): 5: 0.09 /s at 42 ms, 6: 0.01 /s
+// at 52 ms, 7: none at 58 ms, decode time unchanged.
+// Raising the limit to 33 ms or the quantile to the window's latest frame
+// instead removed less and lost the lock 3-5x as often (the margin swings).
+// The extra wait keeps up to ~3 decoded frames waiting for their flip.
 static const struct {
-	double quantile, max_margin_ms;
+	double quantile, max_margin_ms, extra_ms;
 } kSmoothness[VsyncLock::kSmoothnessLevels] = {
-	{0.95, 6}, {0.98, 9}, {0.99, 12}, {0.995, 14}, {0.998, 16}, {0.999, 20},
+	{0.95, 6, 0},    {0.98, 9, 0},    {0.99, 12, 0},    {0.995, 14, 0},
+	{0.998, 16, 0},  {0.999, 20, 0},  {0.999, 20, 8},   {0.999, 20, 17},
 };
 
-void VsyncLock::smoothness(int level, double *spread_quantile, double *max_margin_ms) {
+void VsyncLock::smoothness(int level, double *spread_quantile, double *max_margin_ms, double *extra_ms) {
 	level = std::max(0, std::min(kSmoothnessLevels - 1, level));
 	*spread_quantile = kSmoothness[level].quantile;
 	*max_margin_ms = kSmoothness[level].max_margin_ms;
+	*extra_ms = kSmoothness[level].extra_ms;
 }
 
-void VsyncLock::set_spread(double spread_quantile, double max_margin_ms) {
+void VsyncLock::set_spread(double spread_quantile, double max_margin_ms, double extra_ms) {
 	spread_quantile_.store(spread_quantile);
 	max_margin_us_.store(max_margin_ms * 1000);
-	spdlog::info("vsync lock: waits for {:.2f} % of the frames, margin up to {:.0f} ms", spread_quantile * 100,
-	             max_margin_ms);
+	extra_us_.store(extra_ms * 1000);
+	spdlog::info("vsync lock: waits for {:.2f} % of the frames, margin up to {:.0f} ms, {:.0f} ms extra",
+	             spread_quantile * 100, max_margin_ms, extra_ms);
 }
 
 // The target latency falls at most this share of what the trim can move the
@@ -108,13 +125,14 @@ static uint64_t monotonic_us() {
 }
 
 void VsyncLock::init(int drm_fd, uint32_t crtc_index, double period_us, uint32_t clock_khz, unsigned guard_us,
-                     double spread_quantile, double spread_window_s, double max_margin_ms) {
+                     double spread_quantile, double spread_window_s, double max_margin_ms, double extra_ms) {
 	drm_fd_ = drm_fd;
 	crtc_index_ = crtc_index;
 	nominal_period_us_ = period_us_ = period_us;
 	guard_us_ = guard_us;
 	spread_quantile_.store(spread_quantile);
 	max_margin_us_.store(max_margin_ms * 1000);
+	extra_us_.store(extra_ms * 1000);
 	deviations_.assign(std::max(120, (int)std::lround(spread_window_s * 1e6 / period_us)), 0.0);
 	deviation_next_ = deviation_count_ = 0;
 
@@ -148,8 +166,9 @@ void VsyncLock::init(int drm_fd, uint32_t crtc_index, double period_us, uint32_t
 		snprintf(knob_reset_, sizeof(knob_reset_), "%llu\n", (unsigned long long)knob_nominal_hz_) :
 		snprintf(knob_reset_, sizeof(knob_reset_), "0\n");
 	spdlog::info("vsync lock: refresh period {:.3f} us, trimmed through {}, waits for {:.2f} % of the frames "
-	             "(over {} frames, margin up to {:.0f} ms)",
-	             period_us, path, spread_quantile_.load() * 100, deviations_.size(), max_margin_us_.load() / 1000);
+	             "(over {} frames, margin up to {:.0f} ms, {:.0f} ms extra)",
+	             period_us, path, spread_quantile_.load() * 100, deviations_.size(), max_margin_us_.load() / 1000,
+	             extra_us_.load() / 1000);
 	// A previous run may have left a trim behind.
 	write_knob(0);
 }
@@ -472,8 +491,8 @@ void VsyncLock::tick(uint64_t now_us) {
 
 		if (use_latency) {
 			// Each frame belongs to the vblank at capture + target latency:
-			// the median latency, the late frames' margin over it, the guard,
-			// and the commit lead.
+			// the median latency, the late frames' margin over it, the
+			// level's extra wait, the guard, and the commit lead.
 			lat_max_ms = *std::max_element(lat.begin(), lat.end()) / 1000.0;
 			lat_p99_ms = quantile(lat, 0.99) / 1000.0;
 			const double median_lat = quantile(lat, 0.5);
@@ -487,7 +506,7 @@ void VsyncLock::tick(uint64_t now_us) {
 					deviation_count_++;
 			}
 			update_margin();
-			const double target = median_lat + margin_us_ + guard_us_ + lead_us_;
+			const double target = median_lat + margin_us_ + extra_us_.load() + guard_us_ + lead_us_;
 			if (slot_mode_ && dt_s > 0) {
 				double step = 0.2 * (target - target_lat_us_);
 				const double max_fall_us =

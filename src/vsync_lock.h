@@ -41,7 +41,10 @@
 // late frames that remain are rare outliers, which a short window mostly
 // doesn't hold: 0.9999 over 60 s with a 25 ms cap kept ~1 drop a minute for
 // ~9 ms more, but after a link outage it held the latency up to 19 ms higher
-// for over a minute -- hence the 10 s default window.
+// for over a minute -- hence the 10 s default window. Levels 6 and 7 add a
+// fixed extra_ms on top instead (half a frame, one frame at 60 fps): it
+// catches those outliers without having seen them, and since it doesn't move
+// with the window it costs the lock nothing (see vsync_lock.cpp).
 //
 // The capture timestamps come mapped onto this clock by the receiver's
 // clock sync, and that mapping steps whenever the sync moves to another
@@ -56,16 +59,18 @@ public:
 	// pixel clock. guard_us: how long before the commit deadline the late
 	// frames should be ready. spread_quantile, spread_window_s,
 	// max_margin_ms: the share of the frames the target latency waits for,
-	// over how long, and its limit (see above).
+	// over how long, and its limit; extra_ms: a fixed wait on top (see above).
 	void init(int drm_fd, uint32_t crtc_index, double period_us, uint32_t clock_khz, unsigned guard_us,
-	          double spread_quantile = 0.998, double spread_window_s = 10, double max_margin_ms = 16);
-	// Any thread, any time: a new quantile and margin limit (the menu).
-	void set_spread(double spread_quantile, double max_margin_ms);
-	// Smoothness level -> quantile and margin limit, 0 (least latency, most
-	// drops) .. kSmoothnessLevels - 1; out-of-range levels are clamped.
-	static const int kSmoothnessLevels = 6;
+	          double spread_quantile = 0.998, double spread_window_s = 10, double max_margin_ms = 16,
+	          double extra_ms = 0);
+	// Any thread, any time: a new quantile, margin limit and extra wait (the menu).
+	void set_spread(double spread_quantile, double max_margin_ms, double extra_ms);
+	// Smoothness level -> quantile, margin limit and extra wait, 0 (least
+	// latency, most drops) .. kSmoothnessLevels - 1; out-of-range levels are
+	// clamped.
+	static const int kSmoothnessLevels = 8;
 	static const int kDefaultSmoothness = 4;
-	static void smoothness(int level, double *spread_quantile, double *max_margin_ms);
+	static void smoothness(int level, double *spread_quantile, double *max_margin_ms, double *extra_ms);
 	// Back to the nominal refresh rate.
 	void shutdown();
 	// The same from a signal handler: async-signal-safe.
@@ -145,6 +150,7 @@ private:
 	// Read by tick() on the display thread, set from the menu: atomic.
 	std::atomic<double> spread_quantile_{0.998};
 	std::atomic<double> max_margin_us_{16000};
+	std::atomic<double> extra_us_{0};
 
 	// Vblank timeline: written by the display thread under mutex_, read
 	// under it by the frame thread.
