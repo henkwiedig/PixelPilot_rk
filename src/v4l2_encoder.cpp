@@ -21,6 +21,7 @@
 #include "spdlog/spdlog.h"
 
 #include "dvr.h"
+#include "live_backlog.h"
 
 extern bool dvr_osd;   // main.cpp: burn the OSD into the recording
 
@@ -691,6 +692,14 @@ void *FrameProcessor::__THREAD__(void *p) {
     return nullptr;
 }
 
+// The live picture is behind when an entry has waited this long for its decoder
+// (a frame at 30 fps; the ring queue drops the backlog at 200 ms), and has caught
+// up again once the wait is below kLiveCaughtUpUs. Yielding until then, not just
+// until it is under kLiveBehindUs, lets the backlog drain instead of settling at
+// that much extra latency.
+static constexpr uint32_t kLiveBehindUs = 33000;
+static constexpr uint32_t kLiveCaughtUpUs = 8000;
+
 void FrameProcessor::loop() {
     struct timespec next;
     clock_gettime(CLOCK_MONOTONIC, &next);
@@ -718,10 +727,30 @@ void FrameProcessor::loop() {
         std::lock_guard<std::mutex> lk(mtx);
         if (!running)
             break;
-        if (!dvr_enabled)
+        if (!dvr_enabled) {
             drop_latest();
-        else if (dec_ && latest_.index >= 0)
-            encoder->push_frame(dec_, latest_);
+        } else if (dec_ && latest_.index >= 0) {
+            // The live picture first. Its decoder shares the codec with this
+            // encoder; while it is behind (frames waiting for it), the encoder
+            // gets no frame, so the codec goes to the decoder. The recording
+            // repeats the last frame for that while.
+            const uint32_t backlog = g_live_backlog_us.load(std::memory_order_relaxed);
+            if (backlog > kLiveBehindUs)
+                yielding_ = true;
+            else if (backlog < kLiveCaughtUpUs)
+                yielding_ = false;
+            if (yielding_)
+                yielded_++;
+            else
+                encoder->push_frame(dec_, latest_);
+            const uint64_t now_ms = (uint64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+            if (yielded_ && now_ms - yield_log_ms_ >= 5000) {
+                spdlog::warn("DVR re-encode: {} frames skipped for the live picture (its decoder was behind)",
+                             yielded_);
+                yielded_ = 0;
+                yield_log_ms_ = now_ms;
+            }
+        }
     }
     spdlog::info("Frame pacer done.");
 }

@@ -128,6 +128,9 @@ private:
     long interval_ns;
     V4l2Decoder *dec_ = nullptr;
     V4l2Decoder::Frame latest_;   // index -1 = none
+    // frames not given to the encoder because the live picture was behind
+    uint64_t yielded_ = 0, yield_log_ms_ = 0;
+    bool yielding_ = false;
 };
 
 #endif // V4L2_ENCODER_H
