@@ -358,6 +358,12 @@ bool V4l2Encoder::open_device(const EncFrame &f) {
         set_ctrl(V4L2_CID_MPEG_VIDEO_HEVC_REFRESH_TYPE, V4L2_MPEG_VIDEO_HEVC_REFRESH_IDR, "refresh type");
         set_ctrl(V4L2_CID_MPEG_VIDEO_HEVC_REFRESH_PERIOD, gop, "refresh period");
     } else {
+        // wave5 defaults to Baseline, CAVLC and level 1.0, which no 1080p stream
+        // fits. High with CABAC at level 4.2: 1080p60 (the frame rate can change
+        // while the encoder is open), up to 62.5 Mbit/s.
+        set_ctrl(V4L2_CID_MPEG_VIDEO_H264_PROFILE, V4L2_MPEG_VIDEO_H264_PROFILE_HIGH, "profile");
+        set_ctrl(V4L2_CID_MPEG_VIDEO_H264_ENTROPY_MODE, V4L2_MPEG_VIDEO_H264_ENTROPY_MODE_CABAC, "entropy mode");
+        set_ctrl(V4L2_CID_MPEG_VIDEO_H264_LEVEL, V4L2_MPEG_VIDEO_H264_LEVEL_4_2, "level");
         set_ctrl(V4L2_CID_MPEG_VIDEO_H264_I_PERIOD, gop, "intra period");
         set_ctrl(V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR, 1, "headers on IDR");
     }
