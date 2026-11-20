@@ -31,3 +31,16 @@ inline bool platform_has_large_ram() {
     // needs to land on the right side, not find a precise boundary.
     return found && kb > 2ul * 1024 * 1024;
 }
+
+// MemAvailable in kB, -1 if unreadable.
+inline long mem_available_kb() {
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return -1;
+    char line[256];
+    long kb = -1;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "MemAvailable: %ld kB", &kb) == 1) break;
+    }
+    fclose(f);
+    return kb;
+}

@@ -17,6 +17,7 @@
 #include <inttypes.h>
 #include <signal.h>
 #include <fstream>
+#include <thread>
 #include <chrono>
 #include <atomic>
 #include <queue>
@@ -77,6 +78,7 @@ extern "C" {
 #include <iostream>
 #include "WiFiMonitor.hpp"
 #include "menu.h"
+#include "mem_info.h"
 
 
 #define READ_BUF_SIZE (1024*1024) // SZ_1M https://github.com/rockchip-linux/mpp/blob/ed377c99a733e2cdbcc457a6aa3f0fcd438a9dff/osal/inc/mpp_common.h#L179
@@ -1662,6 +1664,31 @@ bool feed_packet_to_decoder(DecoderPacket *packet,void* data_p,int data_len,uint
 }
 #endif
 
+// A recording must never take the live picture down with it. Below this much
+// MemAvailable the BetaFPV VR04 (128 MB) starts reading its code back from the
+// compressed rootfs and the whole box stalls (live video included, then the
+// OOM killer); a recording that gets it there is stopped first. Boards with
+// more memory never come near it.
+static constexpr long kDvrMinMemAvailableKb = 16 * 1024;
+static void dvr_memory_guard() {
+	pthread_setname_np(pthread_self(), "dvr-mem-guard");
+	int low = 0;
+	for (;;) {
+		sleep(1);
+		const long kb = dvr_enabled ? mem_available_kb() : -1;
+		if (kb < 0 || kb >= kDvrMinMemAvailableKb) {
+			low = 0;
+			continue;
+		}
+		if (++low < 2)   // two seconds in a row
+			continue;
+		low = 0;
+		spdlog::warn("DVR: only {} MB of memory left, stopping the recording", kb / 1024);
+		dvr_stop_all();
+		osd_publish_str_fact("osd.custom_message", NULL, 0, "Low memory\nrecording stopped");
+	}
+}
+
 // Runtime audio on/off for the OSD menu (System -> Receiver -> Audio).
 extern "C" {
 	int audio_get_enabled(void) {
@@ -3144,6 +3171,7 @@ int main(int argc, char **argv)
 	signal(SIGPIPE, sig_handler);
 	if (dvr_template) {
 		signal(SIGUSR1, sigusr1_handler);
+		std::thread(dvr_memory_guard).detach();
 	}
 	signal(SIGUSR2, sigusr2_handler);
  	//////////////////// THREADS SETUP
