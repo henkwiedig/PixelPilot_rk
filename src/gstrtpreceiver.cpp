@@ -5,6 +5,7 @@
 
 #include "gstrtpreceiver.h"
 #include "dvr_cache.h"
+#include "live_backlog.h"
 #include "gst/gstparse.h"
 #include "gst/gstpipeline.h"
 #include "gst/net/gstnetaddressmeta.h"
@@ -1504,6 +1505,21 @@ struct FrameShmAttach {
 // Between the ring reader and the decoder's feed: what the RTP path's socket
 // buffer (udpsrc buffer-size) held, ~0.75 s at 22 Mbit/s.
 static constexpr size_t kRingQueueBytes = 2 * 1024 * 1024;
+// The queue holds what the decoder has not taken yet: normally nothing or a
+// frame. When the decoder falls behind (the codec busy with the re-encoder, a
+// stall), the backlog is latency the live picture never wins back, since it
+// decodes no faster than the radio delivers. So once the oldest entry has
+// waited this long (or the queue is full), all of it is dropped and the feed
+// resyncs from the next picture on: a short glitch rather than lasting delay.
+// (Dropping the newest entry instead, as before, kept the delay for good.)
+static constexpr uint64_t kRingMaxBacklogUs = 200000;
+
+std::atomic<uint32_t> g_live_backlog_us{0};
+
+static uint64_t steady_us() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 // Start offsets and lengths of the NAL units in data[0..n), each with its
 // start code (a 00 in front of 00 00 01 counts as part of it).
@@ -1634,32 +1650,45 @@ void GstRtpReceiver::queue_frame_shm_entry(const uint8_t* slot, uint32_t len) {
     if (m.codec != VENC_FRAME_CODEC_H265)
         return;
     on_incoming_stream_buffer(nullptr, "frame-shm");
-    bool dropped = false, discont = (m.flags & VENC_FRAME_FLAG_DISCONT) != 0;
-    uint64_t total_dropped = 0;
+    bool discont = (m.flags & VENC_FRAME_FLAG_DISCONT) != 0;
+    const uint64_t now = steady_us();
+    uint64_t flushes = 0, behind_us = 0;
+    size_t flushed = 0, flushed_bytes = 0;
     {
         std::lock_guard<std::mutex> lk(m_ring_q_mtx);
-        if (m_ring_q_bytes + len > kRingQueueBytes) {
-            m_ring_q_lost = true;
-            m_ring_q_dropped++;
-            total_dropped = m_ring_q_dropped;
-            dropped = true;
-        } else {
-            m_ring_q.emplace_back(slot, slot + len);
-            if (m_ring_q_lost) {
-                VencFrameMeta* qm = reinterpret_cast<VencFrameMeta*>(m_ring_q.back().data());
-                qm->flags |= VENC_FRAME_FLAG_DISCONT;
-                m_ring_q_lost = false;
-                discont = true;
+        const uint64_t age = m_ring_q_t.empty() ? 0 : now - m_ring_q_t.front();
+        if (age > kRingMaxBacklogUs || m_ring_q_bytes + len > kRingQueueBytes) {
+            // A pending reset (a fresh attach) stays: it resyncs the feed anyway.
+            const bool reset = std::any_of(m_ring_q.begin(), m_ring_q.end(),
+                                           [](const std::vector<uint8_t>& q) { return q.empty(); });
+            flushed = m_ring_q.size();
+            flushed_bytes = m_ring_q_bytes;
+            behind_us = age;
+            m_ring_q.clear();
+            m_ring_q_t.clear();
+            m_ring_q_bytes = 0;
+            if (reset) {
+                m_ring_q.emplace_back();
+                m_ring_q_t.push_back(now);
+            } else {
+                m_ring_q_resync = true;
             }
-            m_ring_q_bytes += len;
+            flushes = ++m_ring_q_flushes;
         }
+        m_ring_q.emplace_back(slot, slot + len);
+        m_ring_q_t.push_back(now);
+        m_ring_q_bytes += len;
+        if (flushed) {
+            VencFrameMeta* qm = reinterpret_cast<VencFrameMeta*>(m_ring_q.back().data());
+            qm->flags |= VENC_FRAME_FLAG_DISCONT;
+            discont = true;
+        }
+        g_live_backlog_us.store((uint32_t)std::min<uint64_t>(now - m_ring_q_t.front(), UINT32_MAX),
+                                std::memory_order_relaxed);
     }
-    if (dropped) {
-        if (total_dropped == 1 || total_dropped % 100 == 0)
-            spdlog::warn("[RING] decoder behind by {} KB: entry dropped ({} so far)", kRingQueueBytes / 1024,
-                         total_dropped);
-        return;
-    }
+    if (flushed && (flushes <= 3 || flushes % 20 == 0))
+        spdlog::warn("[RING] decoder {} ms behind: {} entries ({} KB) dropped, resyncing ({} so far)",
+                     behind_us / 1000, flushed, flushed_bytes / 1024, flushes);
     m_ring_q_cv.notify_one();
     if (discont)
         maybe_request_idr_for_discont();
@@ -1672,6 +1701,7 @@ void GstRtpReceiver::loop_feed_frame_shm() {
     bool skip = true;
     for (;;) {
         std::vector<uint8_t> e;
+        bool resync;
         {
             std::unique_lock<std::mutex> lk(m_ring_q_mtx);
             m_ring_q_cv.wait(lk, [this] { return !m_ring_q.empty() || !m_pull_samples_run; });
@@ -1679,13 +1709,23 @@ void GstRtpReceiver::loop_feed_frame_shm() {
                 break; // stopping
             e = std::move(m_ring_q.front());
             m_ring_q.pop_front();
+            m_ring_q_t.pop_front();
             m_ring_q_bytes -= e.size();
+            resync = m_ring_q_resync;
+            m_ring_q_resync = false;
+            g_live_backlog_us.store(m_ring_q_t.empty() ? 0
+                                    : (uint32_t)std::min<uint64_t>(steady_us() - m_ring_q_t.front(), UINT32_MAX),
+                                    std::memory_order_relaxed);
         }
         if (e.empty()) { // (re)attached: from the next access unit with an SPS on
             au.clear();
             skip = true;
             m_ring_params_seen = false;
             continue;
+        }
+        if (resync) { // the backlog was dropped: from the next access unit on
+            au.clear();
+            skip = true;
         }
         on_frame_shm_entry(e.data(), (uint32_t)e.size(), au, skip);
     }
@@ -1711,9 +1751,11 @@ void GstRtpReceiver::loop_read_frame_shm() {
                 // old ring's, an empty one resets its state.
                 std::lock_guard<std::mutex> lk(m_ring_q_mtx);
                 m_ring_q.clear();
+                m_ring_q_t.clear();
                 m_ring_q_bytes = 0;
-                m_ring_q_lost = false;
+                m_ring_q_resync = false;
                 m_ring_q.emplace_back();
+                m_ring_q_t.push_back(steady_us());
             }
             m_ring_q_cv.notify_one();
         }
@@ -2024,8 +2066,10 @@ void GstRtpReceiver::stop_receiving() {
         {
             std::lock_guard<std::mutex> lk(m_ring_q_mtx);
             m_ring_q.clear();
+            m_ring_q_t.clear();
             m_ring_q_bytes = 0;
         }
+        g_live_backlog_us.store(0, std::memory_order_relaxed);
         m_ring_q_cv.notify_all();
         m_ring_feed_thread->join();
         m_ring_feed_thread = nullptr;

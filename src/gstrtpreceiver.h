@@ -253,9 +253,10 @@ private:
     std::mutex m_ring_q_mtx;
     std::condition_variable m_ring_q_cv;
     std::deque<std::vector<uint8_t>> m_ring_q; // whole entries, meta included; empty = reset
+    std::deque<uint64_t> m_ring_q_t;           // when each was queued (steady clock, us)
     size_t m_ring_q_bytes = 0;
-    bool m_ring_q_lost = false;                // entries dropped: DISCONT on the next one
-    uint64_t m_ring_q_dropped = 0;
+    bool m_ring_q_resync = false;              // backlog dropped: feed from the next picture on
+    uint64_t m_ring_q_flushes = 0;
     GstPad* m_dvr_tee_audio_pad = nullptr;
 
     // Re-encode recorder (appsrc video + Opus). Same pull-thread-driven lifecycle
