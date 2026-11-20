@@ -136,11 +136,14 @@ static lv_obj_t * pp_header_create(lv_obj_t * screen) {
     lv_obj_set_style_border_color(header, lv_color_hex(0x4c60d8), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_radius(header, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
 
+    /* The logo file is its size on a 1080-line screen: LVGL decodes a PNG to
+     * full-size ARGB8888 on every draw (no image cache), and the old 2926x842
+     * original shown at 14 % took 9.4 MB each time, which malloc then kept. */
     lv_obj_t *obj = lv_img_create(header);
     lv_image_set_src(obj, find_resource_file("OpenIPC__OPENIPC_logo_white.png"));
     lv_image_set_inner_align(obj, LV_IMAGE_ALIGN_CENTER);
     lv_obj_set_size(obj, LV_PCT(100), LV_PCT(100));
-    lv_image_set_scale(obj, lv_disp_get_ver_res(NULL) / 30);
+    lv_image_set_scale(obj, lv_disp_get_ver_res(NULL) * LV_SCALE_NONE / 1080);
     return header;
 }
 
