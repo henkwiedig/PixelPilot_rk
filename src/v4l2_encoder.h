@@ -3,11 +3,12 @@
 
 // The DVR re-encoder on a V4L2 platform: a stateful V4L2 memory-to-memory
 // encoder (wave5 on the Artosyn AR9311) that reads the decoder's frames
-// straight from their dma-bufs, so a re-encoded frame is never copied.
+// straight from their dma-bufs, so a re-encoded frame is never copied --
+// unless the OSD is recorded or the recording is 720p: then it reads frames
+// made from them on the SoC's 2D engines (v4l2_frame_prep.h).
 //
-// There is no scaler and no GPU, so the recording has the decoded stream's
-// resolution, without the OSD and without colour correction; the settings
-// for those are accepted and ignored.
+// There is no GPU, so the recording is not colour corrected; that setting is
+// accepted and ignored.
 
 #include <stdint.h>
 
@@ -19,6 +20,7 @@
 #include <vector>
 
 #include "encoder_params.h"
+#include "v4l2_frame_prep.h"
 #include "v4l2_decoder.h"
 
 class V4l2Encoder {
@@ -40,6 +42,7 @@ public:
     void set_bitrate(int kbps);   // live
     void set_codec(VideoCodec c); // reopens the device on the next frame
     void set_fps(int fps);        // live
+    void set_resolution(EncResolution r);   // reopens the device on the next frame
 
     VideoCodec get_codec() const { return params.codec; }
 
@@ -47,7 +50,7 @@ public:
 
 private:
     struct Rpc {
-        enum { FRAME, IDR, BITRATE, CODEC, FPS, DROP, SHUTDOWN } command;
+        enum { FRAME, IDR, BITRATE, CODEC, FPS, RESOLUTION, DROP, SHUTDOWN } command;
         V4l2Decoder *dec = nullptr;
         V4l2Decoder::Frame frame;
         int value = 0;
@@ -61,7 +64,7 @@ private:
 
     void enqueue(Rpc rpc);
     void loop();
-    bool open_device(const V4l2Decoder::Frame &f);
+    bool open_device(const EncFrame &f);
     void close_device();
     void encode(const Rpc &rpc);
     void collect_output();
@@ -75,9 +78,11 @@ private:
     int fd_ = -1;
     int wake_fd_ = -1;
     bool reopen_ = false;
+    uint64_t last_frame_ms_ = 0;
     uint32_t width_ = 0, height_ = 0, stride_ = 0, plane_height_ = 0;
-    std::vector<Source> sources_;
+    std::vector<Source> sources_;   // dec == nullptr: one of prep_'s frames
     std::vector<std::pair<void *, size_t>> coded_;
+    FramePrep prep_;
 
     std::queue<Rpc> queue;
     std::mutex mtx;

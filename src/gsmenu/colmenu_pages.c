@@ -699,8 +699,7 @@ static bool audio_available(void)
 
 /* Rows that only do something on the Rockchip platform: the V4L2 one
  * (BetaFPV VR04) has no copy engine for the front buffer, no GL pass for live
- * colortrans or for the OSD in recordings, and its overlay planes show the
- * video 1:1 (no scaling). */
+ * colortrans, and its overlay planes show the video 1:1 (no scaling). */
 #ifdef PIXELPILOT_V4L2
 static bool rockchip_only(void) { return false; }
 #define ROCKCHIP_ONLY .available = rockchip_only
@@ -736,7 +735,7 @@ static const colmenu_item_t sys_dvr_items[] = {
     { .kind=COLMENU_DROPDOWN, .label="Resolution",        .param="dvr_reenc_resolution", .on_change=on_dvr_reenc_resolution },
     { .kind=COLMENU_DROPDOWN, .label="Re-encode FPS",     .param="dvr_reenc_fps",        .on_change=on_dvr_reenc_fps },
     { .kind=COLMENU_DROPDOWN, .label="Bitrate (kbps)",    .param="dvr_reenc_bitrate",    .on_change=on_dvr_reenc_bitrate },
-    { .kind=COLMENU_SWITCH,   .label="Record OSD in DVR", .param="dvr_osd",              .on_change=on_dvr_osd, ROCKCHIP_ONLY },
+    { .kind=COLMENU_SWITCH,   .label="Record OSD in DVR", .param="dvr_osd",              .on_change=on_dvr_osd },
 };
 static const colmenu_page_t sys_dvr_page = { "DVR", "gs", "system", sys_dvr_items, 8 };
 

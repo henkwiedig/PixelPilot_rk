@@ -169,7 +169,9 @@ if(PIXELPILOT_PLATFORM STREQUAL "v4l2")
         src/v4l2_decoder.h
         src/v4l2_decoder.cpp
         src/v4l2_encoder.h
-        src/v4l2_encoder.cpp)
+        src/v4l2_encoder.cpp
+        src/v4l2_frame_prep.h
+        src/v4l2_frame_prep.cpp)
 elseif(PIXELPILOT_PLATFORM STREQUAL "rockchip")
   list(APPEND LIB_SOURCE_FILES
         src/osd_gl.cpp

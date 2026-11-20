@@ -22,12 +22,22 @@
 
 #include "dvr.h"
 
+extern bool dvr_osd;   // main.cpp: burn the OSD into the recording
+
 // Frames on their way through the encoder, and coded-picture buffers. A
 // coded buffer holds an uncompressed frame's worth (the driver's ceiling):
 // a keyframe at a high bitrate outgrows 1 MiB, and the encoder then drops
 // the access unit, so a recording that starts with it never starts.
 static const unsigned kSourceBuffers = 3;
 static const unsigned kCodedBuffers = 4;
+// Closed this long after the last frame.
+static const uint64_t kIdleCloseMs = 3000;
+
+static uint64_t now_ms() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 static int xioctl(int fd, unsigned long req, void *arg) {
     int ret;
@@ -100,6 +110,13 @@ void V4l2Encoder::set_codec(VideoCodec c) {
     enqueue(std::move(rpc));
 }
 
+void V4l2Encoder::set_resolution(EncResolution r) {
+    Rpc rpc;
+    rpc.command = Rpc::RESOLUTION;
+    rpc.value = (int)r;
+    enqueue(std::move(rpc));
+}
+
 void V4l2Encoder::set_fps(int fps) {
     Rpc rpc;
     rpc.command = Rpc::FPS;
@@ -160,6 +177,10 @@ void V4l2Encoder::loop() {
                     reopen_ = true;
                 }
                 break;
+            case Rpc::RESOLUTION:
+                // A new frame size reopens the device at the next frame.
+                params.resolution = (EncResolution)rpc.value;
+                break;
             case Rpc::FPS:
                 params.fps = rpc.value;
                 if (fd_ >= 0)
@@ -202,6 +223,13 @@ void V4l2Encoder::loop() {
         bool inflight = false;
         for (const Source &s : sources_)
             inflight |= s.busy;
+        // No frames for a while (the recording stopped): the encoder's own
+        // buffers and the OSD frames go back to the codec pool, which the
+        // decoder shares. The next frame opens the device again.
+        if (fd_ >= 0 && !inflight && now_ms() - last_frame_ms_ > kIdleCloseMs) {
+            close_device();
+            spdlog::info("V4L2 encoder: idle, closed");
+        }
         struct pollfd fds[2] = {{wake_fd_, POLLIN, 0}, {fd_, POLLIN | POLLOUT, 0}};
         const int n = (fd_ >= 0 && inflight) ? 2 : 1;
         if (poll(fds, n, 500) <= 0)
@@ -265,7 +293,7 @@ void V4l2Encoder::apply_fps() {
         spdlog::warn("V4L2 encoder: S_PARM {} fps: {}", params.fps, strerror(errno));
 }
 
-bool V4l2Encoder::open_device(const V4l2Decoder::Frame &f) {
+bool V4l2Encoder::open_device(const EncFrame &f) {
     fd_ = open_encoder_for(params.codec);
     if (fd_ < 0) {
         spdlog::error("V4L2 encoder: no device encodes {}", codec_name(params.codec));
@@ -285,8 +313,9 @@ bool V4l2Encoder::open_device(const V4l2Decoder::Frame &f) {
         return false;
     }
 
-    // The decoder's buffer as it is: I420, its stride, its padded rows (the
-    // chroma planes follow those); the picture is cropped to the visible rows.
+    // The frames as they come (the decoder's, or ours): I420, their stride,
+    // their padded rows (the chroma planes follow those); the picture is
+    // cropped to the visible rows.
     fmt = {};
     fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
     fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_YUV420;
@@ -302,9 +331,9 @@ bool V4l2Encoder::open_device(const V4l2Decoder::Frame &f) {
     const uint32_t offered_stride = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
     const uint32_t offered_size = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
     if (fmt.fmt.pix_mp.pixelformat != V4L2_PIX_FMT_YUV420 || fmt.fmt.pix_mp.num_planes != 1 ||
-        offered_stride != f.stride || offered_size > f.dmabuf_size) {
+        offered_stride != f.stride || offered_size > f.size) {
         spdlog::error("V4L2 encoder: cannot take the decoder's {}x{} frames (stride {}, {} bytes): "
-                      "offers stride {}, {} bytes", f.width, f.plane_height, f.stride, f.dmabuf_size,
+                      "offers stride {}, {} bytes", f.width, f.plane_height, f.stride, f.size,
                       offered_stride, offered_size);
         close_device();
         return false;
@@ -438,14 +467,19 @@ void V4l2Encoder::close_device() {
     xioctl(fd_, VIDIOC_REQBUFS, &req);
     close(fd_);
     fd_ = -1;
+    // Our frames are free again; the engines let go of the decoder's
+    // frames, which it may be about to free.
+    prep_.release();
 }
 
 void V4l2Encoder::encode(const Rpc &rpc) {
     const V4l2Decoder::Frame &f = rpc.frame;
-    if (fd_ >= 0 && (reopen_ || f.width != width_ || f.height != height_ || f.stride != stride_ ||
-                     f.plane_height != plane_height_))
+    last_frame_ms_ = now_ms();
+    const EncFrame geom = prep_.geometry(f, params.resolution);
+    if (fd_ >= 0 && (reopen_ || geom.width != width_ || geom.height != height_ || geom.stride != stride_ ||
+                     geom.plane_height != plane_height_))
         close_device();
-    if (fd_ < 0 && !open_device(f)) {
+    if (fd_ < 0 && !open_device(geom)) {
         rpc.dec->unref(f.index);
         return;
     }
@@ -472,6 +506,15 @@ void V4l2Encoder::encode(const Rpc &rpc) {
         return;
     }
 
+    // With the OSD recorded or at 720p, the encoder reads a frame of our
+    // own made from the decoder's, which then goes back right away.
+    EncFrame in;
+    bool own = false;
+    if (!prep_.prepare((unsigned)slot, (unsigned)sources_.size(), f, geom, dvr_osd, in, own)) {
+        rpc.dec->unref(f.index);
+        return;
+    }
+
     struct v4l2_plane planes[VIDEO_MAX_PLANES] = {};
     struct v4l2_buffer buf = {};
     buf.index = slot;
@@ -479,9 +522,9 @@ void V4l2Encoder::encode(const Rpc &rpc) {
     buf.memory = V4L2_MEMORY_DMABUF;
     buf.m.planes = planes;
     buf.length = 1;
-    planes[0].m.fd = f.dmabuf_fd;
-    planes[0].length = f.dmabuf_size;
-    planes[0].bytesused = f.dmabuf_size;
+    planes[0].m.fd = in.fd;
+    planes[0].length = in.size;
+    planes[0].bytesused = in.size;
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     buf.timestamp.tv_sec = ts.tv_sec;
@@ -491,7 +534,12 @@ void V4l2Encoder::encode(const Rpc &rpc) {
         rpc.dec->unref(f.index);
         return;
     }
-    sources_[slot] = {true, rpc.dec, f.index};
+    if (own) {
+        rpc.dec->unref(f.index);
+        sources_[slot] = {true, nullptr, -1};
+    } else {
+        sources_[slot] = {true, rpc.dec, f.index};
+    }
 }
 
 void V4l2Encoder::collect_output() {
@@ -608,8 +656,7 @@ void FrameProcessor::set_fps(int fps) {
 }
 
 void FrameProcessor::set_resolution(EncResolution r) {
-    if (r != EncResolution::Res1080p)
-        spdlog::info("DVR re-encode: no scaler here, the recording keeps the video's resolution");
+    encoder->set_resolution(r);
 }
 
 void FrameProcessor::set_color_correction(float gain, float offset) {
@@ -618,6 +665,8 @@ void FrameProcessor::set_color_correction(float gain, float offset) {
     spdlog::info("DVR re-encode: no GPU here, the recording is not colour corrected");
 }
 
+// The encoder reads the OSD itself (osd_layer.h, v4l2_frame_prep.h), with
+// the parts that show something; this only gets the plane's buffer.
 void FrameProcessor::set_osd_blend(int prime_fd, uint32_t w, uint32_t h, uint32_t stride_px) {
     (void)prime_fd; (void)w; (void)h; (void)stride_px;
 }

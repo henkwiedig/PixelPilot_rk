@@ -6,7 +6,10 @@
 #include <cassert>
 #include <cstring>
 #include <chrono>
+#include <mutex>
 #include <thread>
+#include <vector>
+#include <drm_fourcc.h>
 extern "C" {
 #include "drm.h"
 #include "menu.h"
@@ -14,6 +17,7 @@ extern "C" {
 }
 #include "osd.h"
 #include "osd.hpp"
+#include "osd_layer.h"
 #include "spdlog/spdlog.h"
 #include "../lvgl/lvgl.h"
 #include "osd_gl.hpp"
@@ -88,6 +92,139 @@ static bool osd_area_in(const lv_area_t *in, const osd_area_list *l)
 	return false;
 }
 
+/* What the DVR re-encoder burns in (osd_layer.h): the front buffer and the
+ * parts of it that are not transparent, kept in 32x32 tiles. A tile is
+ * looked at again when a flushed area touches it, so the map follows the
+ * shadow (= the front buffer after the flush) at the cost of the changed
+ * tiles only. The blend engine pays per rectangle and per pixel, so the
+ * used tiles go out as rectangles: runs along a tile row, joined with the
+ * same run in the rows below. */
+#define OSD_TILE 32
+#define OSD_MAX_REGIONS 256
+static std::vector<uint8_t> osd_tile_used, osd_tile_dirty;
+static uint32_t osd_tiles_w, osd_tiles_h;
+static std::mutex osd_layer_mtx;
+static OsdLayerSnapshot osd_layer;
+
+static void osd_tiles_mark(const lv_area_t *a, uint32_t w, uint32_t h)
+{
+	const int32_t x1 = LV_MAX(a->x1, 0), y1 = LV_MAX(a->y1, 0);
+	const int32_t x2 = LV_MIN(a->x2, (int32_t)w - 1), y2 = LV_MIN(a->y2, (int32_t)h - 1);
+	if (x1 > x2 || y1 > y2)
+		return;
+	for (int32_t ty = y1 / OSD_TILE; ty <= y2 / OSD_TILE; ty++)
+		for (int32_t tx = x1 / OSD_TILE; tx <= x2 / OSD_TILE; tx++)
+			osd_tile_dirty[ty * osd_tiles_w + tx] = 1;
+}
+
+/* A pixel shows when its ARGB4444 alpha does: the top nibble of the 8 bits. */
+static bool osd_tile_visible(uint32_t tx, uint32_t ty, uint32_t w, uint32_t h)
+{
+	const uint32_t x1 = tx * OSD_TILE, y1 = ty * OSD_TILE;
+	const uint32_t x2 = LV_MIN(x1 + OSD_TILE, w), y2 = LV_MIN(y1 + OSD_TILE, h);
+	for (uint32_t y = y1; y < y2; y++) {
+		const uint32_t *s = (const uint32_t *)(lvgl_shadow + (size_t)y * lvgl_shadow_stride) + x1;
+		for (uint32_t x = x1; x < x2; x++)
+			if (*s++ & 0xf0000000u)
+				return true;
+	}
+	return false;
+}
+
+static void osd_regions_build(std::vector<OsdRegion> &out, uint32_t w, uint32_t h, bool coarse)
+{
+	struct Span { uint32_t x0, x1, y0, rows; bool hit; };
+	std::vector<Span> open, next;
+	auto emit = [&](const Span &s) {
+		const uint32_t x = s.x0 * OSD_TILE, y = s.y0 * OSD_TILE;
+		out.push_back({(uint16_t)x, (uint16_t)y,
+		               (uint16_t)(LV_MIN(s.x1 * OSD_TILE, w) - x),
+		               (uint16_t)(LV_MIN((s.y0 + s.rows) * OSD_TILE, h) - y)});
+	};
+	out.clear();
+	for (uint32_t ty = 0; ty < osd_tiles_h; ty++) {
+		const uint8_t *row = &osd_tile_used[ty * osd_tiles_w];
+		next.clear();
+		for (Span &s : open)
+			s.hit = false;
+		uint32_t tx = 0;
+		while (tx < osd_tiles_w) {
+			if (!row[tx]) { tx++; continue; }
+			uint32_t x0 = tx;
+			while (tx < osd_tiles_w && row[tx]) tx++;
+			uint32_t x1 = tx;
+			if (coarse) {
+				/* One span per row: first to last used tile. */
+				for (uint32_t t = tx; t < osd_tiles_w; t++)
+					if (row[t]) x1 = t + 1;
+				tx = osd_tiles_w;
+			}
+			bool joined = false;
+			for (Span &s : open)
+				if (!s.hit && s.x0 == x0 && s.x1 == x1) {
+					s.rows++;
+					s.hit = joined = true;
+					next.push_back(s);
+					break;
+				}
+			if (!joined)
+				next.push_back({x0, x1, ty, 1, true});
+		}
+		for (const Span &s : open)
+			if (!s.hit)
+				emit(s);
+		std::swap(open, next);
+	}
+	for (const Span &s : open)
+		emit(s);
+}
+
+/* After a flush: rescan the tiles the areas touched, publish the layer. */
+static void osd_layer_update(struct modeset_buf *front, const osd_area_list *areas)
+{
+	const uint32_t w = front->width, h = front->height;
+	std::vector<OsdRegion> regions;
+	if (front->format == DRM_FORMAT_ARGB4444) {
+		const uint32_t tw = (w + OSD_TILE - 1) / OSD_TILE, th = (h + OSD_TILE - 1) / OSD_TILE;
+		if (tw != osd_tiles_w || th != osd_tiles_h) {
+			osd_tiles_w = tw;
+			osd_tiles_h = th;
+			osd_tile_used.assign(tw * th, 0);
+			osd_tile_dirty.assign(tw * th, 1);
+		}
+		for (int i = 0; i < areas->n; i++)
+			osd_tiles_mark(&areas->a[i], w, h);
+		for (uint32_t ty = 0; ty < th; ty++)
+			for (uint32_t tx = 0; tx < tw; tx++)
+				if (osd_tile_dirty[ty * tw + tx]) {
+					osd_tile_dirty[ty * tw + tx] = 0;
+					osd_tile_used[ty * tw + tx] = osd_tile_visible(tx, ty, w, h);
+				}
+		osd_regions_build(regions, w, h, false);
+		if (regions.size() > OSD_MAX_REGIONS)
+			osd_regions_build(regions, w, h, true);
+	} else {
+		regions.push_back({0, 0, (uint16_t)w, (uint16_t)h});
+	}
+
+	std::lock_guard<std::mutex> lk(osd_layer_mtx);
+	osd_layer.prime_fd = front->prime_fd;
+	osd_layer.drm_format = front->format;
+	osd_layer.width = w;
+	osd_layer.height = h;
+	osd_layer.stride = front->stride;
+	osd_layer.regions.swap(regions);
+}
+
+bool osd_layer_snapshot(OsdLayerSnapshot &out)
+{
+	std::lock_guard<std::mutex> lk(osd_layer_mtx);
+	if (osd_layer.prime_fd < 0)
+		return false;
+	out = osd_layer;
+	return true;
+}
+
 static void osd_convert_argb4444(struct modeset_buf *dst, const lv_area_t *a)
 {
 	const int32_t x1 = LV_MAX(a->x1, 0), y1 = LV_MAX(a->y1, 0);
@@ -132,10 +269,12 @@ void my_flush_cb(lv_display_t * display, const lv_area_t * area, uint8_t * px_ma
 		for (int i = 0; i < osd_dirty_prev.n; i++)
 			if (!osd_area_in(&osd_dirty_prev.a[i], &osd_dirty))
 				osd_convert_argb4444(dst, &osd_dirty_prev.a[i]);
+		osd_layer_update(dst, &osd_dirty);
 		osd_dirty_prev = osd_dirty;
 		osd_dirty.n = 0;
 	} else {
 		memcpy(dst->map, lvgl_shadow, dst->size);
+		osd_layer_update(dst, nullptr);
 	}
 
 	int ret = pthread_mutex_lock(&osd_mutex);
