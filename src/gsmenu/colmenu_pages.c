@@ -1078,7 +1078,10 @@ static void build_root(colmenu_emit_t * e)
         break;
     }
     colmenu_emit_submenu_gated(e, LV_SYMBOL_IMAGE,    "Camera",    camera);
-    colmenu_emit_submenu_gated(e, LV_SYMBOL_DOWNLOAD, "Telemetry", &air_tel_page);
+    /* Artosyn air units have a single serial port and the OSD is always
+     * rendered on the ground, so there is nothing to configure here. */
+    if(RXMODE != ARTOSYN)
+        colmenu_emit_submenu_gated(e, LV_SYMBOL_DOWNLOAD, "Telemetry", &air_tel_page);
     colmenu_emit_submenu_gated(e, LV_SYMBOL_PLAY,     "Actions",   &air_actions_page);
 
     colmenu_emit_label(e, "GS Settings");
