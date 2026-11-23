@@ -14,6 +14,7 @@
 #include <dirent.h>
 #include <strings.h>      /* strcasecmp */
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 #include "colmenu.h"
 #include "colmenu_pages.h"
@@ -954,6 +955,91 @@ static bool wifi_available(void)
     return access("/sys/class/net/wlan0", F_OK) == 0;
 }
 
+/* ── System Settings → Version: the ground's and the air unit's /etc/os-release ──
+ * The two differ in layout: sbc-groundstations writes NAME/VERSION/BUILD_CONFIG/
+ * BUILD_DATE, the OpenIPC air firmware is Buildroot's file plus OPENIPC_VERSION,
+ * GITHUB_VERSION, BUILD_ID, BUILD_PLATFORM and TIME_STAMP. One table covers both:
+ * each row shows the first of its keys the file has, rows with none are left out
+ * (the names and URLs aren't version information, so they stay out too). */
+typedef struct { const char * label; const char * keys[3]; } version_field_t;
+static const version_field_t version_fields[] = {
+    { "Version",  { "VERSION" } },
+    { "OpenIPC",  { "OPENIPC_VERSION" } },
+    { "Build",    { "GITHUB_VERSION" } },
+    { "Build ID", { "BUILD_ID" } },
+    { "Platform", { "BUILD_CONFIG", "BUILD_PLATFORM" } },
+    { "Built",    { "BUILD_DATE", "TIME_STAMP" } },
+};
+
+/* KEY's value in os-release text (the last assignment wins, like sourcing it),
+ * without its quotes; false when the key is missing or empty. */
+static bool os_release_value(const char * text, const char * key, char * out, size_t len)
+{
+    const size_t klen = strlen(key);
+    bool found = false;
+    for(const char * l = text; l && *l; ) {
+        const char * eol = strchr(l, '\n');
+        const size_t n = eol ? (size_t)(eol - l) : strlen(l);
+        if(n > klen && strncmp(l, key, klen) == 0 && l[klen] == '=') {
+            const char * v = l + klen + 1;
+            size_t vn = n - klen - 1;
+            if(vn >= 2 && (v[0] == '"' || v[0] == '\'') && v[vn - 1] == v[0]) { v++; vn -= 2; }
+            if(vn >= len) vn = len - 1;
+            memcpy(out, v, vn);
+            out[vn] = '\0';
+            found = vn > 0;
+        }
+        l = eol ? eol + 1 : NULL;
+    }
+    return found;
+}
+
+static void emit_os_release(colmenu_emit_t * e, const char * text)
+{
+    int rows = 0;
+    for(size_t i = 0; i < sizeof(version_fields) / sizeof(version_fields[0]); i++) {
+        const version_field_t * f = &version_fields[i];
+        for(int k = 0; k < 3 && f->keys[k]; k++) {
+            char v[128];
+            if(!os_release_value(text, f->keys[k], v, sizeof(v))) continue;
+            /* TIME_STAMP is the build time in epoch seconds */
+            if(strcmp(f->keys[k], "TIME_STAMP") == 0) {
+                time_t t = (time_t)strtoll(v, NULL, 10);
+                struct tm tm;
+                if(t > 0 && localtime_r(&t, &tm)) strftime(v, sizeof(v), "%Y-%m-%d %H:%M", &tm);
+            }
+            colmenu_emit_value(e, NULL, f->label, v);
+            rows++;
+            break;
+        }
+    }
+    if(rows == 0) colmenu_emit_value(e, NULL, "No version information", "");
+}
+
+static void build_version(colmenu_emit_t * e)
+{
+    char text[4096] = "";
+    FILE * f = fopen("/etc/os-release", "r");
+    if(f) {
+        text[fread(text, 1, sizeof(text) - 1, f)] = '\0';
+        fclose(f);
+    }
+    colmenu_emit_label(e, "Ground");
+    emit_os_release(e, text);
+
+    /* The air unit only when it answers: gsmenu.sh prints nothing without a
+     * link (prefetched on the loader thread, so opening the page never blocks). */
+    char * air = colmenu_get("gs", "version", "air", NULL);
+    if(air && *air) {
+        colmenu_emit_label(e, "Air");
+        emit_os_release(e, air);
+    }
+    free(air);
+}
+static const char * const version_prefetch[] = { "air", NULL };
+static const colmenu_page_t sys_version_page = { .title="Version", .type="gs", .page="version",
+                                                .build=build_version, .prefetch=version_prefetch };
+
 static const colmenu_item_t system_items[] = {
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_WIFI,  .label="Receiver", .sub=&sys_receiver_page },
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_AUDIO, .label="Audio",    .sub=&sys_audio_page, .available=audio_available },
@@ -968,6 +1054,7 @@ static const colmenu_item_t system_items[] = {
 #ifndef USE_SIMULATOR
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_BELL,  .label="Date & Time", .sub=&sys_datetime_page },
 #endif
+    { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_LIST,  .label="Version",  .sub=&sys_version_page },
 };
 static const colmenu_page_t system_page = { "System", "gs", "system", system_items,
                                             sizeof(system_items) / sizeof(system_items[0]) };
