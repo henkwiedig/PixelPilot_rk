@@ -70,6 +70,9 @@ typedef struct { char * param; char * value; char * opts; } prefetch_entry_t;
 typedef struct { prefetch_entry_t * items; int count; } prefetch_cache_t;
 static prefetch_cache_t * g_prefetch;
 
+/* Developer mode (colmenu_set_developer): rows with .dev_only show only while on. */
+static bool g_developer;
+
 struct colmenu_emit { colstack_t * cs; lv_obj_t * body; };
 
 /* ── gsmenu.sh backend ─────────────────────────────────────────────────────── */
@@ -109,6 +112,12 @@ char * colmenu_get(const char * type, const char * page, const char * param, cha
      * read it straight from the app (switch builder atoi()s this: 0/1, not on/off). */
     if(strcmp(param, "audio") == 0) {
         return strdup(audio_get_enabled() ? "1" : "0");
+    }
+
+    /* Developer mode is the app's own state (gsmenu.sh only persists it for the
+     * next start, see do_set): the switch shows what the menu is doing now. */
+    if(strcmp(param, "developer") == 0) {
+        return strdup(g_developer ? "1" : "0");
     }
 
     /* Restream is configured from pixelpilot.yaml and lives entirely inside the
@@ -427,7 +436,7 @@ static void exec_poll(lv_timer_t * t)
     free(x);
 }
 
-static void colmenu_exec_cb(const char * cmd, void (*done)(void * ctx, int rc), void * ctx)
+void colmenu_exec_cb(const char * cmd, void (*done)(void * ctx, int rc), void * ctx)
 {
     printf("Running command: %s\n", cmd);
     fflush(stdout);
@@ -568,10 +577,12 @@ static int option_index(const char * options, const char * value)
 
 static void build_page(colstack_t * cs, lv_obj_t * body, const colmenu_page_t * pg);
 
-/* Whether a row is shown: the current RX mode must match its mode_mask and
- * its available() hook (hardware present, ...) must not say no. */
+/* Whether a row is shown: developer-only rows need developer mode, the current
+ * RX mode must match its mode_mask and its available() hook (hardware present,
+ * ...) must not say no. */
 static bool item_shown(const colmenu_item_t * it)
 {
+    if(it->dev_only && !g_developer) return false;
     if(it->mode_mask) {
         int mode_bit = (RXMODE == APFPV)   ? COLMENU_MODE_APFPV
                       : (RXMODE == ARTOSYN) ? COLMENU_MODE_ARTOSYN
@@ -1252,6 +1263,9 @@ void colmenu_set_drone_detected(bool detected)
 }
 bool colmenu_drone_detected(void) { return g_drone_detected; }
 
+void colmenu_set_developer(bool on) { g_developer = on; }
+bool colmenu_developer(void) { return g_developer; }
+
 void colmenu_init(lv_obj_t * parent) { g_cs = colstack_create(parent); }
 
 void colmenu_show(const colmenu_page_t * root)
@@ -1335,8 +1349,8 @@ void colmenu_emit_submenu_gated(colmenu_emit_t * e, const char * icon, const cha
     colstack_set_enabled(row, g_drone_detected);
 }
 
-void colmenu_emit_action(colmenu_emit_t * e, const char * icon, const char * label,
-                         void (*on_activate)(void * ctx), void * ctx)
+static lv_obj_t * emit_action_row(colmenu_emit_t * e, const char * icon, const char * label,
+                                  void (*on_activate)(void * ctx), void * ctx)
 {
     lv_obj_t * row = colstack_add_action(e->cs, e->body, icon, label);
     emit_action_t * a = malloc(sizeof(emit_action_t));
@@ -1344,6 +1358,19 @@ void colmenu_emit_action(colmenu_emit_t * e, const char * icon, const char * lab
     a->ctx = ctx;
     colstack_set_action(row, emit_action_invoke, a);
     lv_obj_add_event_cb(row, emit_action_delete, LV_EVENT_DELETE, a);
+    return row;
+}
+
+void colmenu_emit_action(colmenu_emit_t * e, const char * icon, const char * label,
+                         void (*on_activate)(void * ctx), void * ctx)
+{
+    emit_action_row(e, icon, label, on_activate, ctx);
+}
+
+void colmenu_emit_action_value(colmenu_emit_t * e, const char * icon, const char * label,
+                               const char * value, void (*on_activate)(void * ctx), void * ctx)
+{
+    colstack_set_row_value(emit_action_row(e, icon, label, on_activate, ctx), value);
 }
 
 /* Deferred so it's safe to call from a row's own event (the rebuild deletes it). */

@@ -178,6 +178,7 @@ static bool frame_timing_take(uint64_t pts_us, FrameTiming *out) {
 pthread_cond_t video_cond;
 extern bool osd_update_ready;
 extern bool gsmenu_enabled;
+extern "C" void colmenu_set_developer(bool on);   // gsmenu/colmenu.c
 int video_zpos = 1;
 
 #ifndef PIXELPILOT_V4L2
@@ -2462,6 +2463,10 @@ void printHelp() {
     "\n"
     "    --wfb-api-host         - Host or IP of wfb-server for cli statistics. (Default: 127.0.0.1)\n"
     "\n"
+    "    --developer            - Start the menu in developer mode: it also shows the\n"
+    "                             developer-only settings (Enter 7x on System Settings ->\n"
+    "                             Version switches it on from the menu)\n"
+    "\n"
     "    --version              - Show program version\n"
     "\n", APP_VERSION_MAJOR, APP_VERSION_MINOR
   );
@@ -2721,6 +2726,11 @@ int main(int argc, char **argv)
 
 	__OnArgument("--disable-vsync") {
 		disable_vsync = true;
+		continue;
+	}
+
+	__OnArgument("--developer") {
+		colmenu_set_developer(true);
 		continue;
 	}
 

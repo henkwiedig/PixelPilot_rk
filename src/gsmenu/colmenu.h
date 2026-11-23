@@ -49,6 +49,7 @@ typedef struct colmenu_item {
     void (*on_live)(const char * value);    /* SLIDER: fired live while dragging  */
     void (*on_activate)(void);              /* COLMENU_ACTION                    */
     bool (*available)(void);                /* optional: hide the row when false (e.g. hardware absent) */
+    bool                        dev_only;   /* shown only in developer mode (colmenu_developer()) */
 } colmenu_item_t;
 
 /* Handle passed to a dynamic page's build() so it can emit rows at runtime. */
@@ -83,6 +84,14 @@ void colmenu_rebuild(void);
 void colmenu_set_drone_detected(bool detected);
 bool colmenu_drone_detected(void);
 
+/* Developer mode: rows with .dev_only (and whatever a dynamic page gates on
+ * colmenu_developer()) show only while it is on. Starts from --developer
+ * (PIXELPILOT_DEVELOPER in /etc/default/pixelpilot); Enter 7 times on System
+ * Settings -> Version turns it on, the Developer Mode switch that then shows
+ * turns it off. Takes effect for pages built after the change. */
+void colmenu_set_developer(bool on);
+bool colmenu_developer(void);
+
 /* ── emit API for dynamic build() functions ────────────────────────────────── */
 void colmenu_emit_label  (colmenu_emit_t * e, const char * text);
 void colmenu_emit_value  (colmenu_emit_t * e, const char * icon, const char * label, const char * value);
@@ -98,6 +107,9 @@ void colmenu_emit_submenu_gated(colmenu_emit_t * e, const char * icon, const cha
 /* ctx is passed to on_activate and free()'d when the row is destroyed. */
 void colmenu_emit_action (colmenu_emit_t * e, const char * icon, const char * label,
                           void (*on_activate)(void * ctx), void * ctx);
+/* The same with a (dim) value on the right: an info row that reacts to ENTER. */
+void colmenu_emit_action_value(colmenu_emit_t * e, const char * icon, const char * label,
+                               const char * value, void (*on_activate)(void * ctx), void * ctx);
 
 /* Re-run the current dynamic column's builder (e.g. a wifi re-scan). Deferred. */
 void colmenu_rescan(void);
@@ -125,6 +137,10 @@ void colmenu_dialog(const char * title, const char * text, const char * buttons,
  * old menu did for writes). stdout/stderr and the exit code are captured; a
  * non-zero exit shows an error dialog with the command output. */
 void colmenu_exec(const char * cmd);
+/* Same, then `done(ctx, rc)` on the main thread once it finished; the keypad is
+ * the column's again by then, so `done` may open a dialog. A non-zero exit
+ * still shows the error dialog after it. */
+void colmenu_exec_cb(const char * cmd, void (*done)(void * ctx, int rc), void * ctx);
 
 /* Hand the keypad to the current column: for a dialog closing over the menu.
  * The column it was opened from may be gone by then (a drone subtree closes

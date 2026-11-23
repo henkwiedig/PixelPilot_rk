@@ -731,12 +731,14 @@ static const colmenu_page_t sys_display_page = { "Display", "gs", "system", sys_
 static const colmenu_item_t sys_dvr_items[] = {
     { .kind=COLMENU_SWITCH,   .label="Enabled",           .param="rec_enabled",          .on_change=on_rec_enabled },
     { .kind=COLMENU_DROPDOWN, .label="Mode",              .param="dvr_mode",             .on_change=on_dvr_mode },
-    { .kind=COLMENU_SLIDER,   .label="Max file size (MB)", .param="dvr_max_size",         .on_change=on_dvr_max_size, .display_scale=100 },
-    { .kind=COLMENU_DROPDOWN, .label="Codec",             .param="dvr_reenc_codec",      .on_change=on_dvr_reenc_codec },
-    { .kind=COLMENU_DROPDOWN, .label="Resolution",        .param="dvr_reenc_resolution", .on_change=on_dvr_reenc_resolution },
-    { .kind=COLMENU_DROPDOWN, .label="Re-encode FPS",     .param="dvr_reenc_fps",        .on_change=on_dvr_reenc_fps },
-    { .kind=COLMENU_DROPDOWN, .label="Bitrate (kbps)",    .param="dvr_reenc_bitrate",    .on_change=on_dvr_reenc_bitrate },
-    { .kind=COLMENU_SWITCH,   .label="Record OSD in DVR", .param="dvr_osd",              .on_change=on_dvr_osd },
+    /* The rest only in developer mode: the defaults are what holds up on each
+     * board, the knobs are for trying things out. */
+    { .kind=COLMENU_SLIDER,   .label="Max file size (MB)", .param="dvr_max_size",         .on_change=on_dvr_max_size, .display_scale=100, .dev_only=true },
+    { .kind=COLMENU_DROPDOWN, .label="Codec",             .param="dvr_reenc_codec",      .on_change=on_dvr_reenc_codec,      .dev_only=true },
+    { .kind=COLMENU_DROPDOWN, .label="Resolution",        .param="dvr_reenc_resolution", .on_change=on_dvr_reenc_resolution, .dev_only=true },
+    { .kind=COLMENU_DROPDOWN, .label="Re-encode FPS",     .param="dvr_reenc_fps",        .on_change=on_dvr_reenc_fps,        .dev_only=true },
+    { .kind=COLMENU_DROPDOWN, .label="Bitrate (kbps)",    .param="dvr_reenc_bitrate",    .on_change=on_dvr_reenc_bitrate,    .dev_only=true },
+    { .kind=COLMENU_SWITCH,   .label="Record OSD in DVR", .param="dvr_osd",              .on_change=on_dvr_osd,              .dev_only=true },
 };
 static const colmenu_page_t sys_dvr_page = { "DVR", "gs", "system", sys_dvr_items, 8 };
 
@@ -994,7 +996,47 @@ static bool os_release_value(const char * text, const char * key, char * out, si
     return found;
 }
 
-static void emit_os_release(colmenu_emit_t * e, const char * text)
+/* Developer mode on, Android style: ENTER 7 times on the ground's Version row
+ * (counted per visit of the page). Persisted through gsmenu.sh into
+ * /etc/default/pixelpilot (PIXELPILOT_DEVELOPER, pixelpilot.sh passes
+ * --developer); the menu is rebuilt so the developer rows show. */
+#define DEVELOPER_TAPS 7
+static int g_version_taps;
+
+static void developer_rebuild(int choice, void * user) { (void)choice; (void)user; colmenu_rebuild(); }
+
+static void developer_saved(void * ctx, int rc)
+{
+    (void)ctx;
+    if(rc != 0) return;   /* colmenu_exec_cb shows the error */
+    colmenu_set_developer(true);
+    colmenu_dialog("Developer mode",
+                   "Developer mode is on: the menu now shows the developer settings.\n"
+                   "Switch it off again in System Settings, Developer Mode.",
+                   NULL, developer_rebuild, NULL);
+}
+
+static void version_tap(void * ctx)
+{
+    (void)ctx;
+    if(++g_version_taps < DEVELOPER_TAPS) return;
+    g_version_taps = 0;
+    if(colmenu_developer())
+        colmenu_dialog("Developer mode", "Developer mode is already on.", NULL, NULL, NULL);
+    else
+        colmenu_exec_cb("gsmenu.sh set gs system developer on", developer_saved, NULL);
+}
+
+/* System Settings -> Developer Mode (shown only while on): off again. gsmenu.sh
+ * has persisted it by the time this runs. */
+static void on_developer(const char * value)
+{
+    colmenu_set_developer(strcmp(value, "on") == 0);
+    colmenu_rebuild();
+}
+
+/* `tap`: the Version row becomes an ENTER-able row calling it (the ground's). */
+static void emit_os_release(colmenu_emit_t * e, const char * text, void (*tap)(void * ctx))
 {
     int rows = 0;
     for(size_t i = 0; i < sizeof(version_fields) / sizeof(version_fields[0]); i++) {
@@ -1008,7 +1050,10 @@ static void emit_os_release(colmenu_emit_t * e, const char * text)
                 struct tm tm;
                 if(t > 0 && localtime_r(&t, &tm)) strftime(v, sizeof(v), "%Y-%m-%d %H:%M", &tm);
             }
-            colmenu_emit_value(e, NULL, f->label, v);
+            if(tap && strcmp(f->keys[k], "VERSION") == 0)
+                colmenu_emit_action_value(e, NULL, f->label, v, tap, NULL);
+            else
+                colmenu_emit_value(e, NULL, f->label, v);
             rows++;
             break;
         }
@@ -1024,15 +1069,16 @@ static void build_version(colmenu_emit_t * e)
         text[fread(text, 1, sizeof(text) - 1, f)] = '\0';
         fclose(f);
     }
+    g_version_taps = 0;
     colmenu_emit_label(e, "Ground");
-    emit_os_release(e, text);
+    emit_os_release(e, text, version_tap);
 
     /* The air unit only when it answers: gsmenu.sh prints nothing without a
      * link (prefetched on the loader thread, so opening the page never blocks). */
     char * air = colmenu_get("gs", "version", "air", NULL);
     if(air && *air) {
         colmenu_emit_label(e, "Air");
-        emit_os_release(e, air);
+        emit_os_release(e, air, NULL);
     }
     free(air);
 }
@@ -1055,6 +1101,8 @@ static const colmenu_item_t system_items[] = {
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_BELL,  .label="Date & Time", .sub=&sys_datetime_page },
 #endif
     { .kind=COLMENU_SUBMENU, .icon=LV_SYMBOL_LIST,  .label="Version",  .sub=&sys_version_page },
+    { .kind=COLMENU_SWITCH,  .icon=LV_SYMBOL_SETTINGS, .label="Developer Mode", .param="developer",
+      .on_change=on_developer, .dev_only=true },
 };
 static const colmenu_page_t system_page = { "System", "gs", "system", system_items,
                                             sizeof(system_items) / sizeof(system_items[0]) };
