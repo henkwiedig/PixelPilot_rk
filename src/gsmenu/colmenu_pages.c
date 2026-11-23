@@ -464,8 +464,12 @@ static const colmenu_item_t wb_video_items[] = {
     /* No manual bitrate control -- waybeam's rate control is fully adaptive
      * (video0.rcMode), a fixed bitrate override doesn't apply here. */
     { .kind=COLMENU_DROPDOWN, .label="Resilience", .param="video_resilience" },
+    /* P1 (AR9311) strips: % of the quality gap between the strips the
+     * bitrate closes (waybeam video0.stripBalance); evens out the seam at
+     * the cost of latency, so for trying out only. n/a on other air units. */
+    { .kind=COLMENU_DROPDOWN, .label="Strip Balance (%)", .param="video_strip_balance", .dev_only=true },
 };
-static const colmenu_page_t wb_video_page = { "Video", "air", "waybeam", wb_video_items, 2 };
+static const colmenu_page_t wb_video_page = { "Video", "air", "waybeam", wb_video_items, 3 };
 static const colmenu_item_t wb_audio_items[] = {
     { .kind=COLMENU_SWITCH, .label="Enabled", .param="audio_enabled" },
 };
