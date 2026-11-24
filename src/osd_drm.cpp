@@ -4,6 +4,7 @@
  * in osd.cpp and is shared with the SDL simulator, which brings its own display.
  */
 #include <cassert>
+#include <sys/ioctl.h>
 #include <cstring>
 #include <chrono>
 #include <mutex>
@@ -105,6 +106,41 @@ static std::vector<uint8_t> osd_tile_used, osd_tile_dirty;
 static uint32_t osd_tiles_w, osd_tiles_h;
 static std::mutex osd_layer_mtx;
 static OsdLayerSnapshot osd_layer;
+
+/* The ARGB8888 copy a scaling consumer registered (osd_layer.h), under
+ * osd_layer_mtx. */
+static int osd_copy_fd = -1;
+static uint8_t *osd_copy_map;
+static uint32_t osd_copy_stride, osd_copy_w, osd_copy_h;
+
+/* linux/dma-buf.h: CPU access to a dma-buf a device reads. */
+struct osd_dma_buf_sync {
+	uint64_t flags;
+};
+#define OSD_DMA_BUF_SYNC_WRITE (2 << 0)
+#define OSD_DMA_BUF_SYNC_START (0 << 2)
+#define OSD_DMA_BUF_SYNC_END (1 << 2)
+#define OSD_DMA_BUF_IOCTL_SYNC _IOW('b', 0, struct osd_dma_buf_sync)
+
+static void osd_copy_sync(bool start)
+{
+	struct osd_dma_buf_sync s = {OSD_DMA_BUF_SYNC_WRITE | (start ? OSD_DMA_BUF_SYNC_START : OSD_DMA_BUF_SYNC_END)};
+	ioctl(osd_copy_fd, OSD_DMA_BUF_IOCTL_SYNC, &s);
+}
+
+/* Rows of the shadow (ARGB8888) into the copy, with osd_layer_mtx held. */
+static void osd_copy_area(int32_t x1, int32_t y1, int32_t x2, int32_t y2)
+{
+	x1 = LV_MAX(x1, 0);
+	y1 = LV_MAX(y1, 0);
+	x2 = LV_MIN(x2, (int32_t)osd_copy_w - 1);
+	y2 = LV_MIN(y2, (int32_t)osd_copy_h - 1);
+	if (x2 < x1)
+		return;
+	for (int32_t y = y1; y <= y2; y++)
+		memcpy(osd_copy_map + (size_t)y * osd_copy_stride + (size_t)x1 * 4,
+		       lvgl_shadow + (size_t)y * lvgl_shadow_stride + (size_t)x1 * 4, (size_t)(x2 - x1 + 1) * 4);
+}
 
 static void osd_tiles_mark(const lv_area_t *a, uint32_t w, uint32_t h)
 {
@@ -208,12 +244,28 @@ static void osd_layer_update(struct modeset_buf *front, const osd_area_list *are
 	}
 
 	std::lock_guard<std::mutex> lk(osd_layer_mtx);
+	// The ARGB8888 copy: this frame's areas (it is one buffer, always the
+	// latest, unlike the two the plane flips between).
+	if (osd_copy_fd >= 0 && areas && lvgl_shadow) {
+		osd_copy_sync(true);
+		for (int i = 0; i < areas->n; i++)
+			osd_copy_area(areas->a[i].x1, areas->a[i].y1, areas->a[i].x2, areas->a[i].y2);
+		osd_copy_sync(false);
+	}
 	osd_layer.prime_fd = front->prime_fd;
 	osd_layer.drm_format = front->format;
 	osd_layer.width = w;
 	osd_layer.height = h;
 	osd_layer.stride = front->stride;
 	osd_layer.regions.swap(regions);
+	osd_layer.serial++;
+	if (front->format == DRM_FORMAT_ARGB8888) {
+		osd_layer.argb8888_fd = front->prime_fd;
+		osd_layer.argb8888_stride = front->stride;
+	} else {
+		osd_layer.argb8888_fd = osd_copy_fd;
+		osd_layer.argb8888_stride = osd_copy_stride;
+	}
 }
 
 bool osd_layer_snapshot(OsdLayerSnapshot &out)
@@ -223,6 +275,39 @@ bool osd_layer_snapshot(OsdLayerSnapshot &out)
 		return false;
 	out = osd_layer;
 	return true;
+}
+
+void osd_layer_set_argb8888_copy(int fd, uint8_t *map, uint32_t stride, uint32_t w, uint32_t h)
+{
+	std::lock_guard<std::mutex> lk(osd_layer_mtx);
+	if (fd < 0 || !map) {
+		osd_copy_fd = -1;
+		osd_copy_map = nullptr;
+		if (osd_layer.drm_format != DRM_FORMAT_ARGB8888)
+			osd_layer.argb8888_fd = -1;
+		return;
+	}
+	osd_copy_fd = fd;
+	osd_copy_map = map;
+	osd_copy_stride = stride;
+	osd_copy_w = w;
+	osd_copy_h = h;
+	if (p && p->out) {
+		osd_copy_w = LV_MIN(osd_copy_w, p->out->osd_bufs[0].width);
+		osd_copy_h = LV_MIN(osd_copy_h, p->out->osd_bufs[0].height);
+	}
+	// What is on screen now (LVGL may be drawing into the shadow this very
+	// moment; the next flush puts that area right).
+	if (lvgl_shadow) {
+		osd_copy_sync(true);
+		osd_copy_area(0, 0, (int32_t)osd_copy_w - 1, (int32_t)osd_copy_h - 1);
+		osd_copy_sync(false);
+	}
+	if (osd_layer.drm_format != DRM_FORMAT_ARGB8888) {
+		osd_layer.argb8888_fd = fd;
+		osd_layer.argb8888_stride = stride;
+	}
+	osd_layer.serial++;
 }
 
 static void osd_convert_argb4444(struct modeset_buf *dst, const lv_area_t *a)
