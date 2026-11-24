@@ -267,12 +267,14 @@ over plain HTTP - no AR8030 library needed), which reads them from the chip's `B
 | `ar8030.tx.chan`       | int    | TX channel, index into the chip's channel table                        |
 | `ar8030.tx.freq_mhz`   | int    | TX frequency, MHz                                                      |
 | `ar8030.tx.power`      | int    | TX power target, chip dBm                                              |
+| `ar8030.tx.bandwidth_mhz` | string | TX bandwidth, MHz as text (`20`, `2.5`, ...), so `%s` shows it as is |
 | `ar8030.distance_m`    | int    | link distance, metres (the chip's ranging, as the stock UI's "%1m")    |
 
 All but `signal_level` and `distance_m` are tagged `side` = `ground` or `air`; `rx.gain` additionally `path` =
 `a`/`b`. So `ar8030.rx.snr_db{side=ground}` is the video downlink as received on the goggles and
 `{side=air}` the uplink as received by the air unit (the stock UI's G-SNR / S-SNR), and
-`ar8030.tx.mcs{side=air}` is the video MCS. `signal_level` mirrors the stock UI's bars: from the
+`ar8030.tx.mcs{side=air}` / `ar8030.tx.bandwidth_mhz{side=air}` are the video's MCS and bandwidth
+(the ground's chip steps the bandwidth while the air unit's setting is `auto`). `signal_level` mirrors the stock UI's bars: from the
 video MCS (minus 2) `< 3` -> 1, `3..4` -> 2, `>= 5` -> 4, or 3 while the ground sees frame errors.
 The facts are only published in Artosyn mode; without a link only `signal_level` = 0 remains and
 the per-side facts are dropped to undefined, so widgets hide (`IconSelectorWidget`) or show `?`

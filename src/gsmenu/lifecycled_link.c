@@ -34,6 +34,7 @@ typedef struct {
     long   ldpc_err;
     long   gain_a, gain_b;
     long   tx_mcs, tx_chan, tx_power, tx_freq_khz;
+    char   tx_bw_mhz[8]; /* "20", "2.5", ...; "" when lifecycled doesn't report it */
 } link_side_t;
 
 typedef struct {
@@ -84,6 +85,7 @@ static bool parse_side(const char *buf, const char *key, link_side_t *s)
     if (get_num(obj, end, "tx_chan", &v))     s->tx_chan = (long)v;
     if (get_num(obj, end, "tx_power", &v))    s->tx_power = (long)v;
     if (get_num(obj, end, "tx_freq_khz", &v)) s->tx_freq_khz = (long)v;
+    if (get_num(obj, end, "tx_bandwidth_mhz", &v)) snprintf(s->tx_bw_mhz, sizeof(s->tx_bw_mhz), "%g", v);
     const char *g = find_key(obj, end, "gain");
     if (g) {
         sscanf(g, "[%ld,%ld]", &s->gain_a, &s->gain_b);
@@ -167,6 +169,10 @@ static void add_side_facts(void *batch, const link_side_t *s, const char *side)
     osd_add_int_fact(batch, "ar8030.tx.chan", tags, 1, s->tx_chan);
     osd_add_int_fact(batch, "ar8030.tx.freq_mhz", tags, 1, s->tx_freq_khz / 1000);
     osd_add_int_fact(batch, "ar8030.tx.power", tags, 1, s->tx_power);
+    if (s->tx_bw_mhz[0]) {
+        /* text, so a template shows 2.5 as 2.5 (%s) -- numeric placeholders still convert it */
+        osd_add_str_fact(batch, "ar8030.tx.bandwidth_mhz", tags, 1, s->tx_bw_mhz);
+    }
 }
 
 /* Publishes ar8030.* OSD facts (see README "Artosyn (AR8030) link facts").
