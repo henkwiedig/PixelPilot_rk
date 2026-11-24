@@ -13,6 +13,8 @@
 #include "gst/app/gstappsrc.h"
 #include "spdlog/spdlog.h"
 #include <gio/gio.h>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
 #include <stdexcept>
@@ -1502,6 +1504,40 @@ struct FrameShmAttach {
     }
 };
 
+// Bench test only: PIXELPILOT_TEST_LATENCY_SPIKE=<ms>,<hold s>,<every s>
+// holds every ring entry back <ms> for the last <hold s> of every <every s>
+// (from the reader's start), then lets the held ones go at once -- a link
+// queue that builds up and drains, as in the 5 MHz flight of 11-23
+// (vsync_lock.cpp). As in flight the frames keep coming at the camera's rate
+// throughout, apart from the gap at the start and the burst at the end.
+struct LatencySpike {
+    uint64_t delay_us = 0, hold_us = 0, every_us = 0, start_us = 0;
+    std::deque<std::pair<uint64_t, std::vector<uint8_t>>> held;  // (arrival, entry)
+    bool on = false;
+
+    explicit LatencySpike(uint64_t now_us) {
+        const char* s = getenv("PIXELPILOT_TEST_LATENCY_SPIKE");
+        double ms = 0, hold = 0, every = 0;
+        if (!s || sscanf(s, "%lf,%lf,%lf", &ms, &hold, &every) != 3 || ms <= 0 || hold <= 0 || every <= hold)
+            return;
+        delay_us = (uint64_t)(ms * 1000);
+        hold_us = (uint64_t)(hold * 1e6);
+        every_us = (uint64_t)(every * 1e6);
+        start_us = now_us;
+        spdlog::warn("[RING] TEST: {} ms more latency for {} s of every {} s", ms, hold, every);
+    }
+    bool enabled() const { return every_us != 0; }
+    uint64_t delay(uint64_t now_us) {
+        const bool spike = (now_us - start_us) % every_us >= every_us - hold_us;
+        if (spike != on) {
+            on = spike;
+            spdlog::warn("[RING] TEST: latency spike {} ({} entries held)", on ? "starts" : "ends, releasing",
+                         held.size());
+        }
+        return spike ? delay_us : 0;
+    }
+};
+
 // Between the ring reader and the decoder's feed: what the RTP path's socket
 // buffer (udpsrc buffer-size) held, ~0.75 s at 22 Mbit/s.
 static constexpr size_t kRingQueueBytes = 2 * 1024 * 1024;
@@ -1742,9 +1778,11 @@ void GstRtpReceiver::loop_read_frame_shm() {
     }
     FrameShmAttach r(m_frame_shm);
     std::vector<uint8_t> slot;
+    LatencySpike spike(steady_us());
 
     while (m_pull_samples_run) {
         if (!r.ring && r.attach("video")) {
+            spike.held.clear();
             slot.resize(r.ring->slot_data_size);
             {
                 // The feed thread starts over: the queued entries are the
@@ -1761,10 +1799,24 @@ void GstRtpReceiver::loop_read_frame_shm() {
         }
         if (r.ring) {
             uint32_t len = 0;
-            if (venc_frame_ring_read_wait(r.ring, slot.data(), (uint32_t)slot.size(), &len, 100) == 0)
-                queue_frame_shm_entry(slot.data(), len);
-            else
+            const int timeout_ms = spike.held.empty() ? 100 : 2;
+            if (venc_frame_ring_read_wait(r.ring, slot.data(), (uint32_t)slot.size(), &len, timeout_ms) == 0) {
+                if (spike.enabled())
+                    spike.held.emplace_back(steady_us(), std::vector<uint8_t>(slot.data(), slot.data() + len));
+                else
+                    queue_frame_shm_entry(slot.data(), len);
+            } else if (spike.held.empty()) {
                 r.replaced();
+            }
+            if (spike.enabled()) {
+                const uint64_t now = steady_us();
+                const uint64_t delay = spike.delay(now);
+                while (!spike.held.empty() && now - spike.held.front().first >= delay) {
+                    queue_frame_shm_entry(spike.held.front().second.data(),
+                                          (uint32_t)spike.held.front().second.size());
+                    spike.held.pop_front();
+                }
+            }
         }
         tick_stream_presence();
     }
