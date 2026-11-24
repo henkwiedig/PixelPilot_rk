@@ -90,6 +90,30 @@ void VsyncLock::set_spread(double spread_quantile, double max_margin_ms, double 
 // Smoothness 5, the same drops and latency, fewer drops after a latency step.
 static const double kTargetFallShare = 0.5;
 
+// That pace is ~0.5 ms a second: fine for the margin's few ms, not for the
+// hundreds a link queue adds. A flight at 5 MHz (11-23): the link held the
+// frames back 200-500 ms for ~20 s, the lock locked onto that, and when the
+// link came back the target needed ~15 min to fall again -- every frame
+// waited ~330 ms for its vblank meanwhile. So once the target is at least
+// kSnapRefreshes refreshes above where it should be, it drops by whole
+// refreshes at once: each frame's due time moves by whole vblanks, so the
+// phase (and the lock) stays; the frames waiting get skipped once, as after
+// any late burst. What is left, less than a refresh, falls as before.
+static const double kSnapRefreshes = 2;
+
+// The frames waiting for their vblank hold decoder buffers: a CAPTURE buffer
+// goes back only after a newer frame was shown (v4l2_decoder.h). Waiting
+// longer than the spare buffers last starves the decoder -- in that flight
+// it took no input for 100 ms at a time, the ring reader dropped its backlog
+// every ~0.6 s and asked for an IDR each time, and the latency those stalls
+// added kept the target up. The median frame never waits more than
+// kMaxWaitFrames frame intervals: V4L2 keeps two CAPTURE buffers for frames
+// waiting for their flip, the DVR re-encoder's one is free while it doesn't
+// record (kExtraCaptureBuffers); the MPP pool has more. 3 intervals at 60 fps
+// are 50 ms, above every Smoothness level's wait (level 7: ~40 ms), so only
+// a target far off is cut.
+static const double kMaxWaitFrames = 3;
+
 // Locked once the error stays under kLockMs for kLockTicks ticks, lost when
 // it exceeds kUnlockMs.
 static const double kLockMs = 1.0, kUnlockMs = 3.0;
@@ -506,20 +530,63 @@ void VsyncLock::tick(uint64_t now_us) {
 					deviation_count_++;
 			}
 			update_margin();
-			const double target = median_lat + margin_us_ + extra_us_.load() + guard_us_ + lead_us_;
+			double target = median_lat + margin_us_ + extra_us_.load() + guard_us_ + lead_us_;
+			// No more waiting than the decoder's spare buffers last.
+			const double max_wait_us = kMaxWaitFrames * ratio * period_us_;
+			target = std::min(target, median_lat + max_wait_us);
+			bool starving = false;
 			if (slot_mode_ && dt_s > 0) {
-				double step = 0.2 * (target - target_lat_us_);
-				const double max_fall_us =
-					kTargetFallShare * (kMaxPpm - (ff_valid_ ? ff_ppm_ : 0.0)) * dt_s;
-				step = std::max(step, -max_fall_us);
-				target_lat_us_ += step;
-				// A later target needs later vblanks: a slower refresh.
-				slope_ppm = -step / dt_s;
+				const double excess = target_lat_us_ - target;
+				const double over_us = target_lat_us_ - (median_lat + max_wait_us);
+				if (excess >= kSnapRefreshes * period_us_ && over_us > 0) {
+					// Far too high and starving the decoder: the median
+					// frame itself comes out of the decoder late, held up by
+					// the frames waiting here, and with one buffer back per
+					// vblank that backlog never drains (bench, 300 ms spike:
+					// lowering the target by whole refreshes took ~10 s). So
+					// the newest frame at each vblank for a tick: the decoder
+					// catches up at its own speed, and the lock starts over
+					// from fresh samples.
+					starving = true;
+					snaps_++;
+					spdlog::info("vsync lock: target {:.1f} ms, frames wait {:.1f} ms, longer than the decoder's "
+					             "buffers last: newest frames until it caught up, then the lock anew",
+					             target_lat_us_ / 1000, (target_lat_us_ - median_lat) / 1000);
+					std::lock_guard<std::mutex> lk(mutex_);
+					sample_count_ = 0;
+				} else {
+					// Far too high (excess), or waiting longer than the
+					// buffers last (over_us): down by whole refreshes at
+					// once, the phase stays.
+					int k = 0;
+					if (over_us > 0)
+						k = (int)std::ceil(over_us / period_us_);
+					if (excess >= kSnapRefreshes * period_us_)
+						k = std::max(k, (int)std::floor(excess / period_us_));
+					if (k > 0) {
+						if (now_us - last_snap_log_us_ >= 2000000) {
+							last_snap_log_us_ = now_us;
+							spdlog::info("vsync lock: target {:.1f} ms, frames wait {:.1f} ms ({:.1f} ms above "
+							             "where it belongs): {} refreshes earlier at once",
+							             target_lat_us_ / 1000, (target_lat_us_ - median_lat) / 1000,
+							             excess / 1000, k);
+						}
+						target_lat_us_ -= k * period_us_;
+						snaps_++;
+					}
+					double step = 0.2 * (target - target_lat_us_);
+					const double max_fall_us =
+						kTargetFallShare * (kMaxPpm - (ff_valid_ ? ff_ppm_ : 0.0)) * dt_s;
+					step = std::max(step, -max_fall_us);
+					target_lat_us_ += step;
+					// A later target needs later vblanks: a slower refresh.
+					slope_ppm = -step / dt_s;
+				}
 			} else {
 				target_lat_us_ = target;
 			}
-			slot_mode_ = true;
-			wait_ms = (target_lat_us_ - median_lat) / 1000.0;
+			slot_mode_ = !starving;
+			wait_ms = starving ? 0 : (target_lat_us_ - median_lat) / 1000.0;
 
 			// The due times against the vblanks (circular mean): the capture
 			// grid is regular, so this hardly needs averaging.
@@ -531,7 +598,8 @@ void VsyncLock::tick(uint64_t now_us) {
 				s += std::sin(a);
 				c += std::cos(a);
 			}
-			err_ms = std::atan2(s, c) / (2 * M_PI) * period_us_ / 1000.0;
+			// Starting over: no phase to hold this tick.
+			err_ms = starving ? 0 : std::atan2(s, c) / (2 * M_PI) * period_us_ / 1000.0;
 		} else {
 			slot_mode_ = false;
 			// The newest frame goes out at each deadline: hold the median
@@ -636,10 +704,12 @@ void VsyncLock::tick(uint64_t now_us) {
 		}
 		spdlog::info("vsync lock: {} {} ppm, err {:+.1f} ms, margin {:.1f} wait {:.1f} lead {:.2f} ms, "
 		             "latency p50 {:.1f} p99 {:.1f} max {:.1f} target {:.1f} ms; "
-		             "last 10 s: {:.0f} drops, {:.0f} misses, {} clock steps (largest {:.1f} ms)",
+		             "last 10 s: {:.0f} drops, {:.0f} misses, {} clock steps (largest {:.1f} ms), "
+		             "{} target drops",
 		             state, ppm_, err_ms, margin_us_ / 1000, wait_ms, lead_us_ / 1000.0, lat_p50_ms,
 		             lat_p99_ms, lat_max_ms, target_lat_us_ / 1000, rate_drops, rate_misses, steps,
-		             largest_step_us / 1000);
+		             largest_step_us / 1000, snaps_);
+		snaps_ = 0;
 	}
 
 	if (dump_) {

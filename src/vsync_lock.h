@@ -46,6 +46,11 @@
 // catches those outliers without having seen them, and since it doesn't move
 // with the window it costs the lock nothing (see vsync_lock.cpp).
 //
+// The target rises at once and falls slowly (by the trim's pace), except when
+// it is whole refreshes too high -- a link queue that built up and drained --
+// or the frames would wait longer than the decoder's spare buffers last: then
+// it drops by whole refreshes at once, which keeps the phase (vsync_lock.cpp).
+//
 // The capture timestamps come mapped onto this clock by the receiver's
 // clock sync, and that mapping steps whenever the sync moves to another
 // probe: by a millisecond or so on the bench, more over the AR8030 in
@@ -208,6 +213,8 @@ private:
 	double margin_us_ = 0;
 	bool slot_mode_ = false;
 	double target_lat_us_ = 0;  // capture -> vblank
+	unsigned snaps_ = 0;        // target drops by whole refreshes, since the last summary
+	uint64_t last_snap_log_us_ = 0;
 	bool locked_ = false;
 	int lock_ticks_ = 0;
 	uint64_t last_tick_us_ = 0;
