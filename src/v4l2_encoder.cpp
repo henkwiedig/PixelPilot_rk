@@ -11,6 +11,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <chrono>
+
 #include <linux/videodev2.h>
 
 // Newer than the toolchain's kernel headers (Linux 6.0).
@@ -76,12 +79,13 @@ void V4l2Encoder::enqueue(Rpc rpc) {
     if (write(wake_fd_, &one, sizeof(one)) < 0) {}
 }
 
-void V4l2Encoder::push_frame(V4l2Decoder *dec, const V4l2Decoder::Frame &frame) {
+void V4l2Encoder::push_frame(V4l2Decoder *dec, const V4l2Decoder::Frame &frame, uint64_t ts_us) {
     dec->ref(frame.index);
     Rpc rpc;
     rpc.command = Rpc::FRAME;
     rpc.dec = dec;
     rpc.frame = frame;
+    rpc.ts_us = ts_us;
     enqueue(std::move(rpc));
 }
 
@@ -532,10 +536,14 @@ void V4l2Encoder::encode(const Rpc &rpc) {
     planes[0].m.fd = in.fd;
     planes[0].length = in.size;
     planes[0].bytesused = in.size;
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    buf.timestamp.tv_sec = ts.tv_sec;
-    buf.timestamp.tv_usec = ts.tv_nsec / 1000;
+    uint64_t ts_us = rpc.ts_us;
+    if (!ts_us) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        ts_us = (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+    }
+    buf.timestamp.tv_sec = ts_us / 1000000;
+    buf.timestamp.tv_usec = ts_us % 1000000;
     if (xioctl(fd_, VIDIOC_QBUF, &buf)) {
         spdlog::warn("V4L2 encoder: QBUF (frame): {}", strerror(errno));
         rpc.dec->unref(f.index);
@@ -609,13 +617,27 @@ void V4l2Encoder::collect_output() {
         if (used && !(buf.flags & V4L2_BUF_FLAG_ERROR) && buf.index < coded_.size() &&
             used <= coded_[buf.index].second && output_cb) {
             const uint8_t *data = (const uint8_t *)coded_[buf.index].first + planes[0].data_offset;
-            output_cb(std::make_shared<std::vector<uint8_t>>(data, data + used));
+            output_cb(std::make_shared<std::vector<uint8_t>>(data, data + used),
+                      (uint64_t)buf.timestamp.tv_sec * 1000000 + buf.timestamp.tv_usec);
         }
         buf.length = 1;
         planes[0].bytesused = 0;
         if (xioctl(fd_, VIDIOC_QBUF, &buf))
             spdlog::warn("V4L2 encoder: QBUF (coded): {}", strerror(errno));
     }
+}
+
+// A frame waits at most this long for the decoder to finish a newer one before
+// it goes to the encoder anyway (an access unit the decoder drops never comes
+// out).
+static constexpr uint64_t kDecodeWaitUs = 15000;
+// More frames than this waiting for the encoder: the oldest goes.
+static constexpr size_t kMaxPending = 3;
+
+static uint64_t mono_us() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
 
 FrameProcessor::FrameProcessor(V4l2Encoder *enc, int fps, EncResolution res, int drm_fd,
@@ -628,31 +650,55 @@ FrameProcessor::FrameProcessor(V4l2Encoder *enc, int fps, EncResolution res, int
 
 FrameProcessor::~FrameProcessor() {
     std::lock_guard<std::mutex> lk(mtx);
-    drop_latest();
+    drop_all();
 }
 
-void FrameProcessor::drop_latest() {
-    if (dec_ && latest_.index >= 0)
-        dec_->unref(latest_.index);
+void FrameProcessor::drop_all() {
+    if (dec_) {
+        for (const Pending &p : pending_)
+            dec_->unref(p.frame.index);
+        if (latest_.index >= 0)
+            dec_->unref(latest_.index);
+    }
+    pending_.clear();
     latest_ = V4l2Decoder::Frame();
 }
 
-void FrameProcessor::push_latest(V4l2Decoder *dec, const V4l2Decoder::Frame &frame) {
-    std::lock_guard<std::mutex> lk(mtx);
-    drop_latest();
-    // Not recording: hold nothing, encode nothing.
-    if (!running || !dvr_enabled)
-        return;
-    dec->ref(frame.index);
-    dec_ = dec;
-    latest_ = frame;
+void FrameProcessor::push_latest(V4l2Decoder *dec, const V4l2Decoder::Frame &frame, uint64_t capture_us,
+                                 uint64_t decoded_us) {
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        // Not recording: hold nothing, encode nothing.
+        if (!running || !dvr_enabled) {
+            drop_all();
+            return;
+        }
+        dec_ = dec;
+        uint64_t ts;
+        if (timeline_.stamp(capture_us, decoded_us, &ts)) {
+            dec->ref(frame.index);
+            pending_.push_back({frame, ts, decoded_us});
+            while (pending_.size() > kMaxPending) {
+                dec->unref(pending_.front().frame.index);
+                pending_.pop_front();
+                stats_.overflowed++;
+            }
+        } else {
+            stats_.late++;
+        }
+        if (latest_.index >= 0)
+            dec->unref(latest_.index);
+        dec->ref(frame.index);
+        latest_ = frame;
+    }
+    cv.notify_all();
 }
 
 void FrameProcessor::shutdown() {
     {
         std::lock_guard<std::mutex> lk(mtx);
         running = false;
-        drop_latest();
+        drop_all();
     }
     cv.notify_all();
 }
@@ -681,7 +727,7 @@ void FrameProcessor::set_osd_blend(int prime_fd, uint32_t w, uint32_t h, uint32_
 void FrameProcessor::drain_decoder_refs() {
     {
         std::lock_guard<std::mutex> lk(mtx);
-        drop_latest();
+        drop_all();
     }
     encoder->drop_frames();
 }
@@ -692,64 +738,67 @@ void *FrameProcessor::__THREAD__(void *p) {
     return nullptr;
 }
 
-// The live picture is behind when an entry has waited this long for its decoder
-// (a frame at 30 fps; the ring queue drops the backlog at 200 ms), and has caught
-// up again once the wait is below kLiveCaughtUpUs. Yielding until then, not just
-// until it is under kLiveBehindUs, lets the backlog drain instead of settling at
-// that much extra latency.
-static constexpr uint32_t kLiveBehindUs = 33000;
-static constexpr uint32_t kLiveCaughtUpUs = 8000;
+// The live picture first. Its decoder shares the codec with the encoder;
+// while it is behind (frames waiting for it), the encoder gets no frame, so
+// the codec goes to the decoder. The recording holds the last frame for that
+// while.
+bool FrameProcessor::hand_over(const V4l2Decoder::Frame &f, uint64_t ts_us) {
+    if (live_.live_behind()) {
+        stats_.yielded++;
+        return false;
+    }
+    encoder->push_frame(dec_, f, ts_us);
+    return true;
+}
 
 void FrameProcessor::loop() {
-    struct timespec next;
-    clock_gettime(CLOCK_MONOTONIC, &next);
-    for (;;) {
-        long interval;
-        {
-            std::lock_guard<std::mutex> lk(mtx);
-            if (!running)
-                break;
-            interval = interval_ns;
-        }
-        next.tv_nsec += interval;
-        while (next.tv_nsec >= 1000000000L) {
-            next.tv_nsec -= 1000000000L;
-            next.tv_sec++;
-        }
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        // Fell behind by more than a frame: start counting from now.
-        if (now.tv_sec > next.tv_sec + 1 ||
-            (now.tv_sec - next.tv_sec) * 1000000000L + (now.tv_nsec - next.tv_nsec) > interval)
-            next = now;
-        while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL) == EINTR) {}
-
-        std::lock_guard<std::mutex> lk(mtx);
-        if (!running)
-            break;
+    std::unique_lock<std::mutex> lk(mtx);
+    bool waiting = false;   // the frames in pending_ already wait for the decoder
+    while (running) {
+        const uint64_t now = mono_us();
         if (!dvr_enabled) {
-            drop_latest();
-        } else if (dec_ && latest_.index >= 0) {
-            // The live picture first. Its decoder shares the codec with this
-            // encoder; while it is behind (frames waiting for it), the encoder
-            // gets no frame, so the codec goes to the decoder. The recording
-            // repeats the last frame for that while.
-            const uint32_t backlog = g_live_backlog_us.load(std::memory_order_relaxed);
-            if (backlog > kLiveBehindUs)
-                yielding_ = true;
-            else if (backlog < kLiveCaughtUpUs)
-                yielding_ = false;
-            if (yielding_)
-                yielded_++;
-            else
-                encoder->push_frame(dec_, latest_);
-            const uint64_t now_ms = (uint64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
-            if (yielded_ && now_ms - yield_log_ms_ >= 5000) {
-                spdlog::warn("DVR re-encode: {} frames skipped for the live picture (its decoder was behind)",
-                             yielded_);
-                yielded_ = 0;
-                yield_log_ms_ = now_ms;
+            drop_all();
+            cv.wait_for(lk, std::chrono::milliseconds(100));
+            continue;
+        }
+
+        if (!pending_.empty()) {
+            // The decoder is at work on a newer access unit: it finishes
+            // first, so the encoder never holds the next live frame up. That
+            // frame comes out, or the wait runs out.
+            const uint64_t wait_end = pending_.front().decoded_us + kDecodeWaitUs;
+            if (dec_ && dec_->last_fed_pts() > latest_.pts_us && now < wait_end) {
+                if (!waiting)
+                    stats_.waited++;
+                waiting = true;
+                cv.wait_for(lk, std::chrono::microseconds(wait_end - now));
+                continue;
             }
+            waiting = false;
+            // In order, each once; at a recording frame rate below the
+            // camera's, one at most every interval.
+            const uint64_t interval_us = (uint64_t)interval_ns / 1000;
+            while (!pending_.empty()) {
+                const Pending p = pending_.front();
+                pending_.pop_front();
+                if (timeline_.due(p.ts_us, interval_us) && hand_over(p.frame, p.ts_us))
+                    timeline_.encoded(p.ts_us);
+                dec_->unref(p.frame.index);
+            }
+            stats_.log(now, kMaxPending);
+            continue;
+        }
+
+        // No new frame. Through a link loss, the last one again now and then.
+        const uint64_t fill_at = latest_.index >= 0 ? timeline_.fill_at() : 0;
+        if (!fill_at) {
+            cv.wait_for(lk, std::chrono::milliseconds(500));
+        } else if (now >= fill_at) {
+            hand_over(latest_, timeline_.fill_stamp(now));
+            stats_.fills++;
+            stats_.log(now, kMaxPending);
+        } else {
+            cv.wait_for(lk, std::chrono::microseconds(fill_at - now));
         }
     }
     spdlog::info("Frame pacer done.");

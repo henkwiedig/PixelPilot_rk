@@ -502,7 +502,9 @@ void init_buffer(MppFrame frame) {
 // Hands a decoded frame to the display thread -- or, with --front-buffer,
 // copies it (from src_fd) into the scanned-out buffer right away. ats: when
 // the decoder handed the frame out; feed_data_ts: its pts, when it was fed.
-static void display_decoded_frame(int fb_id, int src_fd, uint64_t feed_data_ts, const struct timespec &ats)
+// Returns when the camera took the frame, on the ground clock (the vsync
+// lock's steadied value when it runs), or 0 if the stream doesn't say.
+static uint64_t display_decoded_frame(int fb_id, int src_fd, uint64_t feed_data_ts, const struct timespec &ats)
 {
 	int ret;
 	FrameTiming timing;
@@ -528,7 +530,7 @@ static void display_decoded_frame(int fb_id, int src_fd, uint64_t feed_data_ts, 
 		assert(!ret);
 		ret = pthread_mutex_unlock(&video_mutex);
 		assert(!ret);
-		return;
+		return timing.pts_us ? timing.sei.capture_ground_us : 0;
 	}
 
 	// send DRM FB to display thread
@@ -557,6 +559,9 @@ static void display_decoded_frame(int fb_id, int src_fd, uint64_t feed_data_ts, 
 	assert(!ret);
 	ret = pthread_mutex_unlock(&video_mutex);
 	assert(!ret);
+	if (vsync_lock_mode)
+		return capture_us;
+	return timing.pts_us ? timing.sei.capture_ground_us : 0;
 }
 
 // Decoder error/discard rates over time: these are otherwise completely
@@ -672,9 +677,12 @@ void *__FRAME_THREAD__(void *param)
 			if (f.error)
 				idr_request_decoder_issue("decoder-errinfo");
 			count_decoder_health(f.error, false, ats);
-			display_decoded_frame((int)f.fb_id, f.dmabuf_fd, f.pts_us, ats);
-			if (frame_proc != nullptr)
-				frame_proc->push_latest(v4l2_dec, f);
+			{
+				const uint64_t capture_us = display_decoded_frame((int)f.fb_id, f.dmabuf_fd, f.pts_us, ats);
+				if (frame_proc != nullptr)
+					frame_proc->push_latest(v4l2_dec, f, capture_us,
+					                        (uint64_t)ats.tv_sec * 1000000 + ats.tv_nsec / 1000);
+			}
 			break;
 		case V4l2Decoder::Result::FormatChanged:
 			forget_pending_frames();
@@ -783,7 +791,8 @@ void *__FRAME_THREAD__(void *param)
 
 					// --front-buffer copies before the decoder gets this
 					// buffer back (mpp_frame_deinit below).
-					display_decoded_frame((int)mpi.frame_to_drm[i].fb_id, info.fd, feed_data_ts, ats);
+					const uint64_t capture_us =
+						display_decoded_frame((int)mpi.frame_to_drm[i].fb_id, info.fd, feed_data_ts, ats);
 
 					if (frame_proc != nullptr &&
 					    decoded_hor_stride > 0 && decoded_ver_stride > 0) {
@@ -792,7 +801,8 @@ void *__FRAME_THREAD__(void *param)
 						                       output_list->video_frm_width,
 						                       output_list->video_frm_height,
 						                       decoded_hor_stride,
-						                       decoded_ver_stride, fmt);
+						                       decoded_ver_stride, fmt, capture_us,
+						                       (uint64_t)ats.tv_sec * 1000000 + ats.tv_nsec / 1000);
 					}
 				} else {
 					spdlog::warn("dropping frame (buffer={}, discard={})", buffer ? "ok" : "null", discard);
@@ -1332,6 +1342,14 @@ static inline bool dvr_mode_has_reenc() {
 	return dvr_mode == DVR_MODE_REENCODE || dvr_mode == DVR_MODE_BOTH;
 }
 
+// The DVR re-encoder, its pictures going to the receiver's re-encode recorder,
+// stamped with their frames' capture times (FrameProcessor).
+static VideoEncoder *new_reencoder() {
+	return new VideoEncoder(reenc_params, [](std::shared_ptr<std::vector<uint8_t>> nal, uint64_t ts_us) {
+		if (dvr_enabled && receiver) receiver->dvr_reenc_push(nal, ts_us);
+	});
+}
+
 // Base path (no extension) for the re-encode recording; _reenc suffix in BOTH.
 static std::string dvr_reenc_next_base_path() {
 	if (!dvr_template) return "";
@@ -1588,10 +1606,7 @@ extern "C" {
         // Create encoder pipeline if newly needed. The re-encoded NALs are muxed
         // (with Opus) by the receiver's reenc recorder, not a minimp4 Dvr.
         if (new_has_reenc && !reencoder && dvr_template) {
-            reencoder = new VideoEncoder(reenc_params,
-                             [](std::shared_ptr<std::vector<uint8_t>> nal) {
-                                 if (dvr_enabled && receiver) receiver->dvr_reenc_push(nal);
-                             });
+            reencoder = new_reencoder();
             pthread_create(&g_tid_enc, NULL, &VideoEncoder::__THREAD__, reencoder);
             frame_proc = new FrameProcessor(reencoder, reenc_params.fps, reenc_params.resolution, drm_fd,
                                            dvr_reenc_on_fatal_error);
@@ -3200,9 +3215,7 @@ int main(int argc, char **argv)
 		// spin up the MPP encoder + frame pacer that feed the reenc recorder; the
 		// encoder output is pushed to the receiver via dvr_reenc_push().
 		if (has_reenc) {
-			reencoder = new VideoEncoder(reenc_params, [](std::shared_ptr<std::vector<uint8_t>> nal) {
-				if (dvr_enabled && receiver) receiver->dvr_reenc_push(nal);
-			});
+			reencoder = new_reencoder();
 			ret = pthread_create(&g_tid_enc, NULL, &VideoEncoder::__THREAD__, reencoder);
 			assert(!ret);
 			frame_proc = new FrameProcessor(reencoder, reenc_params.fps, reenc_params.resolution, drm_fd,

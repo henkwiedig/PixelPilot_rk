@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include <atomic>
 #include <mutex>
 #include <vector>
 
@@ -65,6 +66,9 @@ public:
 
     // Waits up to timeout_ms for the next decoded frame or event.
     Result next(Frame *out, int timeout_ms);
+    // The pts_us of the newest access unit fed: while it is newer than the
+    // newest frame out, the decoder is at work on it (or dropped it).
+    uint64_t last_fed_pts() const { return last_fed_pts_.load(std::memory_order_relaxed); }
     // Geometry of the current CAPTURE buffers (after FormatChanged).
     const Frame &format() const { return format_; }
 
@@ -113,6 +117,7 @@ private:
     };
     std::vector<Output> outputs_;
     std::mutex out_mtx_;
+    std::atomic<uint64_t> last_fed_pts_{0};
 
     std::vector<Capture> captures_;
     std::mutex mtx_;              // captures_ and the display bookkeeping

@@ -288,6 +288,7 @@ bool V4l2Decoder::feed(const uint8_t *data, size_t size, uint64_t pts_us, int ti
         data += n;
         size -= n;
     }
+    last_fed_pts_.store(pts_us, std::memory_order_relaxed);
     return true;
 }
 

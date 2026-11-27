@@ -11,10 +11,10 @@ MppEncoder::~MppEncoder() {
     cleanup_encoder();
 }
 
-void MppEncoder::push_frame(MppBuffer buffer,
-                             uint32_t width, uint32_t height,
-                             uint32_t hor_stride, uint32_t ver_stride,
-                             MppFrameFormat fmt, uint64_t pts) {
+uint64_t MppEncoder::push_frame(MppBuffer buffer,
+                                 uint32_t width, uint32_t height,
+                                 uint32_t hor_stride, uint32_t ver_stride,
+                                 MppFrameFormat fmt, uint64_t pts) {
     EncRpc rpc;
     rpc.command    = EncRpc::RPC_FRAME;
     rpc.buffer     = buffer;
@@ -24,7 +24,19 @@ void MppEncoder::push_frame(MppBuffer buffer,
     rpc.ver_stride = ver_stride;
     rpc.fmt        = fmt;
     rpc.pts        = pts;
-    enqueue(std::move(rpc));
+    uint64_t seq;
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        seq = ++submitted_;
+        queue.push(std::move(rpc));
+    }
+    cv.notify_one();
+    return seq;
+}
+
+bool MppEncoder::wait_done(uint64_t seq, int timeout_ms) {
+    std::unique_lock<std::mutex> lock(done_mtx_);
+    return done_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] { return done_ >= seq; });
 }
 
 void MppEncoder::request_idr() {
@@ -91,6 +103,11 @@ void MppEncoder::loop() {
 
         case EncRpc::RPC_FRAME:
             encode_frame(rpc);
+            {
+                std::lock_guard<std::mutex> done_lock(done_mtx_);
+                done_++;
+            }
+            done_cv_.notify_all();
             break;
 
         case EncRpc::RPC_SET_BITRATE:
@@ -271,7 +288,7 @@ void MppEncoder::encode_frame(EncRpc &rpc) {
     // especially for H265 which also needs VPS.
     if (!headers_sent && !extra_data.empty() && output_cb) {
         spdlog::info("MPP encoder: sending headers {}B to DVR", extra_data.size());
-        output_cb(std::make_shared<std::vector<uint8_t>>(extra_data));
+        output_cb(std::make_shared<std::vector<uint8_t>>(extra_data), rpc.pts);
         headers_sent = true;
     }
 
@@ -316,7 +333,7 @@ void MppEncoder::encode_frame(EncRpc &rpc) {
         if (len > 0 && output_cb) {
             output_cb(std::make_shared<std::vector<uint8_t>>(
                 static_cast<uint8_t *>(data),
-                static_cast<uint8_t *>(data) + len));
+                static_cast<uint8_t *>(data) + len), rpc.pts);
         }
         mpp_packet_deinit(&packet);
     }

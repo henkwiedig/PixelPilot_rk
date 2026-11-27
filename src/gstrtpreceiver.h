@@ -139,12 +139,17 @@ public:
     // Muxes the MPP-re-encoded video (pushed via dvr_reenc_push, e.g. from the
     // encoder's output callback) with the SAME Opus audio into a second mp4 via
     // its own appsrc->splitmuxsink branch. Unlike the raw recorder the video is
-    // on a wall-clock/re-paced timeline (not the RTP clock), so this is a live
-    // mux (appsrc do-timestamp) — sync is close but a small constant offset may
-    // remain. codec is the re-encoder's output codec (sets the appsrc caps).
+    // on a wall-clock timeline (not the RTP clock), so this is a live mux: each
+    // picture is stamped as it comes in (appsrc do-timestamp), or, from the
+    // V4L2 re-encoder, by its capture time -- sync is close but a small
+    // constant offset may remain. codec is the re-encoder's output codec (sets
+    // the appsrc caps).
     void dvr_reenc_set_config(VideoCodec codec, int64_t max_size_bytes, std::function<std::string()> base_path_fn);
     void dvr_reenc_request_recording(bool on);
-    void dvr_reenc_push(std::shared_ptr<std::vector<uint8_t>> nal);
+    // ts_us: the picture's own time (CLOCK_MONOTONIC, us) -- the V4L2
+    // re-encoder passes the camera's capture time -- or 0 to stamp it as it
+    // comes in (do-timestamp).
+    void dvr_reenc_push(std::shared_ptr<std::vector<uint8_t>> nal, uint64_t ts_us = 0);
     bool dvr_reenc_is_recording() const { return m_dvr_reenc_active.load(std::memory_order_relaxed); }
     // Roll the re-encode file if one is open: call after an encoder codec/
     // resolution/fps change, whose new SPS/dimensions cannot be applied to an
@@ -276,6 +281,11 @@ private:
     GstElement* m_dvr_reenc_bin = nullptr;
     GstElement* m_dvr_reenc_appsrc = nullptr;
     std::mutex m_dvr_reenc_src_mutex;       // guards m_dvr_reenc_appsrc (pushed from encoder thread)
+    // Own timestamps onto the branch's running time (dvr_reenc_push), guarded
+    // by m_dvr_reenc_src_mutex; a new appsrc starts over.
+    bool m_dvr_reenc_ts_anchored = false;
+    int64_t m_dvr_reenc_ts_offset_ns = 0;
+    GstClockTime m_dvr_reenc_last_pts = GST_CLOCK_TIME_NONE;
     GstPad* m_dvr_reenc_tee_audio_pad = nullptr;
 };
 #endif

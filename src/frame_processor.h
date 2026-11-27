@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <mutex>
 
@@ -11,20 +12,23 @@
 
 #include "mpp_encoder.h"
 #include "frame_colorcorrect.h"
+#include "reenc_pacing.h"
 
 // ---------------------------------------------------------------------------
-// FrameProcessor: feeds MppEncoder at a steady fps regardless of incoming rate.
+// FrameProcessor: feeds MppEncoder every decoded frame once, stamped with its
+// camera capture time, so the recording holds the frames the link delivered
+// at the camera's own pace, however unevenly they arrived. (A timer of its own
+// used to take the newest processed frame at the recording's frame rate,
+// which skipped one frame and repeated the next whenever two came in within
+// a tick.)
 //
-//  Two internal threads:
-//   1. Processor thread (has GL context): receives decoded frames, performs
-//      copy/resize/color-correction/OSD-blend, publishes the result.
-//   2. Timer thread: wakes at target fps intervals and submits the latest
-//      processed frame to the encoder — or repeats the last one if none
-//      arrived, preventing a speedup effect when source fps < target fps.
-//
-//  Decoupling processing from pacing ensures the timer is never blocked by
-//  heavy image work.  Throughput is limited by the slowest single stage
-//  instead of the serial sum of all stages.
+// The processor thread (which has the GL context) copies / resizes /
+// colour-corrects / blends the OSD into one of two buffers of its own and
+// hands it to the encoder, then writes the next frame into the other one,
+// once the encoder is done with it. No frame goes to the recording while the
+// live picture is behind (ReencLiveGate). When no video comes for a while
+// (link loss), the last frame is encoded again at a low rate, so the
+// recording runs on and a recorded OSD keeps moving (ReencTimeline).
 // ---------------------------------------------------------------------------
 
 struct FrameProcFrame {
@@ -52,13 +56,18 @@ public:
     // is (re)started, e.g. from Dvr::on_start_cb).
     void clear_fatal_error() { reenc_fatal_.store(false, std::memory_order_relaxed); }
 
-    // Called from decoder thread: update the latest available frame.
+    // Called from the frame thread for every decoded frame (the processor
+    // takes its own reference). capture_us: its camera capture time on the
+    // ground clock, 0 if unknown; decoded_us: when the decoder handed it out.
+    // Both CLOCK_MONOTONIC, us.
     void push_latest(MppBuffer buf, uint32_t w, uint32_t h,
-                     uint32_t hs, uint32_t vs, MppFrameFormat fmt);
+                     uint32_t hs, uint32_t vs, MppFrameFormat fmt,
+                     uint64_t capture_us, uint64_t decoded_us);
 
     void shutdown();
 
-    // Live-update the pacing interval (thread-safe).
+    // Live-update the recording's frame rate (thread-safe): below the
+    // camera's, one frame at most every 1/fps s.
     void set_fps(int fps) { interval_ns.store(1000000000L / fps, std::memory_order_relaxed); }
 
     // Set encoder output resolution (thread-safe).
@@ -87,11 +96,17 @@ public:
     void set_osd_blend(int prime_fd, uint32_t w, uint32_t h, uint32_t stride_px);
 
     static void *__THREAD__(void *p);
-    static void *__TIMER_THREAD__(void *p);
 
 private:
+    struct Pending {
+        FrameProcFrame frame;
+        uint64_t ts_us = 0;   // the recording's timestamp
+    };
+
     void process_loop();
-    void timer_loop();
+    // Hands buf (with the reference taken for the encoder) to the encoder;
+    // returns its sequence number.
+    uint64_t submit(MppBuffer buf, const FrameProcFrame &meta, uint64_t ts_us);
 
     // Attempts CMA-backed (<4GB-guaranteed) allocation of proc_copy_ via a
     // raw DRM dumb buffer, bypassing MPP's buffer-group CONTIG/DMA32 flags
@@ -107,22 +122,23 @@ private:
     std::atomic<bool>     running{true};
     std::atomic<bool>     reenc_fatal_{false};  // set once a frame conversion fails
     std::function<void()> on_fatal_error_;      // invoked once when reenc_fatal_ is set
-    std::mutex              mtx;       // guards pending (shared with frame/decoder thread)
+    std::mutex              mtx;       // guards pending_, timeline_, stats_ (shared with the frame thread)
     std::condition_variable cv_;       // signalled by push_latest(); processor waits here
     std::mutex              copy_mtx_; // held by processor while it uses a decoder buffer
-    FrameProcFrame     pending;   // latest from decoder (shared with decoder thread)
-
-    // Shared between processor (writer) and timer (reader):
-    std::mutex              ready_mtx_;       // guards last_copy / last_meta
-    std::condition_variable ready_cv_;        // signalled when fresh frame published
-    bool                    ready_fresh_{false}; // true = last_copy updated since last pickup
-    MppBuffer         last_copy   = nullptr;  // latest processed frame pixels
-    FrameProcFrame     last_meta;              // geometry/format for last_copy
+    std::deque<Pending>     pending_;  // decoded, not processed yet (references held)
+    ReencTimeline           timeline_;
+    ReencStats              stats_;
 
     // Only accessed from the processor thread — no mutex needed:
     MppBufferGroup    hold_grp  = nullptr;  // our own DRM buffer pool
-    MppBuffer         proc_copy_  = nullptr;  // processor's working buffer
+    MppBuffer         proc_copy_  = nullptr;  // processor's working buffer: the next frame goes here
     FrameProcFrame     proc_meta_;              // metadata being built by processor
+    uint64_t          proc_seq_   = 0;        // encoder sequence number of proc_copy_'s last use
+    MppBuffer         last_copy   = nullptr;  // the frame handed to the encoder last
+    FrameProcFrame     last_meta;              // geometry/format for last_copy
+    uint64_t          last_seq_   = 0;        // its sequence number
+    bool              last_fresh_ = false;    // last_copy is of the current recording
+    ReencLiveGate     live_;
 
     // OSD blend — shared between OSD thread (writer) and processor thread (reader)
     struct OsdInfo {

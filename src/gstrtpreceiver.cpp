@@ -3074,12 +3074,38 @@ void GstRtpReceiver::dvr_reenc_roll() {
     m_dvr_reenc_roll_pending.store(true, std::memory_order_relaxed);
 }
 
-void GstRtpReceiver::dvr_reenc_push(std::shared_ptr<std::vector<uint8_t>> nal) {
+void GstRtpReceiver::dvr_reenc_push(std::shared_ptr<std::vector<uint8_t>> nal, uint64_t ts_us) {
     if (!nal || nal->empty()) return;
     std::lock_guard<std::mutex> lk(m_dvr_reenc_src_mutex);
     if (!m_dvr_reenc_appsrc) return;  // not recording (yet); drop
     GstBuffer* buf = gst_buffer_new_allocate(nullptr, nal->size(), nullptr);
     gst_buffer_fill(buf, 0, nal->data(), nal->size());
+    if (ts_us) {
+        // The picture's own time on the branch's running time: the first one
+        // where do-timestamp would have put it, the others as far from it as
+        // their own times are, so the recording keeps the pictures' spacing
+        // whatever the encoder's output timing. (A buffer with a PTS and DTS
+        // is left alone by do-timestamp.)
+        if (!m_dvr_reenc_ts_anchored) {
+            GstClock* clock = gst_element_get_clock(m_dvr_reenc_appsrc);
+            if (clock) {
+                const GstClockTime now = gst_clock_get_time(clock);
+                const GstClockTime base = gst_element_get_base_time(m_dvr_reenc_appsrc);
+                gst_object_unref(clock);
+                m_dvr_reenc_ts_offset_ns = (int64_t)(now > base ? now - base : 0) - (int64_t)ts_us * 1000;
+                m_dvr_reenc_ts_anchored = true;
+                m_dvr_reenc_last_pts = GST_CLOCK_TIME_NONE;
+            }
+        }
+        if (m_dvr_reenc_ts_anchored) {
+            int64_t pts = (int64_t)ts_us * 1000 + m_dvr_reenc_ts_offset_ns;
+            if (pts < 0) pts = 0;
+            if (GST_CLOCK_TIME_IS_VALID(m_dvr_reenc_last_pts) && (GstClockTime)pts <= m_dvr_reenc_last_pts)
+                pts = (int64_t)m_dvr_reenc_last_pts + GST_MSECOND;
+            GST_BUFFER_PTS(buf) = GST_BUFFER_DTS(buf) = (GstClockTime)pts;
+            m_dvr_reenc_last_pts = (GstClockTime)pts;
+        }
+    }
     if (gst_app_src_push_buffer(GST_APP_SRC(m_dvr_reenc_appsrc), buf) != GST_FLOW_OK) {
         // The branch is being torn down or blocked; drop quietly.
     }
@@ -3203,6 +3229,7 @@ void GstRtpReceiver::dvr_add_reenc_bin() {
     {
         std::lock_guard<std::mutex> lk(m_dvr_reenc_src_mutex);
         m_dvr_reenc_appsrc = src;
+        m_dvr_reenc_ts_anchored = false;
     }
     m_dvr_reenc_bin = bin;
     m_dvr_reenc_active.store(true, std::memory_order_relaxed);

@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <memory>
 #include <vector>
+#include <chrono>
 #include <functional>
 
 #include <rockchip/rk_mpi.h>
@@ -44,15 +45,23 @@ struct EncRpc {
 
 class MppEncoder {
 public:
-    using FrameCallback = std::function<void(std::shared_ptr<std::vector<uint8_t>>)>;
+    // An encoded picture (or the parameter sets ahead of one), with the pts
+    // its frame was pushed with (CLOCK_MONOTONIC, us).
+    using FrameCallback = std::function<void(std::shared_ptr<std::vector<uint8_t>>, uint64_t ts_us)>;
 
     explicit MppEncoder(MppEncoderParams params, FrameCallback cb);
     ~MppEncoder();
 
-    void push_frame(MppBuffer buffer,
-                    uint32_t width, uint32_t height,
-                    uint32_t hor_stride, uint32_t ver_stride,
-                    MppFrameFormat fmt, uint64_t pts);
+    // Encodes the frame in buffer (the caller has taken the reference the
+    // encoder puts back once done), pts in us. Returns its sequence number,
+    // for wait_done(): frames are encoded one at a time, in order.
+    uint64_t push_frame(MppBuffer buffer,
+                        uint32_t width, uint32_t height,
+                        uint32_t hor_stride, uint32_t ver_stride,
+                        MppFrameFormat fmt, uint64_t pts);
+    // Waits up to timeout_ms until frame seq is encoded (or dropped) and its
+    // buffer is no longer read. False if it isn't by then.
+    bool wait_done(uint64_t seq, int timeout_ms);
     void request_idr();
     void shutdown();
 
@@ -93,6 +102,10 @@ private:
     std::queue<EncRpc> queue;
     std::mutex mtx;
     std::condition_variable cv;
+    uint64_t submitted_ = 0;        // frames pushed, with mtx held
+    uint64_t done_ = 0;             // frames through encode_frame(), with done_mtx_ held
+    std::mutex done_mtx_;
+    std::condition_variable done_cv_;
 };
 
 #endif // MPP_ENCODER_H

@@ -93,31 +93,65 @@ bool FrameProcessor::alloc_contig_proc_copy(size_t size) {
     return true;
 }
 
+// More decoded frames than this waiting for the processor: the oldest goes.
+static constexpr size_t kMaxPending = 3;
+// How long the next frame waits for the encoder to let go of the buffer it is
+// written into, before it is dropped instead.
+static constexpr int kEncoderWaitMs = 100;
+
+static uint64_t mono_us() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
 FrameProcessor::FrameProcessor(MppEncoder *enc, int fps, EncResolution res, int drm_fd,
                                std::function<void()> on_fatal_error)
     : encoder(enc), interval_ns(1000000000L / fps), target_res_((int)res),
       on_fatal_error_(std::move(on_fatal_error)), drm_fd_(drm_fd) {
     mpp_buffer_group_get_internal(&hold_grp, MPP_BUFFER_TYPE_DRM);
+    stats_.waited_for = "the encoder";
 }
 
 FrameProcessor::~FrameProcessor() {
     shutdown();
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        for (Pending &p : pending_)
+            p.frame.release();
+        pending_.clear();
+    }
     if (last_copy)   { mpp_buffer_put(last_copy);   last_copy   = nullptr; }
     if (proc_copy_)  { mpp_buffer_put(proc_copy_);  proc_copy_  = nullptr; }
     if (hold_grp)    { mpp_buffer_group_put(hold_grp); hold_grp = nullptr; }
 }
 
 void FrameProcessor::push_latest(MppBuffer buf, uint32_t w, uint32_t h,
-                                uint32_t hs, uint32_t vs, MppFrameFormat fmt) {
+                                uint32_t hs, uint32_t vs, MppFrameFormat fmt,
+                                uint64_t capture_us, uint64_t decoded_us) {
     if (!running) return;
-    mpp_buffer_inc_ref(buf);
-    FrameProcFrame nf;
-    nf.buffer = buf; nf.width = w; nf.height = h;
-    nf.hor_stride = hs; nf.ver_stride = vs; nf.fmt = fmt;
     {
         std::lock_guard<std::mutex> lock(mtx);
-        pending.release();   // drop any previous un-consumed frame
-        pending = nf;
+        // Not recording: hold nothing (the stamps still go on, for the fill).
+        uint64_t ts;
+        const bool in_time = timeline_.stamp(capture_us, decoded_us, &ts);
+        if (!dvr_enabled)
+            return;
+        if (!in_time) {
+            stats_.late++;
+            return;
+        }
+        mpp_buffer_inc_ref(buf);
+        Pending p;
+        p.frame.buffer = buf; p.frame.width = w; p.frame.height = h;
+        p.frame.hor_stride = hs; p.frame.ver_stride = vs; p.frame.fmt = fmt;
+        p.ts_us = ts;
+        pending_.push_back(p);
+        while (pending_.size() > kMaxPending) {
+            pending_.front().frame.release();
+            pending_.pop_front();
+            stats_.overflowed++;
+        }
     }
     cv_.notify_one();  // wake processor if waiting
 }
@@ -125,18 +159,19 @@ void FrameProcessor::push_latest(MppBuffer buf, uint32_t w, uint32_t h,
 void FrameProcessor::shutdown() {
     running = false;
     cv_.notify_one();
-    ready_cv_.notify_one();
 }
 
 void FrameProcessor::drain_decoder_refs() {
-    // Drop any pending decoder buffer so the caller can free the group.
+    // Drop the pending decoder buffers so the caller can free the group.
     {
         std::lock_guard<std::mutex> lock(mtx);
-        pending.release();
+        for (Pending &p : pending_)
+            p.frame.release();
+        pending_.clear();
     }
     // Wait for any in-flight copy (which holds a decoder buffer ref) to finish.
     std::lock_guard<std::mutex> copy_lock(copy_mtx_);
-    // At this point no decoder buffers are referenced by the pacer.
+    // At this point no decoder buffers are referenced by the processor.
 }
 
 void FrameProcessor::set_osd_blend(int prime_fd, uint32_t w, uint32_t h, uint32_t stride_px) {
@@ -165,46 +200,98 @@ void *FrameProcessor::__THREAD__(void *p) {
     return nullptr;
 }
 
-// ── Timer thread entry point ────────────────────────────────────────────────
-
-void *FrameProcessor::__TIMER_THREAD__(void *p) {
-    pthread_setname_np(pthread_self(), "__ENCTIMER");
-    ((FrameProcessor *)p)->timer_loop();
-    return nullptr;
+uint64_t FrameProcessor::submit(MppBuffer buf, const FrameProcFrame &meta, uint64_t ts_us) {
+    return encoder->push_frame(buf, meta.width, meta.height, meta.hor_stride, meta.ver_stride,
+                               meta.fmt, ts_us);
 }
 
 // ── Processor loop ──────────────────────────────────────────────────────────
 //
-// Receives decoded frames, performs copy/resize/color-correction/OSD-blend,
-// and publishes the result for the timer thread to pick up.
-// Runs continuously — not paced by a timer.  Processing is decoupled from
-// the submission rate so heavy GPU/RGA work never starves the timer.
+// Takes the decoded frames in order, copies/resizes/colour-corrects/blends the
+// OSD into proc_copy_ and hands it to the encoder, stamped with the frame's
+// capture time; the next frame goes into the other buffer. Between frames,
+// through a link loss, the last one goes to the encoder again now and then.
 
 void FrameProcessor::process_loop() {
-    // Start the timer thread; it will be joined when we exit.
-    pthread_t timer_tid;
-    pthread_create(&timer_tid, NULL, &FrameProcessor::__TIMER_THREAD__, this);
-
     while (running) {
-        // Wait for a new decoded frame.
+        // The next decoded frame, or the last one again when it is due.
         FrameProcFrame fresh;
+        uint64_t ts_us = 0;
+        bool fill = false;
+        bool due = true;
         {
             std::unique_lock<std::mutex> lock(mtx);
-            cv_.wait(lock, [&]{ return pending.buffer != nullptr || !running; });
-            if (!running) break;
-            if (pending.buffer) {
-                fresh = pending;
-                pending.buffer = nullptr;
+            while (running) {
+                const bool recording = dvr_enabled && encoder && !reenc_fatal_.load(std::memory_order_relaxed);
+                if (!pending_.empty()) {
+                    fresh = pending_.front().frame;
+                    ts_us = pending_.front().ts_us;
+                    pending_.pop_front();
+                    due = timeline_.due(ts_us, (uint64_t)interval_ns.load(std::memory_order_relaxed) / 1000);
+                    break;
+                }
+                if (!recording)
+                    last_fresh_ = false;   // no fill from an earlier recording's frame
+                const uint64_t fill_at = (recording && last_copy && last_fresh_) ? timeline_.fill_at() : 0;
+                const uint64_t now = mono_us();
+                if (fill_at && now >= fill_at) {
+                    ts_us = timeline_.fill_stamp(now);
+                    stats_.fills++;
+                    fill = true;
+                    break;
+                }
+                if (fill_at)
+                    cv_.wait_for(lock, std::chrono::microseconds(fill_at - now));
+                else
+                    cv_.wait_for(lock, std::chrono::milliseconds(500));
             }
+            stats_.log(mono_us(), kMaxPending);
         }
-        if (!fresh.buffer) continue;
+        if (!running) {
+            fresh.release();
+            break;
+        }
 
         // If DVR is not active, or a prior frame failed to convert and the
-        // reencode session hasn't been restarted since, just drain the
-        // frame to release the decoder ref.
-        if (!dvr_enabled || !encoder || reenc_fatal_.load(std::memory_order_relaxed)) {
+        // reencode session hasn't been restarted since, or the frame isn't
+        // due at the recording's frame rate, just drain the frame to release
+        // the decoder ref.
+        if (!fill && (!dvr_enabled || !encoder || reenc_fatal_.load(std::memory_order_relaxed) || !due)) {
             fresh.release();
             continue;
+        }
+
+        // The live picture first: nothing for the recording while it is
+        // behind. The recording holds the last frame for that while.
+        if (live_.live_behind()) {
+            fresh.release();
+            std::lock_guard<std::mutex> lock(mtx);
+            stats_.yielded++;
+            continue;
+        }
+        if (fill) {
+            mpp_buffer_inc_ref(last_copy);
+            last_seq_ = submit(last_copy, last_meta, ts_us);
+            continue;
+        }
+
+        // The buffer this frame goes into must be out of the encoder.
+        if (proc_copy_ && proc_seq_) {
+            if (!encoder->wait_done(proc_seq_, 0)) {
+                {
+                    std::lock_guard<std::mutex> lock(mtx);
+                    stats_.waited++;
+                }
+                if (!encoder->wait_done(proc_seq_, kEncoderWaitMs)) {
+                    static uint64_t last_warn_us = 0;
+                    if (mono_us() - last_warn_us > 1000000) {
+                        last_warn_us = mono_us();
+                        spdlog::warn("DVR re-encode: the encoder is behind, frame skipped");
+                    }
+                    fresh.release();
+                    continue;
+                }
+            }
         }
 
         auto t_start = std::chrono::steady_clock::now();
@@ -377,14 +464,18 @@ void FrameProcessor::process_loop() {
             continue;
         }
 
-        // ── Publish: swap proc buffer into last_copy for the timer ──────
+        // ── Hand over; the next frame goes into the other buffer ────────
+        mpp_buffer_inc_ref(proc_copy_);
+        const uint64_t seq = submit(proc_copy_, proc_meta_, ts_us);
         {
-            std::lock_guard<std::mutex> lock(ready_mtx_);
-            std::swap(proc_copy_, last_copy);
-            last_meta = proc_meta_;
-            ready_fresh_ = true;
+            std::lock_guard<std::mutex> lock(mtx);
+            timeline_.encoded(ts_us);
         }
-        ready_cv_.notify_one();
+        std::swap(proc_copy_, last_copy);
+        proc_seq_ = last_seq_;
+        last_seq_ = seq;
+        last_meta = proc_meta_;
+        last_fresh_ = true;
 
         // ── Timing diagnostics ──────────────────────────────────────────
         {
@@ -410,68 +501,10 @@ void FrameProcessor::process_loop() {
         }
     }
 
-    // Wait for timer thread to finish before we return.
-    pthread_join(timer_tid, NULL);
-
-    // Release pending decoder buffer on exit
+    // Release the pending decoder buffers on exit
     std::lock_guard<std::mutex> lock(mtx);
-    pending.release();
+    for (Pending &p : pending_)
+        p.frame.release();
+    pending_.clear();
 }
 
-// ── Timer loop ──────────────────────────────────────────────────────────────
-//
-// Lightweight: just timing + pick latest processed frame + push to encoder.
-// No image processing happens here, so it never misses a tick.
-
-void FrameProcessor::timer_loop() {
-    struct timespec next;
-    clock_gettime(CLOCK_MONOTONIC, &next);
-    while (running) {
-        next.tv_nsec += interval_ns.load(std::memory_order_relaxed);
-        if (next.tv_nsec >= 1000000000L) {
-            next.tv_nsec -= 1000000000L;
-            next.tv_sec++;
-        }
-        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, nullptr);
-        if (!running) break;
-        if (!dvr_enabled || !encoder) continue;
-
-        // Pick the latest processed frame.  If no fresh frame is ready,
-        // wait up to half an interval for the processor to finish — this
-        // avoids unnecessary repeats (micro-stutters) when processing is
-        // just slightly slower than the timer tick.
-        MppBuffer frame = nullptr;
-        FrameProcFrame meta;
-        {
-            std::unique_lock<std::mutex> lock(ready_mtx_);
-            if (!ready_fresh_ && last_copy) {
-                auto grace = std::chrono::nanoseconds(
-                    interval_ns.load(std::memory_order_relaxed) / 2);
-                ready_cv_.wait_for(lock, grace,
-                    [&]{ return ready_fresh_ || !running; });
-                if (!running) break;
-                if (ready_fresh_) {
-                    // Fresh frame arrived during grace — re-anchor timer
-                    // so we don't cascade from the delayed tick.
-                    clock_gettime(CLOCK_MONOTONIC, &next);
-                    spdlog::debug("FrameProcessor grace period absorbed late frame");
-                }
-            }
-            ready_fresh_ = false;
-            if (last_copy) {
-                mpp_buffer_inc_ref(last_copy);
-                frame = last_copy;
-                meta  = last_meta;
-            }
-        }
-        if (frame) {
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            uint64_t pts_ms = (uint64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
-            encoder->push_frame(frame,
-                                meta.width, meta.height,
-                                meta.hor_stride, meta.ver_stride,
-                                meta.fmt, pts_ms);
-        }
-    }
-}
